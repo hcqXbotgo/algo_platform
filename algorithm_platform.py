@@ -666,6 +666,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         device_log_btn.clicked.connect(self.load_device_logs)
         device_log_btn.setStyleSheet("background-color: #2196F3; color: white;")
         
+        file_select_layout = QHBoxLayout()
         file_select_layout.addWidget(QLabel("日志文件:"))
         file_select_layout.addWidget(self.log_file_edit)
         file_select_layout.addWidget(log_browse_btn)
@@ -715,11 +716,6 @@ class AlgorithmValidationPlatform(QMainWindow):
         refresh_btn = QPushButton(" 刷新日志列表")
         refresh_btn.clicked.connect(self.load_device_logs)
         btn_layout.addWidget(refresh_btn)
-        
-        load_selected_btn = QPushButton("📂 加载选中日志")
-        load_selected_btn.clicked.connect(self.load_selected_log)
-        load_selected_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px; font-weight: bold;")
-        btn_layout.addWidget(load_selected_btn)
         
         list_layout.addLayout(btn_layout)
         list_group.setLayout(list_layout)
@@ -776,6 +772,12 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.log_figure = Figure(figsize=(10, 5))
         self.log_canvas = FigureCanvas(self.log_figure)
         plot_layout.addWidget(self.log_canvas)
+        
+        # 导出图片按钮
+        export_plot_btn = QPushButton("💾 导出图片")
+        export_plot_btn.clicked.connect(self.export_log_plot)
+        export_plot_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
+        plot_layout.addWidget(export_plot_btn)
         
         plot_group.setLayout(plot_layout)
         layout.addWidget(plot_group)
@@ -2027,6 +2029,11 @@ class AlgorithmValidationPlatform(QMainWindow):
                 select_btn.clicked.connect(lambda checked, idx=i: self.select_log_from_table(idx))
                 btn_layout.addWidget(select_btn)
                 
+                delete_btn = QPushButton("删除")
+                delete_btn.setStyleSheet("background-color: #f44336; color: white; padding: 4px 8px;")
+                delete_btn.clicked.connect(lambda checked, idx=i: self.delete_device_log(idx))
+                btn_layout.addWidget(delete_btn)
+                
                 btn_layout.addStretch()
                 self.device_log_table.setCellWidget(i, 3, btn_widget)
             
@@ -2062,6 +2069,49 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.log_file_edit.setText(full_path)
             log_manager.info(f"[LOG] 已加载日志文件: {full_path}")
             QMessageBox.information(self, "成功", f"已加载: {os.path.basename(full_path)}\n\n点击'分析日志'按钮开始分析")
+    
+    def delete_device_log(self, row_index):
+        """删除设备上的日志文件"""
+        item = self.device_log_table.item(row_index, 0)
+        if not item:
+            return
+        
+        full_path = item.data(Qt.UserRole)
+        filename = os.path.basename(full_path)
+        
+        # 确认删除
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定要删除设备上的日志文件吗？\n\n{filename}\n\n此操作不可恢复！",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        try:
+            # 检查设备连接
+            if not self.device_connected or not self.current_device_ip:
+                QMessageBox.warning(self, "错误", "请先连接设备")
+                return
+            
+            # 执行删除命令
+            success, output = self.device_manager.execute_ssh_command(f"rm -f {full_path}")
+            
+            if success:
+                log_manager.info(f"[LOG] 已删除设备日志文件: {full_path}")
+                QMessageBox.information(self, "成功", f"已删除: {filename}")
+                
+                # 刷新日志列表
+                self.load_device_logs()
+            else:
+                QMessageBox.critical(self, "错误", f"删除失败:\n{output}")
+                
+        except Exception as e:
+            log_manager.error(f"[LOG] 删除设备日志文件失败: {str(e)}")
+            QMessageBox.critical(self, "错误", f"删除失败:\n{str(e)}")
     
     def toggle_monitoring(self):
         """分析日志文件"""
@@ -2168,6 +2218,8 @@ class AlgorithmValidationPlatform(QMainWindow):
                     "是否现在选择该工具文件？\n\n"
                     "（如果设备已有该工具，可以跳过）",
                     QMessageBox.Yes | QMessageBox.No
+
+
                 )
                 
                 if reply == QMessageBox.Yes:
@@ -2534,7 +2586,14 @@ class AlgorithmValidationPlatform(QMainWindow):
             ax.grid(True)
             
         fig_axes[-1].set_xlabel('Frame')
-        self.log_figure.tight_layout()
+        
+        # 使用tight_layout并捕获警告，避免布局问题
+        try:
+            self.log_figure.tight_layout()
+        except Exception:
+            # 如果tight_layout失败，使用bbox_inches='tight'作为备选
+            pass
+        
         self.log_canvas.draw()
         
     def export_csv(self):
@@ -2544,6 +2603,83 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.information(self, "成功", "CSV文件已导出到当前目录")
         else:
             QMessageBox.warning(self, "警告", "请先分析日志文件")
+            
+    def export_log_plot(self):
+        """导出耗时曲线图 - 每个RKNN模型一张独立图片"""
+        if not hasattr(self.log_analyzer, 'data') or not self.log_analyzer.data:
+            QMessageBox.warning(self, "警告", "请先分析日志文件")
+            return
+        
+        # 选择保存目录
+        save_dir = QFileDialog.getExistingDirectory(
+            self, 
+            "选择保存图片的目录"
+        )
+        
+        if not save_dir:
+            return
+        
+        try:
+            import os
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+            
+            exported_files = []
+            
+            # 为每个模型生成独立的图表
+            for model_name, model_data in self.log_analyzer.data.items():
+                if not model_data['infer'] or not model_data['total']:
+                    continue
+                
+                # 创建独立的图表
+                fig = Figure(figsize=(10, 6))
+                canvas = FigureCanvas(fig)
+                ax = fig.add_subplot(111)
+                
+                length = min(len(model_data['infer']), len(model_data['total']))
+                frames = range(1, length + 1)
+                
+                # 绘制数据
+                ax.plot(frames, model_data['total'][:length], label='Total', color='#2196F3', linewidth=2)
+                ax.plot(frames, model_data['infer'][:length], label='Infer', linestyle='--', color='#FF9800', linewidth=2)
+                
+                # 设置标签和标题
+                ax.set_xlabel('Frame', fontsize=12)
+                ax.set_ylabel('Time (ms)', fontsize=12)
+                ax.set_title(f'{model_name} - Inference Time Analysis', fontsize=14, fontweight='bold')
+                ax.legend(loc='upper right', fontsize=11)
+                ax.grid(True, alpha=0.3)
+                
+                # 添加统计信息文本框
+                infer_avg = np.mean(model_data['infer'][:length])
+                total_avg = np.mean(model_data['total'][:length])
+                stats_text = f'Avg Infer: {infer_avg:.2f} ms\nAvg Total: {total_avg:.2f} ms\nFrames: {length}'
+                ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+                       verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+                       fontsize=9)
+                
+                # 保存图片
+                safe_model_name = model_name.replace('.rknn', '').replace('/', '_').replace('\\', '_')
+                file_path = os.path.join(save_dir, f"{safe_model_name}.png")
+                fig.savefig(file_path, dpi=150, bbox_inches='tight')
+                exported_files.append(file_path)
+                
+                # 关闭图表释放资源
+                plt.close(fig)
+            
+            if exported_files:
+                QMessageBox.information(
+                    self, 
+                    "成功", 
+                    f"已导出 {len(exported_files)} 个模型的耗时曲线图到：\n{save_dir}\n\n" + 
+                    "\n".join([os.path.basename(f) for f in exported_files[:5]]) +
+                    ("\n..." if len(exported_files) > 5 else "")
+                )
+            else:
+                QMessageBox.warning(self, "警告", "没有可导出的数据")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出失败：\n{str(e)}")
             
     def connect_rtsp(self):
         """连接RTSP流"""

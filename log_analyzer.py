@@ -17,7 +17,7 @@ class LogAnalyzer:
         self.data = {}
         
     def parse_log(self, log_file):
-        """解析日志文件（只处理 multi_media 开头的日志行）"""
+        """解析日志文件"""
         self.data = {}
         
         infer_pattern = re.compile(r"infer spend time:(\d+\.\d+)\s*ms")
@@ -35,9 +35,6 @@ class LogAnalyzer:
         try:
             with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    # 只处理 multi_media 开头的日志行
-                    if not line.strip().startswith('multi_media'):
-                        continue
                     
                     # 模型名 - 匹配初始化行
                     model_match = model_pattern.search(line)
