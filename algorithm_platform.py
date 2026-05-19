@@ -1957,31 +1957,12 @@ class AlgorithmValidationPlatform(QMainWindow):
         if not self.device_connected or not self.current_device_ip:
             QMessageBox.warning(self, "错误", "请先连接设备")
             return
-        
-        # 显示进度对话框
-        progress_dialog = QDialog(self)
-        progress_dialog.setWindowTitle("获取设备日志文件")
-        progress_dialog.setModal(True)
-        progress_dialog.setFixedWidth(400)
-        
-        progress_layout = QVBoxLayout(progress_dialog)
-        
-        status_label = QLabel("正在获取设备日志文件列表...")
-        status_label.setStyleSheet("font-size: 14px; padding: 10px;")
-        progress_layout.addWidget(status_label)
-        
-        progress_bar = QProgressBar()
-        progress_bar.setRange(0, 0)  # 不确定进度
-        progress_layout.addWidget(progress_bar)
-        
-        progress_dialog.show()
+
         QApplication.processEvents()
         
         try:
             # 连接到设备，获取日志文件列表
             success, output = self.device_manager.execute_ssh_command("ls -lh /userdata/logs/*.log 2>/dev/null || echo 'NO_FILES'")
-            
-            progress_dialog.close()
             
             if not success:
                 QMessageBox.warning(self, "错误", f"无法获取设备日志文件列表:\n{output}")
@@ -2972,6 +2953,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         # 延迟1秒后自动加载设备日志列表（让UI先完成渲染）
         QTimer.singleShot(1000, self.load_device_logs)
+        self.refresh_model_list()
     
     def save_device_config(self, device_ip, rtsp_0, rtsp_1, wifi_ssid='', wifi_password=''):
         """保存设备配置到文件"""
