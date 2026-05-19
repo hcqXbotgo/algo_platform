@@ -1756,7 +1756,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.critical(self, "错误", f"保存失败：\n{str(e)}")
             
     def push_config_to_device(self):
-        """推送配置到设备(使用后台线程)"""
+        """推送配置到设备（同步执行）"""
         # 检查设备是否已连接
         if not self.current_device_ip:
             QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
@@ -1784,7 +1784,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             
             progress_layout = QVBoxLayout(progress_dialog)
             
-            status_label = QLabel("正在准备推送...")
+            status_label = QLabel("正在推送配置文件...")
             status_label.setStyleSheet("font-size: 12px; padding: 10px;")
             progress_layout.addWidget(status_label)
             
@@ -1800,43 +1800,65 @@ class AlgorithmValidationPlatform(QMainWindow):
             progress_dialog.show()
             self.statusBar().showMessage(f"正在推送配置文件到 {ip}...")
             
-            # 创建后台线程
-            worker = FileTransferWorker(
-                self.device_manager,
-                'push_config',
-                config_file=temp_file,
-                device_ip=ip
-            )
+            # 同步执行推送操作
+            QApplication.processEvents()  # 确保UI更新
             
-            thread = QThread()
-            worker.moveToThread(thread)
+            # 步骤1: 推送配置文件
+            progress_bar.setValue(30)
+            status_label.setText("正在推送配置文件...")
+            QApplication.processEvents()
             
-            # 连接信号
-            thread.started.connect(worker.run)
-            worker.progress.connect(lambda percent, msg: self._update_progress(progress_bar, status_label, percent, msg))
-            worker.finished.connect(lambda success, msg: self._on_push_config_finished(success, msg, progress_dialog, thread))
+            success, msg = self.device_manager.push_config(temp_file, ip)
             
-            # 启动线程
-            thread.start()
+            if success:
+                progress_bar.setValue(70)
+                status_label.setText("配置推送成功，正在重启进程...")
+                QApplication.processEvents()
+                
+                # 步骤2: 重启进程
+                restart_success, restart_msg = self.device_manager.restart_media_process(ip)
+                
+                # 清理临时文件
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                
+                progress_bar.setValue(100)
+                
+                if restart_success:
+                    log_manager.info(f"[DEVICE] 配置推送成功: {msg}")
+                    QMessageBox.information(
+                        self, 
+                        "成功", 
+                        f"配置已成功推送到 {ip}！\n{msg}\n\n✅ multi_media进程已自动重启，新配置已生效"
+                    )
+                    self.statusBar().showMessage("配置推送完成", 3000)
+                else:
+                    log_manager.warning(f"[DEVICE] 配置推送成功但进程重启失败: {restart_msg}")
+                    QMessageBox.warning(
+                        self, 
+                        "部分成功", 
+                        f"配置已推送成功！\n{msg}\n\n⚠️ 但multi_media进程重启失败: {restart_msg}\n请手动重启进程以使配置生效"
+                    )
+                    self.statusBar().showMessage("配置推送成功，但进程重启失败", 3000)
+            else:
+                # 清理临时文件
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                
+                log_manager.error(f"[DEVICE] 配置推送失败: {msg}")
+                QMessageBox.critical(self, "失败", f"配置推送失败：\n{msg}")
+                self.statusBar().showMessage("配置推送失败", 3000)
+            
+            progress_dialog.close()
             
         except Exception as e:
+            # 清理临时文件
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            
+            log_manager.error(f"[OPERATION] 推送配置异常: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "错误", f"推送配置失败：\n{str(e)}")
             self.statusBar().showMessage("推送配置失败")
-            
-    def _on_push_config_finished(self, success, msg, progress_dialog, thread):
-        """推送配置完成回调"""
-        progress_dialog.close()
-        thread.quit()
-        thread.wait()
-        
-        if success:
-            log_manager.info(f"[DEVICE] 配置推送成功: {msg}")
-            QMessageBox.information(self, "成功", f"配置已推送！\n{msg}")
-            self.statusBar().showMessage("配置推送成功", 3000)
-        else:
-            log_manager.error(f"[DEVICE] 配置推送失败: {msg}")
-            QMessageBox.critical(self, "失败", f"配置推送失败：\n{msg}")
-            self.statusBar().showMessage("配置推送失败", 3000)
             
     def browse_log_file(self):
         """浏览选择日志文件"""
@@ -1869,6 +1891,8 @@ class AlgorithmValidationPlatform(QMainWindow):
         progress_dialog.show()
         
         try:
+
+
             # 连接到设备
             success, output = self.device_manager.execute_ssh_command("ls /userdata/logs/*.log")
             

@@ -485,10 +485,12 @@ class DeviceManager:
                 log_manager.warning(f"[进程] 进程仍然存在，尝试强制杀死: {verify_msg}")
                 self.execute_ssh_command("kill -9 $(ps aux | grep multi_media | grep -v grep | awk '{print $2}')")
                 time.sleep(1)
-            
-            # 使用nohup启动，确保进程在后台持续运行
-            # 使用完整路径和nohup防止进程退出
-            start_command = "nohup /oem/usr/bin/multi_media > /dev/null 2>&1 &"
+
+            start_command = (
+                "export LD_LIBRARY_PATH=/oem/usr/lib:/lib && "
+                "exec setsid /oem/usr/bin/multi_media "
+                "> /dev/null 2>&1 < /dev/null &"
+            )
             log_manager.info(f"[进程] 执行启动命令: {start_command}")
             
             start_success, start_msg = self.execute_ssh_command(start_command)
