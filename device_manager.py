@@ -212,6 +212,44 @@ class DeviceManager:
             return True, f"配置已推送到 {remote_full_path}"
         except Exception as e:
             return False, f"配置推送失败: {str(e)}"
+    
+    def pull_config(self, config_filename, device_ip, local_path=None):
+        """从设备下载配置文件
+        
+        Args:
+            config_filename: 配置文件名（如 model_config.json）
+            device_ip: 设备IP地址
+            local_path: 本地保存路径，默认为当前目录
+            
+        Returns:
+            (success, message_or_filepath): 成功返回(True, 文件路径)，失败返回(False, 错误信息)
+        """
+        if local_path is None:
+            local_path = os.path.basename(config_filename)
+        
+        try:
+            remote_path = f"/oem/usr/models/{config_filename}"
+            
+            # 使用SSHClient下载
+            ssh_client = paramiko.SSHClient()
+            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh_client.connect(device_ip, port=22, username='root', password='', timeout=10)
+            
+            sftp = ssh_client.open_sftp()
+            sftp.get(remote_path, local_path)
+            
+            sftp.close()
+            ssh_client.close()
+            
+            if os.path.exists(local_path):
+                file_size = os.path.getsize(local_path)
+                return True, local_path
+            else:
+                return False, "文件下载失败"
+        except FileNotFoundError:
+            return False, f"设备上不存在配置文件: {config_filename}"
+        except Exception as e:
+            return False, f"配置下载失败: {str(e)}"
             
     def push_video(self, video_file, device_ip):
         """推送视频文件到设备/userdata目录"""

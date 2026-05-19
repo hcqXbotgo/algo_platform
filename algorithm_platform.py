@@ -277,6 +277,9 @@ class AlgorithmValidationPlatform(QMainWindow):
                     f"✅ 配置已保存，下次启动时将自动连接\n\n"
                     f"现在可以使用所有功能了。"
                 )
+                
+                # 加载追踪模式
+                self.load_track_modes()
 
     def _auto_connect_mqtt(self, device_ip):
         """自动连接MQTT（用户无感知）"""
@@ -450,6 +453,11 @@ class AlgorithmValidationPlatform(QMainWindow):
         load_config_btn = QPushButton("📂 加载配置")
         load_config_btn.clicked.connect(self.load_config)
         config_layout.addWidget(load_config_btn)
+        
+        load_device_config_btn = QPushButton("🔄 从设备加载")
+        load_device_config_btn.clicked.connect(self.load_config_from_device)
+        load_device_config_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px; font-weight: bold;")
+        config_layout.addWidget(load_device_config_btn)
         
         config_group.setLayout(config_layout)
         layout.addWidget(config_group)
@@ -1207,7 +1215,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         progress_layout.addWidget(progress_bar)
         
         cancel_btn = QPushButton("取消")
-        cancel_btn.setEnabled(False)  # 暂时不允许取消
+        cancel_btn.setEnabled(False)
         progress_layout.addWidget(cancel_btn)
         
         progress_dialog.show()
@@ -1741,6 +1749,70 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.statusBar().showMessage("配置加载成功", 2000)
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载配置失败：\n{str(e)}")
+    
+    def load_config_from_device(self):
+        """从设备加载配置文件"""
+        # 检查设备是否已连接
+        if not self.current_device_ip:
+            QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
+            return
+        
+        ip = self.current_device_ip
+        
+        # 确定要下载的配置文件名
+        current_file = self.config_file_edit.text()
+        if current_file and os.path.basename(current_file):
+            config_filename = os.path.basename(current_file)
+        else:
+            # 默认使用 model_config.json
+            config_filename = "model_config.json"
+        
+        reply = QMessageBox.question(
+            self, 
+            "确认", 
+            f"确定要从设备 {ip} 下载配置文件 {config_filename} 吗？\n\n这将覆盖当前编辑器中的内容。",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        try:
+            log_manager.info(f"[OPERATION] 开始从设备 {ip} 下载配置文件 {config_filename}")
+            self.statusBar().showMessage(f"正在从设备下载 {config_filename}...")
+            
+            # 下载到本地（使用原文件名）
+            local_file = config_filename
+            success, result = self.device_manager.pull_config(config_filename, ip, local_file)
+            
+            if success:
+                # 更新文件路径显示
+                self.config_file_edit.setText(local_file)
+                
+                # 加载文件内容到编辑器
+                with open(local_file, 'r', encoding='utf-8') as f:
+                    if local_file.endswith('.json'):
+                        content = json.dumps(json.load(f), indent=2, ensure_ascii=False)
+                    else:
+                        content = f.read()
+                
+                self.config_text_edit.setText(content)
+                
+                log_manager.info(f"[DEVICE] 配置下载成功: {result}")
+                QMessageBox.information(
+                    self, 
+                    "成功", 
+                    f"配置已从设备加载！\n\n文件: {config_filename}\n大小: {os.path.getsize(local_file)} 字节"
+                )
+                self.statusBar().showMessage(f"配置已从设备加载: {config_filename}", 3000)
+            else:
+                error_msg = result if isinstance(result, str) else "未知错误"
+                log_manager.error(f"[DEVICE] 配置下载失败: {error_msg}")
+                QMessageBox.critical(self, "错误", f"从设备加载配置失败：\n{error_msg}")
+                
+        except Exception as e:
+            log_manager.error(f"[ERROR] 配置下载异常: {str(e)}")
+            QMessageBox.critical(self, "错误", f"加载配置时发生错误：\n{str(e)}")
             
     def save_config_local(self):
         """保存配置到本地"""
@@ -1767,16 +1839,26 @@ class AlgorithmValidationPlatform(QMainWindow):
         config_content = self.config_text_edit.toPlainText()
         ip = self.current_device_ip
         
-        # 先保存到临时文件
-        temp_file = "temp_config.json"
-        if "xbotgo_media.ini" in self.config_file_edit.text():
-            temp_file = "temp_config.ini"
+        # 确定配置文件名（使用正确的文件名，确保设备能识别）
+        current_file = self.config_file_edit.text()
+        if current_file and os.path.basename(current_file):
+            config_filename = os.path.basename(current_file)
+        else:
+            # 默认使用 model_config.json
+            config_filename = "model_config.json"
+        
+        # 如果当前文件是INI格式，使用ini后缀
+        if current_file and current_file.endswith('.ini'):
+            config_filename = "xbotgo_media.ini"
             
         try:
+            # 保存到临时文件（使用正确的文件名）
+            temp_file = config_filename
+            
             with open(temp_file, 'w', encoding='utf-8') as f:
                 f.write(config_content)
             
-            log_manager.info(f"[OPERATION] 开始推送配置文件到 {ip}")
+            log_manager.info(f"[OPERATION] 开始推送配置文件 {config_filename} 到 {ip}")
             
             # 创建进度对话框
             progress_dialog = QDialog(self)
@@ -2756,20 +2838,63 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.critical(self, "失败", f"设置失败：\n{msg}")
             
     def load_track_modes(self):
-        """加载追踪模式（不包含停止选项，因为已有单独的停止按钮）"""
-        config_file = "model_config.json"
-        if os.path.exists(config_file):
-            try:
-                with open(config_file, 'r', encoding='utf-8') as f:
+        """从设备加载追踪模式配置"""
+        # 检查设备是否已连接
+        if not self.current_device_ip:
+            log_manager.warning("[CONFIG] 设备未连接，无法加载追踪模式")
+            return
+        
+        ip = self.current_device_ip
+        config_filename = "model_config.json"
+        
+        try:
+            log_manager.info(f"[CONFIG] 正在从设备 {ip} 加载追踪模式配置...")
+            
+            # 从设备下载配置文件到临时位置
+            temp_file = f"temp_{config_filename}"
+            success, result = self.device_manager.pull_config(config_filename, ip, temp_file)
+            
+            if success:
+                # 读取并解析配置
+                with open(temp_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
+                
                 modes = config.get('modes', [])
                 self.track_mode_combo.clear()
-                # 移除"停止追踪"选项，因为已有单独的停止按钮
-                for mode in modes:
-                    self.track_mode_combo.addItem(f"[{mode['id']}] {mode['desc']}", mode['id'])
-            except Exception as e:
-                log_manager.error(f"[RTMP] {error_msg}")
-
+                
+                if modes:
+                    # 移除"停止追踪"选项，因为已有单独的停止按钮
+                    for mode in modes:
+                        self.track_mode_combo.addItem(f"[{mode['id']}] {mode['desc']}", mode['id'])
+                    
+                    log_manager.info(f"[CONFIG] 成功加载 {len(modes)} 个追踪模式")
+                    self.statusBar().showMessage(f"已加载 {len(modes)} 个追踪模式", 2000)
+                else:
+                    log_manager.warning("[CONFIG] 配置文件中没有定义追踪模式")
+                    QMessageBox.warning(self, "警告", "设备上的配置文件中没有定义追踪模式")
+                
+                # 清理临时文件
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            else:
+                error_msg = result if isinstance(result, str) else "未知错误"
+                log_manager.error(f"[CONFIG] 从设备加载配置失败: {error_msg}")
+                QMessageBox.warning(
+                    self, 
+                    "加载失败", 
+                    f"无法从设备加载追踪模式配置：\n{error_msg}\n\n请确保设备上存在 {config_filename} 文件"
+                )
+                
+        except json.JSONDecodeError as e:
+            log_manager.error(f"[CONFIG] 配置文件格式错误: {str(e)}")
+            QMessageBox.critical(self, "错误", f"配置文件格式错误：\n{str(e)}")
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        except Exception as e:
+            log_manager.error(f"[CONFIG] 加载追踪模式异常: {str(e)}")
+            QMessageBox.critical(self, "错误", f"加载追踪模式时发生错误：\n{str(e)}")
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
     def toggle_tracking(self):
         """切换追踪状态（启动/停止）"""
         if self.is_tracking:
@@ -3087,12 +3212,11 @@ class AlgorithmValidationPlatform(QMainWindow):
             f"您现在可以直接使用所有功能了。"
         )
         
-        # 延迟1秒后自动加载设备日志列表（让UI先完成渲染）
-        QTimer.singleShot(1000, self.load_device_logs)
-        self.refresh_model_list()
-    
+        # 自动加载追踪模式
+        self.load_track_modes()
+        
     def save_device_config(self, device_ip, rtsp_0, rtsp_1, wifi_ssid='', wifi_password=''):
-        """保存设备配置到文件"""
+        """保存设备配置到本地文件"""
         try:
             config = {
                 'device_ip': device_ip,
@@ -3133,20 +3257,13 @@ class AlgorithmValidationPlatform(QMainWindow):
                 # 重置连接状态
                 self.current_device_ip = None
                 self.device_connected = False
-                self.ssh_available = False
-                
-                # 更新UI
-                self.status_label.setText("未连接设备")
-                self.status_label.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
-                self.rtsp_label_0.setText("RTSP 0: N/A")
-                self.rtsp_label_1.setText("RTSP 1: N/A")
                 
                 QMessageBox.information(self, "成功", "设备配置已清除")
                 
             except Exception as e:
                 log_manager.error(f"[CONFIG] 清除配置失败: {str(e)}")
                 QMessageBox.critical(self, "错误", f"清除配置失败：\n{str(e)}")
-
+    
     def show_about(self):
         """显示关于信息"""
         QMessageBox.about(self, "关于", 
