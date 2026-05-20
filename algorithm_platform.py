@@ -7,6 +7,7 @@
 import sys
 import os
 import threading
+import subprocess
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QMessageBox, QGroupBox, QFormLayout,
@@ -3020,7 +3021,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.critical(self, "错误", f"导出报告失败：\n{str(e)}")
             
     def auto_connect_device(self):
-        """启动时自动加载并连接上次配置的设备（三级自动连接）"""
+        """启动时自动加载并连接上次配置的设备（智能IP校验+自动连接）"""
         try:
             if not os.path.exists(self.device_config_file):
                 log_manager.info("[AUTO] 未找到设备配置文件，跳过自动连接")
@@ -3040,33 +3041,64 @@ class AlgorithmValidationPlatform(QMainWindow):
                 log_manager.warning("[AUTO] 配置文件中没有设备IP")
                 return
             
-            log_manager.info(f"[AUTO] 检测到上次配置的设备: {device_ip}，开始自动连接流程...")
-            self.statusBar().showMessage(f"正在自动连接设备: {device_ip}...", 5000)
+            log_manager.info(f"[AUTO] 检测到上次配置的设备: {device_ip}，开始智能连接流程...")
+            self.statusBar().showMessage(f"正在检测设备状态...", 5000)
             
-            # 第一级：尝试直接SSH连接
-            log_manager.info("[AUTO] 第一级：尝试SSH直连...")
-            test_success, test_msg = self.device_manager.connect_ssh(device_ip)
+            # Step 0: 通过ADB检测设备当前实际IP
+            log_manager.info("[AUTO] Step 0: 通过ADB检测设备当前IP...")
+            current_ip = self._get_current_device_ip_via_adb()
+            
+            if current_ip:
+                log_manager.info(f"[AUTO] 检测到设备当前IP: {current_ip}")
+                
+                # 比较当前IP与配置IP是否一致
+                if current_ip != device_ip:
+                    log_manager.warning(f"[AUTO] IP不一致！配置IP: {device_ip}, 当前IP: {current_ip}")
+                    
+                    # IP不一致，需要重新配置WiFi获取正确IP
+                    if wifi_ssid and wifi_password:
+                        log_manager.info(f"[AUTO] 将通过WiFi重连获取正确IP (SSID: {wifi_ssid})")
+                        self.statusBar().showMessage("检测到IP变化，正在重新配置WiFi...", 5000)
+                        
+                        # 在后台线程中执行WiFi重连
+                        self._wifi_reconnect_attempt(device_ip, wifi_ssid, wifi_password, rtsp_0, rtsp_1)
+                        return
+                    else:
+                        log_manager.error("[AUTO] IP不一致但没有WiFi配置信息，无法自动修复")
+                        self._on_auto_connect_failed(device_ip, f"IP地址已变化（{device_ip} → {current_ip}），但缺少WiFi配置信息")
+                        return
+                else:
+                    log_manager.info(f"[AUTO] IP一致 ({current_ip})，可以直接进行SSH连接")
+            else:
+                log_manager.warning("[AUTO] 未能通过ADB获取设备IP，将尝试直接SSH连接")
+            
+            # Step 1: 使用正确的IP进行SSH连接
+            target_ip = current_ip if current_ip else device_ip
+            log_manager.info(f"[AUTO] Step 1: 尝试SSH连接到 {target_ip}...")
+            self.statusBar().showMessage(f"正在连接设备: {target_ip}...", 5000)
+            
+            test_success, test_msg = self.device_manager.connect_ssh(target_ip)
             
             if test_success:
                 # SSH直连成功
-                log_manager.info(f"[AUTO] SSH直连成功: {test_msg}")
-                self._on_auto_connect_success(device_ip, rtsp_0, rtsp_1, "SSH直连成功")
+                log_manager.info(f"[AUTO] SSH连接成功: {test_msg}")
+                self._on_auto_connect_success(target_ip, rtsp_0, rtsp_1, "SSH连接成功")
                 return
             
-            # SSH连接失败（正常流程，进入第二级）
-            log_manager.info(f"[AUTO] SSH直连失败: {test_msg}，尝试第二级WiFi重连...")
+            # SSH连接失败，进入WiFi重连流程
+            log_manager.info(f"[AUTO] SSH连接失败: {test_msg}，尝试WiFi重连...")
             
-            # 第二级：检查是否有WiFi信息，尝试ADB+WiFi自动重连
+            # Step 2: 检查是否有WiFi信息，尝试ADB+WiFi自动重连
             if wifi_ssid and wifi_password:
-                log_manager.info("[AUTO] 第二级：检测到WiFi信息，尝试ADB+WiFi自动重连...")
+                log_manager.info("[AUTO] Step 2: 检测到WiFi信息，尝试ADB+WiFi自动重连...")
                 self.statusBar().showMessage("正在通过WiFi重新连接设备...", 5000)
                 
                 # 在后台线程中执行WiFi重连
                 self._wifi_reconnect_attempt(device_ip, wifi_ssid, wifi_password, rtsp_0, rtsp_1)
                 return
             
-            # 第三级：没有WiFi信息或WiFi重连失败，提示用户一键配置
-            log_manager.info("[AUTO] 第三级：无法自动连接，提示用户一键配置")
+            # Step 3: 没有WiFi信息或WiFi重连失败，提示用户一键配置
+            log_manager.info("[AUTO] Step 3: 无法自动连接，提示用户一键配置")
             self.statusBar().showMessage("自动连接失败，请使用'一键配置设备'", 3000)
             
             # 弹出对话框询问是否清除配置
@@ -3091,6 +3123,78 @@ class AlgorithmValidationPlatform(QMainWindow):
                 
         except Exception as e:
             log_manager.error(f"[AUTO] 自动连接异常: {str(e)}", exc_info=True)
+    
+    def _get_current_device_ip_via_adb(self):
+        """通过ADB获取设备当前实际IP地址
+        
+        Returns:
+            str: 设备IP地址，如果获取失败返回None
+        """
+        try:
+            log_manager.info("[ADB] 正在检测ADB设备并获取IP...")
+            
+            # 检查ADB设备连接
+            result = subprocess.run(
+                ['adb', 'devices'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode != 0:
+                log_manager.warning(f"[ADB] ADB命令执行失败: {result.stderr.strip()}")
+                return None
+            
+            # 解析设备列表
+            lines = result.stdout.strip().split('\n')
+            devices = []
+            for line in lines[1:]:  # 跳过第一行标题
+                if '\tdevice' in line or '\t\tdevice' in line:
+                    device_id = line.split('\t')[0].strip()
+                    if device_id and device_id != 'List of devices attached':
+                        devices.append(device_id)
+            
+            if not devices:
+                log_manager.info("[ADB] 未检测到ADB设备（可能未连接USB）")
+                return None
+            
+            # 使用第一个设备
+            device_id = devices[0]
+            log_manager.info(f"[ADB] 检测到设备: {device_id}")
+            
+            # 尝试多种方式获取IP
+            ip_commands = [
+                "ip addr show wlan0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1",
+                "ifconfig wlan0 | grep 'inet addr:' | cut -d: -f2 | awk '{print $1}'",
+                "hostname -I | awk '{print $1}'",
+            ]
+            
+            for cmd in ip_commands:
+                log_manager.debug(f"[ADB] 尝试命令: {cmd}")
+                result = subprocess.run(
+                    ['adb', '-s', device_id, 'shell', cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    ip = result.stdout.strip().split('\n')[-1].strip()
+                    # 验证IP格式
+                    import re
+                    if re.match(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', ip):
+                        log_manager.info(f"[ADB] 成功获取设备IP: {ip}")
+                        return ip
+            
+            log_manager.warning("[ADB] 未能获取到有效的IP地址")
+            return None
+            
+        except FileNotFoundError:
+            log_manager.warning("[ADB] ADB未安装或未添加到PATH")
+            return None
+        except Exception as e:
+            log_manager.error(f"[ADB] 获取IP失败: {str(e)}")
+            return None
     
     def _wifi_reconnect_attempt(self, device_ip, wifi_ssid, wifi_password, rtsp_0, rtsp_1):
         """WiFi自动重连尝试（后台线程）"""
