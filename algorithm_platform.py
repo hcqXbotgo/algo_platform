@@ -1361,20 +1361,129 @@ class AlgorithmValidationPlatform(QMainWindow):
         # 启动线程
         self.transfer_thread.start()
     
-        # 创建后台线程（保存为实例属性，防止被垃圾回收）
-        self.transfer_worker = FileTransferWorker(
-            self.device_manager,
-            'delete_model',
-            model_name=model_name,
-            device_ip=ip
-        )
+    def upload_video_to_device(self):
+        """上传视频到设备（后台线程+进度显示）"""
+        if not self.current_device_ip:
+            QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
+            return
         
-        self.transfer_thread = QThread()
-        self.transfer_worker.moveToThread(self.transfer_thread)
+        video_file = self.video_file_edit.text()
+        if not video_file or not os.path.exists(video_file):
+            QMessageBox.warning(self, "错误", "请选择有效的视频文件")
+            return
         
-        # 连接信号
-        self.transfer_thread.started.connect(self.transfer_worker.run)
-        self.transfer_worker.progress.connect(lambda percent, msg: self._update_progress(progress_bar, status_label, percent, msg))
+        ip = self.current_device_ip
+        
+        reply = QMessageBox.question(self, "确认", 
+                                    f"确定要上传视频 {os.path.basename(video_file)} 到设备 /userdata 目录吗？\n\n"
+                                    f"文件大小: {os.path.getsize(video_file) / 1024 / 1024:.2f} MB",
+                                    QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+        
+        # 创建进度对话框
+        progress_dialog = QDialog(self)
+        progress_dialog.setWindowTitle("视频上传")
+        progress_dialog.setModal(True)
+        progress_dialog.setFixedSize(400, 150)
+        
+        layout = QVBoxLayout(progress_dialog)
+        
+        # 状态标签
+        status_label = QLabel(f"正在上传: {os.path.basename(video_file)}")
+        status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(status_label)
+        
+        # 进度条
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 100)
+        progress_bar.setValue(0)
+        layout.addWidget(progress_bar)
+        
+        # 进度文本
+        progress_text = QLabel("准备上传...")
+        progress_text.setAlignment(Qt.AlignCenter)
+        layout.addWidget(progress_text)
+        
+        # 取消按钮
+        cancel_btn = QPushButton("取消")
+        cancel_layout = QHBoxLayout()
+        cancel_layout.addStretch()
+        cancel_layout.addWidget(cancel_btn)
+        layout.addLayout(cancel_layout)
+        
+        # 创建进度更新信号
+        class ProgressWorker(QObject):
+            progress_signal = pyqtSignal(int, float, float)  # percent, transferred_mb, total_mb
+            finished_signal = pyqtSignal(bool, str)  # success, message
+            
+            def __init__(self, video_file, device_ip):
+                super().__init__()
+                self.video_file = video_file
+                self.device_ip = device_ip
+                self.cancelled = False
+            
+            def upload(self):
+                """执行上传"""
+                def progress_callback(transferred, total):
+                    if self.cancelled:
+                        return
+                    percent = int(transferred / total * 100) if total > 0 else 0
+                    transferred_mb = transferred / 1024 / 1024
+                    total_mb = total / 1024 / 1024
+                    # 发射信号更新进度
+                    self.progress_signal.emit(percent, transferred_mb, total_mb)
+                
+                try:
+                    success, msg = self.device_manager.push_video(self.video_file, self.device_ip, progress_callback)
+                    self.finished_signal.emit(success, msg)
+                except Exception as e:
+                    self.finished_signal.emit(False, f"上传异常: {str(e)}")
+        
+        # 创建工作线程和对象
+        worker = ProgressWorker(video_file, ip)
+        worker.device_manager = self.device_manager  # 传递device_manager引用
+        
+        thread = QThread()
+        worker.moveToThread(thread)
+        
+        # 连接信号到槽
+        def update_progress(percent, transferred_mb, total_mb):
+            progress_bar.setValue(percent)
+            progress_text.setText(f"{percent}% ({transferred_mb:.2f} MB / {total_mb:.2f} MB)")
+        
+        def upload_finished(success, msg):
+            thread.quit()
+            progress_dialog.accept()
+            
+            if success:
+                QMessageBox.information(self, "成功", f"视频上传成功！\n{msg}")
+                log_manager.info(f"[VIDEO] 上传完成: {msg}")
+            else:
+                QMessageBox.critical(self, "失败", f"视频上传失败：\n{msg}")
+                log_manager.error(f"[VIDEO] 上传失败: {msg}")
+        
+        worker.progress_signal.connect(update_progress)
+        worker.finished_signal.connect(upload_finished)
+        
+        # 连接取消按钮
+        cancel_btn.clicked.connect(lambda: setattr(worker, 'cancelled', True))
+        
+        # 启动线程
+        thread.started.connect(worker.upload)
+        thread.start()
+        
+        # 显示进度对话框（阻塞直到完成或取消）
+        result = progress_dialog.exec_()
+        
+        # 如果用户取消了对话框
+        if result == QDialog.Rejected:
+            worker.cancelled = True
+            log_manager.info("[VIDEO] 用户取消了上传")
+            QMessageBox.information(self, "提示", "上传已取消")
+            thread.quit()
+            thread.wait(3000)  # 等待线程结束，最多3秒
+
         self.transfer_worker.finished.connect(lambda success, msg: self._on_delete_model_finished(success, msg, progress_dialog, self.transfer_thread))
         
         # 启动线程
@@ -2790,31 +2899,6 @@ class AlgorithmValidationPlatform(QMainWindow):
         file_name, _ = QFileDialog.getOpenFileName(self, "选择视频文件", "", "Video Files (*.mp4 *.avi *.mov)")
         if file_name:
             self.video_file_edit.setText(file_name)
-            
-    def upload_video_to_device(self):
-        """上传视频到设备"""
-        if not self.current_device_ip:
-            QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
-            return
-        
-        video_file = self.video_file_edit.text()
-        if not video_file or not os.path.exists(video_file):
-            QMessageBox.warning(self, "错误", "请选择有效的视频文件")
-            return
-        
-        ip = self.current_device_ip
-        
-        reply = QMessageBox.question(self, "确认", 
-                                    f"确定要上传视频 {os.path.basename(video_file)} 到设备 /userdata 目录吗？",
-                                    QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.No:
-            return
-        
-        success, msg = self.device_manager.push_video(video_file, ip)
-        if success:
-            QMessageBox.information(self, "成功", f"视频上传成功！\n{msg}")
-        else:
-            QMessageBox.critical(self, "失败", f"视频上传失败：\n{msg}")
             
     def apply_video_source(self):
         """应用视频源设置"""

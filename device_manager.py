@@ -251,24 +251,65 @@ class DeviceManager:
         except Exception as e:
             return False, f"配置下载失败: {str(e)}"
             
-    def push_video(self, video_file, device_ip):
-        """推送视频文件到设备/userdata目录"""
+    def push_video(self, video_file, device_ip, progress_callback=None):
+        """推送视频文件到设备/userdata目录
+        
+        Args:
+            video_file: 本地视频文件路径
+            device_ip: 设备IP地址
+            progress_callback: 进度回调函数 callback(transferred, total)
+        """
         try:
             remote_path = "/userdata/"
             remote_full_path = os.path.join(remote_path, os.path.basename(video_file))
             
+            log_manager.info(f"[VIDEO] 开始上传视频: {os.path.basename(video_file)}")
+            
+            # 创建SSH客户端并设置超时
             ssh_client = paramiko.SSHClient()
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh_client.connect(device_ip, port=22, username='root', password='')
+            ssh_client.connect(device_ip, port=22, username='root', password='', timeout=15)
             
             sftp = ssh_client.open_sftp()
-            sftp.put(video_file, remote_full_path)
+            
+            # 获取文件大小
+            file_size = os.path.getsize(video_file)
+            log_manager.info(f"[VIDEO] 文件大小: {file_size / 1024 / 1024:.2f} MB")
+            
+            # 定义进度回调
+            def _progress_callback(transferred, total):
+                if progress_callback:
+                    progress_callback(transferred, total)
+                # 每10%记录一次日志
+                percent = (transferred / total * 100) if total > 0 else 0
+                if int(percent) % 10 == 0 and int(percent) > 0:
+                    log_manager.info(f"[VIDEO] 上传进度: {percent:.1f}% ({transferred / 1024 / 1024:.2f} MB / {total / 1024 / 1024:.2f} MB)")
+            
+            # 上传文件（带进度）
+            sftp.put(video_file, remote_full_path, callback=_progress_callback)
+            
+            # 验证文件是否成功上传
+            file_stat = sftp.stat(remote_full_path)
+            uploaded_size = file_stat.st_size
             
             sftp.close()
             ssh_client.close()
             
-            return True, f"视频已上传到 {remote_full_path}"
+            if uploaded_size == file_size:
+                log_manager.info(f"[VIDEO] 视频上传成功: {remote_full_path}")
+                return True, f"视频已上传到 {remote_full_path} ({file_size / 1024 / 1024:.2f} MB)"
+            else:
+                log_manager.error(f"[VIDEO] 文件大小不匹配: 本地={file_size}, 远程={uploaded_size}")
+                return False, f"上传验证失败：文件大小不匹配"
+                
+        except paramiko.SSHException as e:
+            log_manager.error(f"[VIDEO] SSH连接失败: {str(e)}")
+            return False, f"SSH连接失败: {str(e)}"
+        except IOError as e:
+            log_manager.error(f"[VIDEO] 文件传输失败: {str(e)}")
+            return False, f"文件传输失败: {str(e)}"
         except Exception as e:
+            log_manager.error(f"[VIDEO] 视频上传异常: {str(e)}", exc_info=True)
             return False, f"视频上传失败: {str(e)}"
             
     def list_models(self, device_ip, connection_type='SSH'):
