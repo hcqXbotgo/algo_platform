@@ -565,12 +565,22 @@ class DeviceManager:
                 self.execute_ssh_command("kill -9 $(ps aux | grep multi_media | grep -v grep | awk '{print $2}')")
                 time.sleep(1)
 
+            # 生成带时间戳的日志文件名
+            import datetime
+            timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+            log_dir = "/userdata/logs"
+            log_file = f"{log_dir}/multi_media-{timestamp}-redir.log"
+            
+            # 确保日志目录存在
+            self.execute_ssh_command(f"mkdir -p {log_dir}")
+            
             start_command = (
                 "export LD_LIBRARY_PATH=/oem/usr/lib:/lib && "
-                "exec setsid /oem/usr/bin/multi_media "
-                "> /dev/null 2>&1 < /dev/null &"
+                f"exec setsid /oem/usr/bin/multi_media "
+                f"> {log_file} 2>&1 < /dev/null &"
             )
             log_manager.info(f"[进程] 执行启动命令: {start_command}")
+            log_manager.info(f"[进程] 日志文件: {log_file}")
             
             start_success, start_msg = self.execute_ssh_command(start_command)
             

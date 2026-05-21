@@ -651,6 +651,12 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.perf_canvas = FigureCanvas(self.perf_figure)
         chart_layout.addWidget(self.perf_canvas)
         
+        # 导出图片按钮
+        export_perf_btn = QPushButton("💾 导出性能趋势图")
+        export_perf_btn.clicked.connect(self.export_performance_plot)
+        export_perf_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
+        chart_layout.addWidget(export_perf_btn)
+        
         chart_group.setLayout(chart_layout)
         layout.addWidget(chart_group)
         
@@ -2603,11 +2609,6 @@ class AlgorithmValidationPlatform(QMainWindow):
             # 3. 内存使用图（左下）- 使用实际MB数
             ax_mem.plot(timestamps, history['memory_used_mb'], label='已使用', 
                        marker='v', linewidth=2, linestyle='-', color='#9467bd')
-            # 添加总内存参考线
-            if history['memory_total_mb']:
-                total_mb = history['memory_total_mb'][-1]  # 使用最新的总内存
-                ax_mem.axhline(y=total_mb, color='red', linestyle='--', 
-                              linewidth=1, label=f'总内存({total_mb:.0f} MB)')
             ax_mem.set_xlabel('采样点')
             ax_mem.set_ylabel('内存 (MB)')
             ax_mem.set_title('内存使用')
@@ -2645,6 +2646,122 @@ class AlgorithmValidationPlatform(QMainWindow):
             
         self.perf_figure.tight_layout()
         self.perf_canvas.draw()
+        
+    def export_performance_plot(self):
+        """导出性能趋势图"""
+        history = self.performance_monitor.get_history_data()
+        
+        if not history['timestamps']:
+            QMessageBox.warning(self, "警告", "暂无性能数据，请先启动监控")
+            return
+        
+        # 选择保存路径
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, 
+            "导出性能趋势图", 
+            "performance_trend.png", 
+            "PNG图片 (*.png);;所有文件 (*)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # 确保文件名以.png结尾
+            if not file_path.lower().endswith('.png'):
+                file_path += '.png'
+            
+            # 创建独立的图表用于导出（更高分辨率）
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+            
+            fig = Figure(figsize=(16, 10))
+            canvas = FigureCanvas(fig)
+            
+            # 创建4个子图：2x2布局
+            ax_npu = fig.add_subplot(221)
+            ax_cpu = fig.add_subplot(222)
+            ax_mem = fig.add_subplot(223)
+            ax_ddr = fig.add_subplot(224)
+            
+            timestamps = range(len(history['timestamps']))
+            
+            # 1. NPU占用率图（左上）
+            ax_npu.plot(timestamps, history['npu_core0'], label='Core0', marker='o', 
+                       linewidth=2, linestyle='-', color='#1f77b4')
+            ax_npu.plot(timestamps, history['npu_core1'], label='Core1', marker='s', 
+                       linewidth=2, linestyle='-', color='#ff7f0e')
+            ax_npu.plot(timestamps, history['npu_load'], label='平均', marker='^', 
+                       linewidth=2.5, linestyle='--', color='red')
+            ax_npu.set_xlabel('采样点', fontsize=12)
+            ax_npu.set_ylabel('占用率 (%)', fontsize=12)
+            ax_npu.set_title('NPU占用率', fontsize=14, fontweight='bold')
+            ax_npu.legend(loc='best', fontsize=10)
+            ax_npu.grid(True, alpha=0.3)
+            ax_npu.set_ylim(0, 100)
+            
+            # 2. CPU占用率图（右上）
+            ax_cpu.plot(timestamps, history['cpu_usage'], label='CPU', marker='d', 
+                       linewidth=2, linestyle='-', color='#2ca02c')
+            ax_cpu.set_xlabel('采样点', fontsize=12)
+            ax_cpu.set_ylabel('占用率 (%)', fontsize=12)
+            ax_cpu.set_title('CPU占用率', fontsize=14, fontweight='bold')
+            ax_cpu.legend(loc='best', fontsize=10)
+            ax_cpu.grid(True, alpha=0.3)
+            ax_cpu.set_ylim(0, 100)
+            
+            # 3. 内存使用图（左下）- 使用实际MB数
+            ax_mem.plot(timestamps, history['memory_used_mb'], label='已使用', 
+                       marker='v', linewidth=2, linestyle='-', color='#9467bd')
+            ax_mem.set_xlabel('采样点', fontsize=12)
+            ax_mem.set_ylabel('内存 (MB)', fontsize=12)
+            ax_mem.set_title('内存使用', fontsize=14, fontweight='bold')
+            ax_mem.legend(loc='best', fontsize=10)
+            ax_mem.grid(True, alpha=0.3)
+            if history['ddr_total']:
+                # 总带宽
+                ax_ddr.plot(timestamps, history['ddr_total'], label='总带宽', 
+                           linewidth=2.5, color='red', marker='d')
+                
+                # 添加主要模块的带宽曲线
+                if history['ddr_modules']:
+                    modules_to_show = {
+                        'isp': ('ISP', '#1f77b4', '-'),
+                        'npu': ('NPU', '#ff7f0e', '-'),
+                        'vicap': ('VICAP', '#2ca02c', '-'),
+                        'cpu': ('CPU', '#d62728', '-'),
+                        'gpu': ('GPU', '#9467bd', '-'),
+                        'rga': ('RGA', '#8c564b', '-')
+                    }
+                    
+                    for module, (label, color, style) in modules_to_show.items():
+                        if module in history['ddr_modules'][0]:
+                            module_data = [m.get(module, 0) for m in history['ddr_modules']]
+                            ax_ddr.plot(timestamps, module_data, label=label, 
+                                       linewidth=1.5, linestyle=style, color=color, alpha=0.7)
+                
+                ax_ddr.set_xlabel('采样点', fontsize=12)
+                ax_ddr.set_ylabel('带宽 (MB/s)', fontsize=12)
+                ax_ddr.set_title('DDR带宽监控', fontsize=14, fontweight='bold')
+                ax_ddr.legend(loc='best', fontsize=10)
+                ax_ddr.grid(True, alpha=0.3)
+            
+            # 添加总体标题
+            fig.suptitle('性能监控趋势图', fontsize=16, fontweight='bold', y=0.995)
+            
+            # 保存图片，使用bbox_inches='tight'避免布局问题
+            fig.savefig(file_path, dpi=150, bbox_inches='tight')
+            
+            # 关闭图表释放资源
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+            
+            QMessageBox.information(self, "成功", f"性能趋势图已导出到：\n{file_path}")
+            self.statusBar().showMessage(f"性能趋势图已导出: {os.path.basename(file_path)}", 3000)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出失败：\n{str(e)}")
+            log_manager.error(f"[PERF] 导出性能趋势图失败: {str(e)}", exc_info=True)
         
     def browse_log_file(self):
         """浏览选择日志文件"""
