@@ -3048,36 +3048,70 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         ip = self.current_device_ip
         config_filename = "model_config.json"
+        temp_file = f"temp_{config_filename}"
         
         try:
             log_manager.info(f"[CONFIG] 正在从设备 {ip} 加载追踪模式配置...")
             
             # 从设备下载配置文件到临时位置
-            temp_file = f"temp_{config_filename}"
             success, result = self.device_manager.pull_config(config_filename, ip, temp_file)
             
             if success:
-                # 读取并解析配置
-                with open(temp_file, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                
-                modes = config.get('modes', [])
-                self.track_mode_combo.clear()
-                
-                if modes:
-                    # 移除"停止追踪"选项，因为已有单独的停止按钮
-                    for mode in modes:
-                        self.track_mode_combo.addItem(f"[{mode['id']}] {mode['desc']}", mode['id'])
+                try:
+                    # 读取并解析配置
+                    with open(temp_file, 'r', encoding='utf-8') as f:
+                        content = f.read()
                     
-                    log_manager.info(f"[CONFIG] 成功加载 {len(modes)} 个追踪模式")
-                    self.statusBar().showMessage(f"已加载 {len(modes)} 个追踪模式", 2000)
-                else:
-                    log_manager.warning("[CONFIG] 配置文件中没有定义追踪模式")
-                    QMessageBox.warning(self, "警告", "设备上的配置文件中没有定义追踪模式")
-                
-                # 清理临时文件
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
+                    # 先尝试解析，如果失败提供更详细的错误信息
+                    try:
+                        config = json.loads(content)
+                    except json.JSONDecodeError as e:
+                        # 提供更详细的错误诊断
+                        error_line = e.lineno
+                        error_col = e.colno
+                        error_msg = str(e)
+                        
+                        log_manager.error(f"[CONFIG] 配置文件格式错误: {error_msg}")
+                        log_manager.error(f"[CONFIG] 错误位置: 第 {error_line} 行, 第 {error_col} 列")
+                        
+                        # 显示错误附近的上下文
+                        lines = content.split('\n')
+                        if error_line <= len(lines):
+                            start_line = max(0, error_line - 3)
+                            end_line = min(len(lines), error_line + 2)
+                            context = '\n'.join([f"{i+1}: {lines[i]}" for i in range(start_line, end_line)])
+                            log_manager.error(f"[CONFIG] 错误上下文:\n{context}")
+                        
+                        QMessageBox.critical(
+                            self, 
+                            "配置文件格式错误", 
+                            f"设备上的 {config_filename} 文件格式不正确：\n\n"
+                            f"错误位置: 第 {error_line} 行, 第 {error_col} 列\n"
+                            f"错误信息: {error_msg}\n\n"
+                            f"请检查设备上的配置文件是否正确。"
+                        )
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                        return
+                    
+                    modes = config.get('modes', [])
+                    self.track_mode_combo.clear()
+                    
+                    if modes:
+                        # 移除"停止追踪"选项，因为已有单独的停止按钮
+                        for mode in modes:
+                            self.track_mode_combo.addItem(f"[{mode['id']}] {mode['desc']}", mode['id'])
+                        
+                        log_manager.info(f"[CONFIG] 成功加载 {len(modes)} 个追踪模式")
+                        self.statusBar().showMessage(f"已加载 {len(modes)} 个追踪模式", 2000)
+                    else:
+                        log_manager.warning("[CONFIG] 配置文件中没有定义追踪模式")
+                        QMessageBox.warning(self, "警告", "设备上的配置文件中没有定义追踪模式")
+                    
+                finally:
+                    # 清理临时文件
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
             else:
                 error_msg = result if isinstance(result, str) else "未知错误"
                 log_manager.error(f"[CONFIG] 从设备加载配置失败: {error_msg}")
@@ -3087,11 +3121,6 @@ class AlgorithmValidationPlatform(QMainWindow):
                     f"无法从设备加载追踪模式配置：\n{error_msg}\n\n请确保设备上存在 {config_filename} 文件"
                 )
                 
-        except json.JSONDecodeError as e:
-            log_manager.error(f"[CONFIG] 配置文件格式错误: {str(e)}")
-            QMessageBox.critical(self, "错误", f"配置文件格式错误：\n{str(e)}")
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
         except Exception as e:
             log_manager.error(f"[CONFIG] 加载追踪模式异常: {str(e)}")
             QMessageBox.critical(self, "错误", f"加载追踪模式时发生错误：\n{str(e)}")
