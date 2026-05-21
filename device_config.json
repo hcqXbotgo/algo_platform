@@ -1,8 +1,0 @@
-{
-  "device_ip": "192.168.17.181",
-  "wifi_ssid": "XBOTGO-5G",
-  "wifi_password": "xbotgogogo",
-  "rtsp_0": "rtsp://192.168.17.181/live/0",
-  "rtsp_1": "rtsp://192.168.17.181/live/1",
-  "last_connected": "2026-05-19 11:16:28"
-}
