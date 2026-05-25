@@ -32,6 +32,19 @@ class PerformanceMonitor:
             'ddr_total': [],       # DDR总带宽
             'ddr_modules': []      # 各模块带宽: {'cpu': x, 'isp': y, 'npu': z, ...}
         }
+        # 完整历史数据（用于导出，不限制长度）
+        self.full_history_data = {
+            'timestamps': [],
+            'npu_core0': [],
+            'npu_core1': [],
+            'npu_load': [],
+            'cpu_usage': [],
+            'memory_used_mb': [],
+            'memory_total_mb': [],
+            'memory_usage': [],
+            'ddr_total': [],
+            'ddr_modules': []
+        }
         self.latest_data = {}
         self.monitor_thread = None
         self.tool_path = "/userdata/rk-msch-probe-for-user-64bit-1"
@@ -96,6 +109,20 @@ class PerformanceMonitor:
             'memory_usage': [],    # 内存占用率(%)
             'ddr_total': [],       # DDR总带宽
             'ddr_modules': []      # 各模块带宽: {'cpu': x, 'isp': y, 'npu': z, ...}
+        }
+        
+        # 清空完整历史数据
+        self.full_history_data = {
+            'timestamps': [],
+            'npu_core0': [],
+            'npu_core1': [],
+            'npu_load': [],
+            'cpu_usage': [],
+            'memory_used_mb': [],
+            'memory_total_mb': [],
+            'memory_usage': [],
+            'ddr_total': [],
+            'ddr_modules': []
         }
         
         # 检查DDR工具并启动DDR监控（在后台线程中执行，避免阻塞主流程）
@@ -287,6 +314,18 @@ class PerformanceMonitor:
                 for key in self.history_data:
                     if len(self.history_data[key]) > max_len:
                         self.history_data[key] = self.history_data[key][-max_len:]
+                
+                # 更新完整历史数据
+                self.full_history_data['timestamps'].append(timestamp)
+                self.full_history_data['npu_core0'].append(self.latest_npu_data['core0'])
+                self.full_history_data['npu_core1'].append(self.latest_npu_data['core1'])
+                self.full_history_data['npu_load'].append(npu_load)
+                self.full_history_data['cpu_usage'].append(cpu_usage)
+                self.full_history_data['memory_used_mb'].append(memory_used_mb)
+                self.full_history_data['memory_total_mb'].append(memory_total_mb)
+                self.full_history_data['memory_usage'].append(memory_usage)
+                self.full_history_data['ddr_total'].append(ddr_total)
+                self.full_history_data['ddr_modules'].append(ddr_modules)
                 
                 # 更新最新数据
                 self.latest_data = {
@@ -519,8 +558,15 @@ class PerformanceMonitor:
         """获取最新的监控数据"""
         return self.latest_data.copy()
         
-    def get_history_data(self):
-        """获取历史数据"""
+    def get_history_data(self, use_full_history=False):
+        """获取历史数据
+        
+        Args:
+            use_full_history: 是否使用完整历史数据（不限制100个点）
+                             默认为False保持向后兼容
+        """
+        if use_full_history:
+            return self.full_history_data.copy()
         return self.history_data.copy()
         
     def export_data(self, filename="performance_data.csv"):
@@ -532,13 +578,13 @@ class PerformanceMonitor:
                 writer = csv.writer(f)
                 writer.writerow(['时间戳', 'NPU占用(%)', 'CPU占用(%)', '内存占用(%)', 'DDR带宽(MB/s)'])
                 
-                for i in range(len(self.history_data['timestamps'])):
+                for i in range(len(self.full_history_data['timestamps'])):
                     writer.writerow([
-                        self.history_data['timestamps'][i],
-                        self.history_data['npu_load'][i],
-                        self.history_data['cpu_usage'][i],
-                        self.history_data['memory_usage'][i],
-                        self.history_data['ddr_total'][i]
+                        self.full_history_data['timestamps'][i],
+                        self.full_history_data['npu_load'][i],
+                        self.full_history_data['cpu_usage'][i],
+                        self.full_history_data['memory_usage'][i],
+                        self.full_history_data['ddr_total'][i]
                     ])
                     
             return True, f"数据已导出到 {filename}"

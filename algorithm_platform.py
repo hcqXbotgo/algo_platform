@@ -2649,7 +2649,8 @@ class AlgorithmValidationPlatform(QMainWindow):
         
     def export_performance_plot(self):
         """导出性能趋势图"""
-        history = self.performance_monitor.get_history_data()
+        # 获取完整的监控历史数据（不限制100个点）
+        history = self.performance_monitor.get_history_data(use_full_history=True)
         
         if not history['timestamps']:
             QMessageBox.warning(self, "警告", "暂无性能数据，请先启动监控")
