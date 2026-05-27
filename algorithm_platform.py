@@ -6,7 +6,6 @@
 
 import sys
 import os
-import threading
 import subprocess
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
@@ -17,11 +16,11 @@ from PyQt5.QtWidgets import (
     QMenuBar, QAction, QToolBar, QInputDialog, QFrame, QAbstractItemView
 )
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject
-from PyQt5.QtGui import QIcon, QFont, QTextCursor
+from PyQt5.QtCore import Qt, QTimer, QThread
+
+from PyQt5.QtGui import QFont
 import matplotlib
 matplotlib.use('Qt5Agg')
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
@@ -30,11 +29,8 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']  
 plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
 import json
 import re
-import csv
 import numpy as np
 from datetime import datetime
-from functools import partial
-import traceback
 
 # 导入自定义模块
 from log_manager import LogManager
@@ -44,95 +40,28 @@ from log_analyzer import LogAnalyzer
 from video_manager import VideoManager
 from mqtt_controller import MQTTController
 from wifi_manager import WiFiManager
-from smart_device_manager import SmartDeviceManager
 from device_setup_dialog import DeviceSetupDialog
 from rtmp_manager import RTMPManager
+from wifi_perf_test import WiFiPerfTester
+from ui_components import (
+    LogAnalysisTab,
+    ModelConfigTab,
+    PerformanceTab,
+    RTMPTab,
+    VideoTab,
+    WiFiPerfTab,
+)
+from workers import (
+    FileTransferWorker,
+    LogDownloadWorker,
+    PerformanceStartWorker,
+    VideoUploadWorker,
+    WiFiPerfTestWorker,
+    WiFiReconnectWorker,
+)
 
 # 获取全局日志管理器
 log_manager = LogManager()
-
-
-class FileTransferWorker(QObject):
-    """文件传输后台工作线程"""
-    progress = pyqtSignal(int, str)  # 进度百分比, 状态消息
-    finished = pyqtSignal(bool, str)  # 成功/失败, 消息
-    
-    def __init__(self, device_manager, operation_type, **kwargs):
-        super().__init__()
-        self.device_manager = device_manager
-        self.operation_type = operation_type
-        self.kwargs = kwargs
-    
-    def run(self):
-        """执行文件传输操作"""
-        try:
-            log_manager.info(f"[WORKER] 开始执行{self.operation_type}操作")
-            
-            if self.operation_type == 'push_model':
-                model_file = self.kwargs.get('model_file')
-                device_ip = self.kwargs.get('device_ip')
-                
-                self.progress.emit(10, "正在连接设备...")
-                success, msg = self.device_manager.push_model(model_file, device_ip, 'SSH')
-                
-                if success:
-                    self.progress.emit(80, "模型推送成功,正在重启进程...")
-                    restart_success, restart_msg = self.device_manager.restart_media_process(device_ip)
-                    
-                    if restart_success:
-                        self.progress.emit(100, "完成")
-                        self.finished.emit(True, f"{msg}\n✅ multi_media进程已自动重启")
-                    else:
-                        self.progress.emit(100, "完成")
-                        self.finished.emit(True, f"{msg}\n⚠️ multi_media重启失败: {restart_msg}")
-                else:
-                    self.finished.emit(False, msg)
-                    
-            elif self.operation_type == 'push_config':
-                config_file = self.kwargs.get('config_file')
-                device_ip = self.kwargs.get('device_ip')
-                
-                self.progress.emit(10, "正在连接设备...")
-                success, msg = self.device_manager.push_config(config_file, device_ip)
-                
-                if success:
-                    self.progress.emit(80, "配置推送成功,正在重启进程...")
-                    restart_success, restart_msg = self.device_manager.restart_media_process(device_ip)
-                    
-                    # 清理临时文件
-                    if os.path.exists(config_file):
-                        os.remove(config_file)
-                    
-                    if restart_success:
-                        self.progress.emit(100, "完成")
-                        self.finished.emit(True, f"{msg}\n✅ multi_media进程已自动重启,新配置已生效")
-                    else:
-                        self.progress.emit(100, "完成")
-                        self.finished.emit(True, f"{msg}\n⚠️ multi_media重启失败: {restart_msg}")
-                else:
-                    # 清理临时文件
-                    if os.path.exists(config_file):
-                        os.remove(config_file)
-                    self.finished.emit(False, msg)
-                    
-            elif self.operation_type == 'delete_model':
-                model_name = self.kwargs.get('model_name')
-                device_ip = self.kwargs.get('device_ip')
-                
-                self.progress.emit(10, "正在连接设备...")
-                self.progress.emit(50, f"正在删除模型 {model_name}...")
-                success, msg = self.device_manager.delete_model(model_name, device_ip)
-                
-                if success:
-                    self.progress.emit(100, "完成")
-                    self.finished.emit(True, msg)
-                else:
-                    self.finished.emit(False, msg)
-                    
-        except Exception as e:
-            error_trace = traceback.format_exc()
-            log_manager.error(f"[WORKER] {self.operation_type}操作异常: {e}", exc_info=True)
-            self.finished.emit(False, f"{str(e)}\n{error_trace}")
 
 
 class AlgorithmValidationPlatform(QMainWindow):
@@ -157,22 +86,13 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.mqtt_controller = MQTTController()
         self.wifi_manager = WiFiManager()
         self.rtmp_manager = RTMPManager()
+        self.wifi_perf_tester = WiFiPerfTester()
         
         # 设备连接状态
         self.device_connected = False
         self.ssh_available = False
         self.adb_available = False
         self.current_device_ip = None
-        
-        # 文件传输线程（防止被垃圾回收）
-        self.transfer_worker = None
-        self.transfer_thread = None
-        
-        # 状态栏
-        self.statusBar().showMessage("就绪")
-        
-        # 创建菜单栏
-        self.create_menu_bar()
         
         # 创建工具栏
         self.create_toolbar()
@@ -370,6 +290,11 @@ class AlgorithmValidationPlatform(QMainWindow):
         from log_viewer import LogViewerDialog
         dialog = LogViewerDialog(self)
         dialog.exec_()
+
+    def _transfer_in_progress(self):
+        """检查是否已有文件传输任务正在运行。"""
+        thread = getattr(self, "transfer_thread", None)
+        return bool(thread and thread.isRunning())
         
     def create_main_ui(self):
         """创建主界面"""
@@ -383,582 +308,34 @@ class AlgorithmValidationPlatform(QMainWindow):
         tab_widget.addTab(self.create_performance_tab(), "性能监控")  # 包含算法控制和进程控制
         tab_widget.addTab(self.create_log_analysis_tab(), "日志分析")
         tab_widget.addTab(self.create_video_tab(), "视频源管理")
+        tab_widget.addTab(self.create_wifi_perf_tab(), "WiFi性能测试")  # 新增WiFi性能测试
         # 移除独立的"算法控制"标签页，已合并到性能监控页面
 
     def create_model_config_tab(self):
         """创建模型与配置合并标签页"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+        return ModelConfigTab.create_tab(self)
+
         
-        # ========== 上半部分：模型管理 ==========
-        model_group = QGroupBox("📦 模型文件管理")
-        model_layout = QVBoxLayout()
-        
-        # 模型文件选择
-        file_select_layout = QHBoxLayout()
-        self.model_file_edit = QLineEdit()
-        self.model_file_edit.setReadOnly(True)
-        browse_btn = QPushButton("浏览...")
-        browse_btn.clicked.connect(self.browse_model_file)
-        file_select_layout.addWidget(QLabel("RKNN模型:"))
-        file_select_layout.addWidget(self.model_file_edit)
-        file_select_layout.addWidget(browse_btn)
-        model_layout.addLayout(file_select_layout)
-        
-        # 推送按钮
-        push_model_btn = QPushButton("📤 推送模型到设备")
-        push_model_btn.clicked.connect(self.push_model_to_device)
-        push_model_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px; font-weight: bold;")
-        model_layout.addWidget(push_model_btn)
-        
-        model_group.setLayout(model_layout)
-        layout.addWidget(model_group)
-        
-        # 当前模型列表（带删除功能）
-        list_group = QGroupBox("📋 已部署模型")
-        list_layout = QVBoxLayout()
-        
-        self.model_table = QTableWidget()
-        self.model_table.setColumnCount(4)
-        self.model_table.setHorizontalHeaderLabels(["模型名称", "大小", "修改时间", "操作"])
-        self.model_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        list_layout.addWidget(self.model_table)
-        
-        refresh_btn = QPushButton("🔄 刷新模型列表")
-        refresh_btn.clicked.connect(self.refresh_model_list)
-        list_layout.addWidget(refresh_btn)
-        
-        list_group.setLayout(list_layout)
-        layout.addWidget(list_group)
-        
-        # ========== 分隔线 ==========
-        separator = QLabel()
-        separator.setFrameStyle(QFrame.HLine | QFrame.Sunken)
-        layout.addWidget(separator)
-        
-        # ========== 下半部分：参数配置 ==========
-        config_group = QGroupBox("⚙️ 配置文件管理")
-        config_layout = QVBoxLayout()
-        
-        # 配置文件选择
-        config_file_layout = QHBoxLayout()
-        self.config_file_edit = QLineEdit()
-        self.config_file_edit.setReadOnly(True)
-        config_browse_btn = QPushButton("浏览...")
-        config_browse_btn.clicked.connect(self.browse_config_file)
-        config_file_layout.addWidget(QLabel("配置文件:"))
-        config_file_layout.addWidget(self.config_file_edit)
-        config_file_layout.addWidget(config_browse_btn)
-        config_layout.addLayout(config_file_layout)
-        
-        load_config_btn = QPushButton("📂 加载配置")
-        load_config_btn.clicked.connect(self.load_config)
-        config_layout.addWidget(load_config_btn)
-        
-        load_device_config_btn = QPushButton("🔄 从设备加载")
-        load_device_config_btn.clicked.connect(self.load_config_from_device)
-        load_device_config_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px; font-weight: bold;")
-        config_layout.addWidget(load_device_config_btn)
-        
-        config_group.setLayout(config_layout)
-        layout.addWidget(config_group)
-        
-        # 配置编辑器
-        edit_group = QGroupBox("📝 配置编辑器")
-        edit_layout = QVBoxLayout()
-        
-        self.config_text_edit = QTextEdit()
-        self.config_text_edit.setFont(QFont("Consolas", 10))
-        edit_layout.addWidget(self.config_text_edit)
-        
-        btn_layout = QHBoxLayout()
-        save_local_btn = QPushButton("💾 保存到本地")
-        save_local_btn.clicked.connect(self.save_config_local)
-        btn_layout.addWidget(save_local_btn)
-        
-        push_config_btn = QPushButton("📤 推送到设备")
-        push_config_btn.clicked.connect(self.push_config_to_device)
-        push_config_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 8px; font-weight: bold;")
-        btn_layout.addWidget(push_config_btn)
-        
-        edit_layout.addLayout(btn_layout)
-        edit_group.setLayout(edit_layout)
-        layout.addWidget(edit_group)
-        
-        return widget
-        
-    def create_model_tab(self):
-        """创建模型管理标签页"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        # 模型文件选择组
-        model_group = QGroupBox("模型文件管理")
-        model_layout = QFormLayout()
-        
-        self.model_file_edit = QLineEdit()
-        self.model_file_edit.setReadOnly(True)
-        browse_btn = QPushButton("浏览...")
-        browse_btn.clicked.connect(self.browse_model_file)
-        model_file_layout = QHBoxLayout()
-        model_file_layout.addWidget(self.model_file_edit)
-        model_file_layout.addWidget(browse_btn)
-        model_layout.addRow("RKNN模型:", model_file_layout)
-        
-        push_model_btn = QPushButton("推送模型到设备")
-        push_model_btn.clicked.connect(self.push_model_to_device)
-        push_model_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px;")
-        model_layout.addRow(push_model_btn)
-        
-        model_group.setLayout(model_layout)
-        layout.addWidget(model_group)
-        
-        # 当前模型列表
-        list_group = QGroupBox("已部署模型")
-        list_layout = QVBoxLayout()
-        
-        # 添加oem分区占用信息显示
-        self.oem_usage_label = QLabel("加载中...")
-        self.oem_usage_label.setStyleSheet("""
-            padding: 8px; 
-            background-color: #e3f2fd; 
-            border-radius: 3px;
-            color: #1976d2;
-            font-weight: bold;
-        """)
-        self.oem_usage_label.setWordWrap(True)
-        list_layout.addWidget(self.oem_usage_label)
-        
-        self.model_table = QTableWidget()
-        self.model_table.setColumnCount(3)
-        self.model_table.setHorizontalHeaderLabels(["模型名称", "大小", "修改时间"])
-        self.model_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        list_layout.addWidget(self.model_table)
-        
-        refresh_btn = QPushButton("刷新模型列表")
-        refresh_btn.clicked.connect(self.refresh_model_list)
-        list_layout.addWidget(refresh_btn)
-        
-        list_group.setLayout(list_layout)
-        layout.addWidget(list_group)
-        
-        return widget
         
     def create_performance_tab(self):
         """创建性能监控标签页（包含算法控制和进程控制）"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        # 控制面板
-        control_group = QGroupBox("监控控制")
-        control_layout = QFormLayout()
-        
-        self.monitor_interval_spin = QSpinBox()
-        self.monitor_interval_spin.setRange(1, 10)
-        self.monitor_interval_spin.setValue(2)
-        control_layout.addRow("采样间隔(秒):", self.monitor_interval_spin)
-        
-        self.ddr_freq_spin = QSpinBox()
-        self.ddr_freq_spin.setRange(1000, 3000)
-        self.ddr_freq_spin.setValue(1848)
-        control_layout.addRow("DDR频率(MHz):", self.ddr_freq_spin)
-        
-        # 创建单个按钮，根据状态切换文本
-        self.monitor_btn = QPushButton("开始监控")
-        self.monitor_btn.clicked.connect(self.toggle_monitoring)
-        self.monitor_btn.setStyleSheet("background-color: #4CAF50; color: white;")
-        control_layout.addRow(self.monitor_btn)
-        
-        # 监控状态标记
-        self.is_monitoring = False
-        
-        control_group.setLayout(control_layout)
-        layout.addWidget(control_group)
-        
-        # MQTT状态显示（只读，自动连接）
-        mqtt_group = QGroupBox("MQTT状态")
-        mqtt_layout = QVBoxLayout()
-        
-        self.mqtt_status_label = QLabel("🔌 MQTT: 未连接\n💡 提示: 设备配置后将自动连接MQTT")
-        self.mqtt_status_label.setStyleSheet("""
-            padding: 15px; 
-            background-color: #ecf0f1; 
-            border-radius: 5px;
-            color: #7f8c8d;
-        """)
-        self.mqtt_status_label.setWordWrap(True)
-        mqtt_layout.addWidget(self.mqtt_status_label)
-        
-        mqtt_group.setLayout(mqtt_layout)
-        layout.addWidget(mqtt_group)
-        
-        # 追踪模式选择（使用单个按钮切换状态）
-        track_group = QGroupBox("追踪模式")
-        track_layout = QFormLayout()
-        
-        self.track_mode_combo = QComboBox()
-        # 从配置文件加载模式
-        self.load_track_modes()
-        track_layout.addRow("追踪模式:", self.track_mode_combo)
-        
-        # 创建单个按钮，根据状态切换文本
-        self.track_btn = QPushButton("启动追踪")
-        self.track_btn.clicked.connect(self.toggle_tracking)
-        self.track_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px;")
-        track_layout.addRow(self.track_btn)
-        
-        # 追踪状态标记
-        self.is_tracking = False
-        
-        track_group.setLayout(track_layout)
-        layout.addWidget(track_group)
-        
-        # 进程控制
-        process_group = QGroupBox("进程控制")
-        process_layout = QHBoxLayout()
-        
-        restart_process_btn = QPushButton("重启multi_media进程")
-        restart_process_btn.clicked.connect(self.restart_media_process)
-        restart_process_btn.setStyleSheet("background-color: #FF9800; color: white;")
-        process_layout.addWidget(restart_process_btn)
-        
-        kill_process_btn = QPushButton("停止multi_media进程")
-        kill_process_btn.clicked.connect(self.kill_media_process)
-        kill_process_btn.setStyleSheet("background-color: #f44336; color: white;")
-        process_layout.addWidget(kill_process_btn)
-        
-        process_group.setLayout(process_layout)
-        layout.addWidget(process_group)
-        
-        # 实时数据显示
-        data_group = QGroupBox("实时数据")
-        data_layout = QVBoxLayout()
-        
-        self.perf_table = QTableWidget()
-        self.perf_table.setColumnCount(2)
-        self.perf_table.setHorizontalHeaderLabels(["指标", "数值"])
-        self.perf_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        data_layout.addWidget(self.perf_table)
-        
-        data_group.setLayout(data_layout)
-        layout.addWidget(data_group)
-        
-        # 图表区域
-        chart_group = QGroupBox("性能趋势图")
-        chart_layout = QVBoxLayout()
-        
-        self.perf_figure = Figure(figsize=(10, 4))
-        self.perf_canvas = FigureCanvas(self.perf_figure)
-        chart_layout.addWidget(self.perf_canvas)
-        
-        # 导出图片按钮
-        export_perf_btn = QPushButton("💾 导出性能趋势图")
-        export_perf_btn.clicked.connect(self.export_performance_plot)
-        export_perf_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
-        chart_layout.addWidget(export_perf_btn)
-        
-        chart_group.setLayout(chart_layout)
-        layout.addWidget(chart_group)
-        
-        return widget
+        return PerformanceTab.create_tab(self)
+
         
     def create_log_analysis_tab(self):
         """创建日志分析标签页"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        # ========== 上半部分：日志文件选择 ==========
-        file_group = QGroupBox("📄 日志文件选择")
-        file_layout = QVBoxLayout()
-        
-        # 日志文件输入框和按钮
-        file_select_layout = QHBoxLayout()
-        self.log_file_edit = QLineEdit()
-        self.log_file_edit.setReadOnly(True)
-        log_browse_btn = QPushButton("本地浏览...")
-        log_browse_btn.clicked.connect(self.browse_log_file)
-        device_log_btn = QPushButton("从设备选择...")
-        device_log_btn.clicked.connect(self.load_device_logs)
-        device_log_btn.setStyleSheet("background-color: #2196F3; color: white;")
-        
-        file_select_layout = QHBoxLayout()
-        file_select_layout.addWidget(QLabel("日志文件:"))
-        file_select_layout.addWidget(self.log_file_edit)
-        file_select_layout.addWidget(log_browse_btn)
-        file_select_layout.addWidget(device_log_btn)
-        file_layout.addLayout(file_select_layout)
-        
-        # 分析按钮
-        analyze_btn = QPushButton(" 分析日志")
-        analyze_btn.clicked.connect(self.analyze_log)
-        analyze_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 10px;")
-        file_layout.addWidget(analyze_btn)
-        
-        file_group.setLayout(file_layout)
-        layout.addWidget(file_group)
-        
-        # ========== 分隔线 ==========
-        separator = QLabel()
-        separator.setFrameStyle(QFrame.HLine | QFrame.Sunken)
-        layout.addWidget(separator)
-        
-        # ========== 下半部分：设备日志列表 ==========
-        list_group = QGroupBox("📋 设备日志文件列表")
-        list_layout = QVBoxLayout()
-        
-        self.device_log_table = QTableWidget()
-        self.device_log_table.setColumnCount(4)
-        self.device_log_table.setHorizontalHeaderLabels(["日志文件名", "大小", "修改时间", "操作"])
-        self.device_log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.device_log_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.device_log_table.setStyleSheet("""
-            QTableWidget {
-                gridline-color: #e0e0e0;
-            }
-            QTableWidget::item {
-                padding: 5px;
-            }
-            QHeaderView::section {
-                background-color: #f5f5f5;
-                padding: 8px;
-                border: 1px solid #d0d0d0;
-                font-weight: bold;
-            }
-        """)
-        list_layout.addWidget(self.device_log_table)
-        
-        btn_layout = QHBoxLayout()
-        refresh_btn = QPushButton(" 刷新日志列表")
-        refresh_btn.clicked.connect(self.load_device_logs)
-        btn_layout.addWidget(refresh_btn)
-        
-        list_layout.addLayout(btn_layout)
-        list_group.setLayout(list_layout)
-        layout.addWidget(list_group)
-        
-        # ========== 分隔线 ==========
-        separator2 = QLabel()
-        separator2.setFrameStyle(QFrame.HLine | QFrame.Sunken)
-        layout.addWidget(separator2)
-        
-        # ========== 分析结果 ==========
-        result_group = QGroupBox("📊 分析结果")
-        result_layout = QVBoxLayout()
-        
-        self.result_table = QTableWidget()
-        self.result_table.setColumnCount(7)
-        self.result_table.setHorizontalHeaderLabels([
-            "模型名称", 
-            "推理平均(ms)", 
-            "总耗时平均(ms)", 
-            "最大耗时(ms)",
-            "帧数",
-            "推理标准差(ms)",
-            "总耗时标准差(ms)"
-        ])
-        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.result_table.setStyleSheet("""
-            QTableWidget {
-                gridline-color: #e0e0e0;
-            }
-            QTableWidget::item {
-                padding: 5px;
-            }
-            QHeaderView::section {
-                background-color: #f5f5f5;
-                padding: 8px;
-                border: 1px solid #d0d0d0;
-                font-weight: bold;
-            }
-        """)
-        result_layout.addWidget(self.result_table)
-        
-        export_csv_btn = QPushButton("💾 导出CSV")
-        export_csv_btn.clicked.connect(self.export_csv)
-        result_layout.addWidget(export_csv_btn)
-        
-        result_group.setLayout(result_layout)
-        layout.addWidget(result_group)
-        
-        # 图表显示
-        plot_group = QGroupBox("📈 耗时曲线")
-        plot_layout = QVBoxLayout()
-        
-        self.log_figure = Figure(figsize=(10, 5))
-        self.log_canvas = FigureCanvas(self.log_figure)
-        plot_layout.addWidget(self.log_canvas)
-        
-        # 导出图片按钮
-        export_plot_btn = QPushButton("💾 导出图片")
-        export_plot_btn.clicked.connect(self.export_log_plot)
-        export_plot_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
-        plot_layout.addWidget(export_plot_btn)
-        
-        plot_group.setLayout(plot_layout)
-        layout.addWidget(plot_group)
-        
-        return widget
+        return LogAnalysisTab.create_tab(self)
+
         
     def create_video_tab(self):
         """创建视频源管理标签页"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        # RTSP配置
-        rtsp_group = QGroupBox("RTSP流配置")
-        rtsp_layout = QFormLayout()
-        
-        # 显示当前设备IP（只读）
-        self.rtsp_device_ip_label = QLabel("未连接设备")
-        self.rtsp_device_ip_label.setStyleSheet("color: #7f8c8d; padding: 5px;")
-        rtsp_layout.addRow("设备IP:", self.rtsp_device_ip_label)
-        
-        self.rtsp_channel1 = QCheckBox("通道0 (rtsp://IP/live/0)")
-        self.rtsp_channel1.setChecked(True)
-        rtsp_layout.addRow(self.rtsp_channel1)
-        
-        self.rtsp_channel2 = QCheckBox("通道1 (rtsp://IP/live/1)")
-        rtsp_layout.addRow(self.rtsp_channel2)
-        
-        connect_rtsp_btn = QPushButton("连接RTSP流")
-        connect_rtsp_btn.clicked.connect(self.connect_rtsp)
-        rtsp_layout.addRow(connect_rtsp_btn)
-        
-        rtsp_group.setLayout(rtsp_layout)
-        layout.addWidget(rtsp_group)
-        
-        # 本地视频上传
-        local_group = QGroupBox("本地视频管理")
-        local_layout = QFormLayout()
-        
-        self.video_file_edit = QLineEdit()
-        self.video_file_edit.setReadOnly(True)
-        video_browse_btn = QPushButton("浏览...")
-        video_browse_btn.clicked.connect(self.browse_video_file)
-        video_file_layout = QHBoxLayout()
-        video_file_layout.addWidget(self.video_file_edit)
-        video_file_layout.addWidget(video_browse_btn)
-        local_layout.addRow("视频文件:", video_file_layout)
-        
-        upload_video_btn = QPushButton("上传视频到设备")
-        upload_video_btn.clicked.connect(self.upload_video_to_device)
-        local_layout.addRow(upload_video_btn)
-        
-        local_group.setLayout(local_layout)
-        layout.addWidget(local_group)
-        
-        # 视频源切换
-        source_group = QGroupBox("视频源选择")
-        source_layout = QFormLayout()
-        
-        self.video_source_combo = QComboBox()
-        self.video_source_combo.addItems(["本地视频(/userdata)", "RTSP摄像头流"])
-        source_layout.addRow("视频源:", self.video_source_combo)
-        
-        apply_source_btn = QPushButton("应用视频源设置")
-        apply_source_btn.clicked.connect(self.apply_video_source)
-        source_layout.addRow(apply_source_btn)
-        
-        source_group.setLayout(source_layout)
-        layout.addWidget(source_group)
-        
-        return widget
+        return VideoTab.create_tab(self)
+
         
     def create_rtmp_tab(self):
         """创建RTMP直播标签页"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        # RTMP服务器配置组
-        rtmp_group = QGroupBox("RTMP服务器配置")
-        rtmp_layout = QFormLayout()
-        
-        self.rtmp_url_edit = QLineEdit("rtmp://192.168.17.108/live/test")
-        self.rtmp_url_edit.setPlaceholderText("例如: rtmp://192.168.17.108/live/test")
-        rtmp_layout.addRow("服务器地址:", self.rtmp_url_edit)
-        
-        self.rtmp_quality_combo = QComboBox()
-        self.rtmp_quality_combo.addItems(["720P (流畅)", "1080P (高清)"])
-        self.rtmp_quality_combo.setCurrentIndex(0)
-        rtmp_layout.addRow("画质选择:", self.rtmp_quality_combo)
-        
-        rtmp_group.setLayout(rtmp_layout)
-        layout.addWidget(rtmp_group)
-        
-        # 推流控制组
-        control_group = QGroupBox("推流控制")
-        control_layout = QVBoxLayout()
-        
-        # 状态显示
-        self.rtmp_status_label = QLabel("📺 RTMP推流状态: 未启动")
-        self.rtmp_status_label.setStyleSheet("""
-            padding: 15px; 
-            background-color: #ecf0f1; 
-            border-radius: 5px;
-            color: #7f8c8d;
-            font-size: 14px;
-        """)
-        self.rtmp_status_label.setAlignment(Qt.AlignCenter)
-        control_layout.addWidget(self.rtmp_status_label)
-        
-        # 按钮布局
-        btn_layout = QHBoxLayout()
-        
-        start_stream_btn = QPushButton("▶️ 开始直播")
-        start_stream_btn.clicked.connect(self.start_rtmp_streaming)
-        start_stream_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60;
-                color: white;
-                padding: 12px;
-                font-size: 14px;
-                font-weight: bold;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #229954;
-            }
-        """)
-        btn_layout.addWidget(start_stream_btn)
-        
-        stop_stream_btn = QPushButton("⏹️ 停止直播")
-        stop_stream_btn.clicked.connect(self.stop_rtmp_streaming)
-        stop_stream_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c;
-                color: white;
-                padding: 12px;
-                font-size: 14px;
-                font-weight: bold;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #c0392b;
-            }
-        """)
-        btn_layout.addWidget(stop_stream_btn)
-        
-        control_layout.addLayout(btn_layout)
-        control_group.setLayout(control_layout)
-        layout.addWidget(control_group)
-        
-        # 使用说明
-        help_group = QGroupBox("使用说明")
-        help_layout = QVBoxLayout()
-        help_text = QLabel(
-            "• 选择画质后点击'开始直播'即可推流\n"
-            "• 720P适合网络带宽有限的场景\n"
-            "• 1080P提供高清画质\n"
-            "• 推流过程中可随时停止\n"
-            "• 确保设备已连接到网络"
-        )
-        help_text.setStyleSheet("color: #7f8c8d; padding: 10px;")
-        help_text.setWordWrap(True)
-        help_layout.addWidget(help_text)
-        help_group.setLayout(help_layout)
-        layout.addWidget(help_group)
-        
-        return widget
+        return RTMPTab.create_tab(self)
+
         
     def start_rtmp_streaming(self):
         """开始RTMP推流"""
@@ -1038,7 +415,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.critical(self, "错误", error_msg)
             self.rtmp_status_label.setText("❌ RTMP推流状态: 异常")
             self.statusBar().showMessage("RTMP停止推流异常", 3000)
-    
+
     def stop_rtmp_streaming(self):
         """停止RTMP推流"""
         # 检查设备是否已连接
@@ -1107,68 +484,313 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.rtmp_status_label.setText("❌ RTMP推流状态: 异常")
             self.statusBar().showMessage("RTMP停止推流异常", 3000)
 
-    def create_control_tab(self):
-        """创建算法控制标签页"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+    def create_wifi_perf_tab(self):
+        """创建WiFi性能测试标签页"""
+        return WiFiPerfTab.create_tab(self)
+
+
+    
+    # ==================== WiFi性能测试相关函数 ====================
+    
+    def on_test_mode_changed(self, index):
+        """测试模式切换"""
+        if index == 0:  # 单点测试
+            self.single_config_widget.setVisible(True)
+            self.multi_config_widget.setVisible(False)
+        else:  # 多点扫描
+            self.single_config_widget.setVisible(False)
+            self.multi_config_widget.setVisible(True)
+    
+    def refresh_wifi_info(self):
+        """刷新WiFi信息"""
+        if not self.current_device_ip:
+            QMessageBox.warning(self, "警告", "请先连接设备")
+            return
         
-        # MQTT状态显示（只读，自动连接）
-        mqtt_group = QGroupBox("MQTT状态")
-        mqtt_layout = QVBoxLayout()
+        self.wifi_device_ip_label.setText(self.current_device_ip)
+        self.wifi_device_ip_label.setStyleSheet("color: #27ae60; font-weight: bold; padding: 5px;")
         
-        self.mqtt_status_label = QLabel("🔌 MQTT: 未连接\n💡 提示: 设备配置后将自动连接MQTT")
-        self.mqtt_status_label.setStyleSheet("""
+        # 获取WiFi信息
+        wifi_info = self.wifi_perf_tester.get_wifi_info()
+        
+        rssi = wifi_info['rssi']
+        speed = wifi_info['link_speed']
+        
+        self.wifi_rssi_label.setText(f"{rssi} dBm")
+        self.wifi_speed_label.setText(f"{speed} Mbps")
+        
+        # 根据RSSI设置颜色
+        if rssi < -70:
+            color = "#e74c3c"  # 红色 - 信号弱
+        elif rssi < -50:
+            color = "#f39c12"  # 橙色 - 信号中等
+        else:
+            color = "#27ae60"  # 绿色 - 信号强
+        
+        self.wifi_rssi_label.setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; font-size: 14px;")
+        
+        log_manager.info(f"WiFi信息: RSSI={rssi}dBm, 速率={speed}Mbps")
+    
+    def start_wifi_perf_test(self):
+        """开始WiFi性能测试"""
+        if not self.current_device_ip:
+            QMessageBox.warning(self, "警告", "请先连接设备")
+            return
+        
+        # 更新设备IP
+        self.wifi_perf_tester.set_device_ip(self.current_device_ip)
+        
+        test_mode = self.bandwidth_combo.currentIndex()
+        duration = self.test_duration_spin.value()
+        
+        if test_mode == 0:  # 单点测试
+            bandwidth = self.single_bandwidth_spin.value()
+            self._start_single_test(bandwidth, duration)
+        else:  # 多点扫描
+            start_bw = self.multi_bw_start_spin.value()
+            end_bw = self.multi_bw_end_spin.value()
+            step_bw = self.multi_bw_step_spin.value()
+            
+            if start_bw >= end_bw:
+                QMessageBox.warning(self, "错误", "起始带宽必须小于结束带宽")
+                return
+            
+            bandwidths = list(range(start_bw, end_bw + 1, step_bw))
+            self._start_multi_test(bandwidths, duration)
+    
+    def _start_single_test(self, bandwidth, duration):
+        """开始单点测试"""
+        self._start_wifi_test_worker("single", duration, bandwidth=bandwidth)
+    
+    def _start_multi_test(self, bandwidths, duration):
+        """开始多点扫描测试"""
+        self._start_wifi_test_worker("multi", duration, bandwidths=bandwidths)
+
+    def _start_wifi_test_worker(self, mode, duration, bandwidth=None, bandwidths=None):
+        """启动 WiFi 测试 QThread，所有 UI 更新由信号回到主线程处理。"""
+        if getattr(self, "wifi_test_thread", None) and self.wifi_test_thread.isRunning():
+            QMessageBox.information(self, "提示", "当前已有WiFi测试正在运行")
+            return
+
+        self.start_test_btn.setEnabled(False)
+        self.stop_test_btn.setEnabled(True)
+        self.wifi_test_status_label.setText("🔄 测试状态: 正在启动iperf3服务器...")
+        self.wifi_test_status_label.setStyleSheet("""
+            padding: 15px; 
+            background-color: #fff3cd; 
+            border-radius: 5px;
+            color: #856404;
+            font-size: 14px;
+        """)
+
+        self.wifi_test_thread = QThread()
+        self.wifi_test_worker = WiFiPerfTestWorker(
+            self.wifi_perf_tester,
+            mode=mode,
+            duration=duration,
+            bandwidth=bandwidth,
+            bandwidths=bandwidths,
+        )
+        self.wifi_test_worker.moveToThread(self.wifi_test_thread)
+
+        self.wifi_test_thread.started.connect(self.wifi_test_worker.run)
+        self.wifi_test_worker.progress.connect(self._on_wifi_worker_progress, Qt.QueuedConnection)
+        self.wifi_test_worker.result_ready.connect(self._on_wifi_result_ready, Qt.QueuedConnection)
+        self.wifi_test_worker.finished.connect(self._on_wifi_worker_finished, Qt.QueuedConnection)
+        self.wifi_test_worker.finished.connect(self.wifi_test_thread.quit)
+        self.wifi_test_worker.finished.connect(self.wifi_test_worker.deleteLater)
+        self.wifi_test_thread.finished.connect(self.wifi_test_thread.deleteLater)
+        self.wifi_test_thread.finished.connect(self._clear_wifi_worker_refs)
+        self.wifi_test_thread.start()
+
+    def _on_wifi_worker_progress(self, progress, message):
+        """WiFi 测试进度更新。"""
+        self.wifi_test_progress.setValue(progress)
+        self.wifi_test_status_label.setText(f"🔄 {message}")
+
+    def _on_wifi_result_ready(self, result):
+        """WiFi 测试结果更新。"""
+        self._add_result_to_table(result)
+        self._update_wifi_chart()
+
+    def _on_wifi_worker_finished(self, success, message):
+        """WiFi 测试结束。"""
+        self._update_test_status(success, message)
+        if success:
+            self.wifi_test_progress.setValue(100)
+        self.start_test_btn.setEnabled(True)
+        self.stop_test_btn.setEnabled(False)
+
+    def _clear_wifi_worker_refs(self):
+        """释放 WiFi 测试线程引用。"""
+        self.wifi_test_worker = None
+        self.wifi_test_thread = None
+    
+    def _add_result_to_table(self, result):
+        """添加结果到表格"""
+        row = self.wifi_result_table.rowCount()
+        self.wifi_result_table.insertRow(row)
+        
+        self.wifi_result_table.setItem(row, 0, QTableWidgetItem(str(result['bandwidth_target'])))
+        self.wifi_result_table.setItem(row, 1, QTableWidgetItem(f"{result['throughput_mbps']:.2f}"))
+        self.wifi_result_table.setItem(row, 2, QTableWidgetItem(f"{result['jitter_ms']:.2f}"))
+        self.wifi_result_table.setItem(row, 3, QTableWidgetItem(f"{result['loss_percent']:.2f}%"))
+        self.wifi_result_table.setItem(row, 4, QTableWidgetItem(f"{result['avg_latency_ms']:.2f}"))
+        self.wifi_result_table.setItem(row, 5, QTableWidgetItem(f"{result['rssi_dbm']}"))
+        self.wifi_result_table.setItem(row, 6, QTableWidgetItem(f"{result['link_speed_mbps']:.1f}"))
+        self.wifi_result_table.setItem(row, 7, QTableWidgetItem(result['timestamp']))
+    
+    def _update_wifi_chart(self):
+        """更新WiFi性能图表"""
+        if not self.wifi_perf_tester.test_results:
+            return
+        
+        self.wifi_perf_figure.clear()
+        
+        # 创建子图
+        ax1 = self.wifi_perf_figure.add_subplot(2, 2, 1)
+        ax2 = self.wifi_perf_figure.add_subplot(2, 2, 2)
+        ax3 = self.wifi_perf_figure.add_subplot(2, 2, 3)
+        ax4 = self.wifi_perf_figure.add_subplot(2, 2, 4)
+        
+        # 提取数据
+        bandwidths = [r['bandwidth_target'] for r in self.wifi_perf_tester.test_results]
+        throughputs = [r['throughput_mbps'] for r in self.wifi_perf_tester.test_results]
+        jitters = [r['jitter_ms'] for r in self.wifi_perf_tester.test_results]
+        losses = [r['loss_percent'] for r in self.wifi_perf_tester.test_results]
+        latencies = [r['avg_latency_ms'] for r in self.wifi_perf_tester.test_results]
+        
+        # 吞吐量 vs 目标带宽
+        ax1.plot(bandwidths, throughputs, 'o-', linewidth=2, markersize=8, color='#27ae60')
+        ax1.set_xlabel('目标带宽 (Mbps)', fontsize=10)
+        ax1.set_ylabel('实际吞吐量 (Mbps)', fontsize=10)
+        ax1.set_title('吞吐量测试', fontsize=12, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        
+        # 抖动 vs 目标带宽
+        ax2.plot(bandwidths, jitters, 's-', linewidth=2, markersize=8, color='#e74c3c')
+        ax2.set_xlabel('目标带宽 (Mbps)', fontsize=10)
+        ax2.set_ylabel('抖动 (ms)', fontsize=10)
+        ax2.set_title('网络抖动', fontsize=12, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        
+        # 丢包率 vs 目标带宽
+        ax3.plot(bandwidths, losses, '^-', linewidth=2, markersize=8, color='#f39c12')
+        ax3.set_xlabel('目标带宽 (Mbps)', fontsize=10)
+        ax3.set_ylabel('丢包率 (%)', fontsize=10)
+        ax3.set_title('丢包率', fontsize=12, fontweight='bold')
+        ax3.grid(True, alpha=0.3)
+        
+        # 延迟 vs 目标带宽
+        ax4.plot(bandwidths, latencies, 'D-', linewidth=2, markersize=8, color='#3498db')
+        ax4.set_xlabel('目标带宽 (Mbps)', fontsize=10)
+        ax4.set_ylabel('平均延迟 (ms)', fontsize=10)
+        ax4.set_title('通信延迟', fontsize=12, fontweight='bold')
+        ax4.grid(True, alpha=0.3)
+        
+        # 使用tight_layout并捕获警告，避免布局问题导致递归重绘
+        try:
+            self.wifi_perf_figure.tight_layout()
+        except Exception:
+            pass
+        
+        self.wifi_perf_canvas.draw()
+    
+    def _update_test_status(self, success, message):
+        """更新测试状态"""
+        if success:
+            self.wifi_test_status_label.setText(f"✅ 测试状态: {message}")
+            self.wifi_test_status_label.setStyleSheet("""
+                padding: 15px; 
+                background-color: #d4edda; 
+                border-radius: 5px;
+                color: #155724;
+                font-size: 14px;
+            """)
+        else:
+            self.wifi_test_status_label.setText(f"❌ 测试状态: {message}")
+            self.wifi_test_status_label.setStyleSheet("""
+                padding: 15px; 
+                background-color: #f8d7da; 
+                border-radius: 5px;
+                color: #721c24;
+                font-size: 14px;
+            """)
+    
+    def stop_wifi_perf_test(self):
+        """停止WiFi性能测试"""
+        worker = getattr(self, "wifi_test_worker", None)
+        if not worker:
+            self._update_test_status(False, "当前没有正在运行的测试")
+            return
+
+        reply = QMessageBox.question(
+            self, 
+            "确认", 
+            "确定要停止当前测试吗？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+
+        worker.cancel()
+        self.wifi_test_status_label.setText("⏹️ 测试状态: 正在停止...")
+        self.wifi_test_status_label.setStyleSheet("""
             padding: 15px; 
             background-color: #ecf0f1; 
             border-radius: 5px;
             color: #7f8c8d;
+            font-size: 14px;
         """)
-        self.mqtt_status_label.setWordWrap(True)
-        mqtt_layout.addWidget(self.mqtt_status_label)
+        self.stop_test_btn.setEnabled(False)
         
-        mqtt_group.setLayout(mqtt_layout)
-        layout.addWidget(mqtt_group)
+        log_manager.info("WiFi性能测试已请求停止")
+    
+    def export_wifi_perf_csv(self):
+        """导出WiFi性能测试CSV"""
+        if not self.wifi_perf_tester.test_results:
+            QMessageBox.warning(self, "警告", "没有可导出的测试结果")
+            return
         
-        # 追踪模式选择（移除了停止追踪选项）
-        track_group = QGroupBox("追踪模式")
-        track_layout = QFormLayout()
+        filepath, msg = self.wifi_perf_tester.export_to_csv()
         
-        self.track_mode_combo = QComboBox()
-        # 从配置文件加载模式
-        self.load_track_modes()
-        track_layout.addRow("追踪模式:", self.track_mode_combo)
+        if filepath:
+            QMessageBox.information(self, "成功", f"测试结果已导出到:\n{filepath}")
+            log_manager.info(f"WiFi性能测试结果已导出: {filepath}")
+        else:
+            QMessageBox.critical(self, "错误", msg)
+    
+    def clear_wifi_results(self):
+        """清空WiFi测试结果"""
+        reply = QMessageBox.question(
+            self, 
+            "确认", 
+            "确定要清空所有测试结果吗？",
+            QMessageBox.Yes | QMessageBox.No
+        )
         
-        start_track_btn = QPushButton("启动追踪")
-        start_track_btn.clicked.connect(self.start_tracking)
-        start_track_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px;")
-        track_layout.addRow(start_track_btn)
+        if reply == QMessageBox.No:
+            return
         
-        stop_track_btn = QPushButton("停止追踪")
-        stop_track_btn.clicked.connect(self.stop_tracking)
-        stop_track_btn.setStyleSheet("background-color: #f44336; color: white; padding: 10px;")
-        track_layout.addRow(stop_track_btn)
+        self.wifi_perf_tester.clear_results()
+        self.wifi_result_table.setRowCount(0)
         
-        track_group.setLayout(track_layout)
-        layout.addWidget(track_group)
+        # 清空图表
+        self.wifi_perf_figure.clear()
+        self.wifi_perf_canvas.draw()
         
-        # 进程控制
-        process_group = QGroupBox("进程控制")
-        process_layout = QHBoxLayout()
+        self.wifi_test_progress.setValue(0)
+        self.wifi_test_status_label.setText("⏸️ 测试状态: 就绪")
+        self.wifi_test_status_label.setStyleSheet("""
+            padding: 15px; 
+            background-color: #ecf0f1; 
+            border-radius: 5px;
+            color: #7f8c8d;
+            font-size: 14px;
+        """)
         
-        restart_process_btn = QPushButton("重启multi_media进程")
-        restart_process_btn.clicked.connect(self.restart_media_process)
-        restart_process_btn.setStyleSheet("background-color: #FF9800; color: white;")
-        process_layout.addWidget(restart_process_btn)
-        
-        kill_process_btn = QPushButton("停止multi_media进程")
-        kill_process_btn.clicked.connect(self.kill_media_process)
-        kill_process_btn.setStyleSheet("background-color: #f44336; color: white;")
-        process_layout.addWidget(kill_process_btn)
-        
-        process_group.setLayout(process_layout)
-        layout.addWidget(process_group)
-        
-        return widget
+        log_manager.info("WiFi测试结果已清空")
     
     # ==================== 槽函数实现 ====================
     
@@ -1191,6 +813,10 @@ class AlgorithmValidationPlatform(QMainWindow):
         if not model_file or not os.path.exists(model_file):
             QMessageBox.warning(self, "错误", "请选择有效的模型文件")
             log_manager.warning("[OPERATION] 推送模型失败：未选择有效文件")
+            return
+
+        if self._transfer_in_progress():
+            QMessageBox.information(self, "提示", "已有文件传输任务正在进行，请稍后再试")
             return
         
         ip = self.current_device_ip
@@ -1242,8 +868,14 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         # 连接信号
         self.transfer_thread.started.connect(self.transfer_worker.run)
-        self.transfer_worker.progress.connect(lambda percent, msg: self._update_progress(progress_bar, status_label, percent, msg))
-        self.transfer_worker.finished.connect(lambda success, msg: self._on_push_model_finished(success, msg, progress_dialog, self.transfer_thread, ip))
+        self.transfer_worker.progress.connect(
+            lambda percent, msg: self._update_progress(progress_bar, status_label, percent, msg),
+            Qt.QueuedConnection
+        )
+        self.transfer_worker.finished.connect(
+            lambda success, msg: self._on_push_model_finished(success, msg, progress_dialog, self.transfer_thread, ip),
+            Qt.QueuedConnection
+        )
         
         # 启动线程
         self.transfer_thread.start()
@@ -1278,54 +910,11 @@ class AlgorithmValidationPlatform(QMainWindow):
                 f"模型推送失败！\n{msg}"
             )
     
-    def push_config(self, config_file, ip):
-        """推送配置文件"""
-        temp_file = self._save_config_to_temp(config_file)
-        if not temp_file:
-            return
-        
-        progress_dialog = QDialog(self)
-        progress_dialog.setWindowTitle("推送配置文件")
-        progress_dialog.setFixedSize(400, 100)
-        progress_dialog.setModal(True)
-        progress_dialog.setWindowFlags(Qt.WindowTitleHint | Qt.WindowSystemMenuHint)
-        
-        progress_layout = QVBoxLayout(progress_dialog)
-        progress_bar = QProgressBar(progress_dialog)
-        progress_bar.setRange(0, 100)
-        progress_layout.addWidget(progress_bar)
-        
-        status_label = QLabel(progress_dialog)
-        status_label.setAlignment(Qt.AlignCenter)
-        progress_layout.addWidget(status_label)
-        
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setEnabled(False)  # 暂时不允许取消
-        progress_layout.addWidget(cancel_btn)
-        
-        progress_dialog.show()
-        self.statusBar().showMessage(f"正在推送配置文件到 {ip}...")
-        
-        # 创建后台线程（保存为实例属性，防止被垃圾回收）
-        self.transfer_worker = FileTransferWorker(
-            self.device_manager,
-            'push_config',
-            config_file=temp_file,
-            device_ip=ip
-        )
-        
-        self.transfer_thread = QThread()
-        self.transfer_worker.moveToThread(self.transfer_thread)
-        
-        # 连接信号
-        self.transfer_thread.started.connect(self.transfer_worker.run)
-        self.transfer_worker.progress.connect(lambda percent, msg: self._update_progress(progress_bar, status_label, percent, msg))
-        self.transfer_worker.finished.connect(lambda success, msg: self._on_push_config_finished(success, msg, progress_dialog, self.transfer_thread))
-        
-        # 启动线程
-        self.transfer_thread.start()
-    
     def delete_model(self, ip, model_name):
+        if self._transfer_in_progress():
+            QMessageBox.information(self, "提示", "已有文件传输任务正在进行，请稍后再试")
+            return
+
         progress_dialog = QDialog(self)
         progress_dialog.setWindowTitle("删除模型")
         progress_dialog.setFixedSize(400, 100)
@@ -1361,18 +950,32 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         # 连接信号
         self.transfer_thread.started.connect(self.transfer_worker.run)
-        self.transfer_worker.progress.connect(lambda percent, msg: self._update_progress(progress_bar, status_label, percent, msg))
-        self.transfer_worker.finished.connect(lambda success, msg: self._on_delete_model_finished(success, msg, progress_dialog, self.transfer_thread))
+        self.transfer_worker.progress.connect(
+            lambda percent, msg: self._update_progress(progress_bar, status_label, percent, msg),
+            Qt.QueuedConnection
+        )
+        self.transfer_worker.finished.connect(
+            lambda success, msg: self._on_delete_model_finished(success, msg, progress_dialog, self.transfer_thread),
+            Qt.QueuedConnection
+        )
         
         # 启动线程
         self.transfer_thread.start()
     
     def upload_video_to_device(self):
         """上传视频到设备（后台线程+进度显示）"""
+        if getattr(self, "video_upload_thread", None) and self.video_upload_thread.isRunning():
+            QMessageBox.information(self, "提示", "当前已有视频正在上传")
+            return
+
         if not self.current_device_ip:
             QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
             return
-        
+
+        if self._transfer_in_progress():
+            QMessageBox.information(self, "提示", "已有文件传输任务正在进行，请稍后再试")
+            return
+
         video_file = self.video_file_edit.text()
         if not video_file or not os.path.exists(video_file):
             QMessageBox.warning(self, "错误", "请选择有效的视频文件")
@@ -1417,105 +1020,52 @@ class AlgorithmValidationPlatform(QMainWindow):
         cancel_layout.addStretch()
         cancel_layout.addWidget(cancel_btn)
         layout.addLayout(cancel_layout)
-        
-        # 创建进度更新信号
-        class ProgressWorker(QObject):
-            progress_signal = pyqtSignal(int, float, float)  # percent, transferred_mb, total_mb
-            finished_signal = pyqtSignal(bool, str)  # success, message
-            
-            def __init__(self, video_file, device_ip):
-                super().__init__()
-                self.video_file = video_file
-                self.device_ip = device_ip
-                self.cancelled = False
-            
-            def upload(self):
-                """执行上传"""
-                def progress_callback(transferred, total):
-                    if self.cancelled:
-                        return
-                    percent = int(transferred / total * 100) if total > 0 else 0
-                    transferred_mb = transferred / 1024 / 1024
-                    total_mb = total / 1024 / 1024
-                    # 发射信号更新进度
-                    self.progress_signal.emit(percent, transferred_mb, total_mb)
-                
-                try:
-                    success, msg = self.device_manager.push_video(self.video_file, self.device_ip, progress_callback)
-                    self.finished_signal.emit(success, msg)
-                except Exception as e:
-                    self.finished_signal.emit(False, f"上传异常: {str(e)}")
-        
-        # 创建工作线程和对象
-        worker = ProgressWorker(video_file, ip)
-        worker.device_manager = self.device_manager  # 传递device_manager引用
-        
-        thread = QThread()
-        worker.moveToThread(thread)
-        
-        # 连接信号到槽
+
+        self.video_upload_thread = QThread()
+        self.video_upload_worker = VideoUploadWorker(self.device_manager, video_file, ip)
+        self.video_upload_worker.moveToThread(self.video_upload_thread)
+
         def update_progress(percent, transferred_mb, total_mb):
             progress_bar.setValue(percent)
             progress_text.setText(f"{percent}% ({transferred_mb:.2f} MB / {total_mb:.2f} MB)")
         
         def upload_finished(success, msg):
-            thread.quit()
             progress_dialog.accept()
-            
+
             if success:
                 QMessageBox.information(self, "成功", f"视频上传成功！\n{msg}")
                 log_manager.info(f"[VIDEO] 上传完成: {msg}")
+            elif msg == "上传已取消":
+                QMessageBox.information(self, "提示", msg)
+                log_manager.info("[VIDEO] 用户取消了上传")
             else:
                 QMessageBox.critical(self, "失败", f"视频上传失败：\n{msg}")
                 log_manager.error(f"[VIDEO] 上传失败: {msg}")
-        
-        worker.progress_signal.connect(update_progress)
-        worker.finished_signal.connect(upload_finished)
-        
-        # 连接取消按钮
-        cancel_btn.clicked.connect(lambda: setattr(worker, 'cancelled', True))
-        
-        # 启动线程
-        thread.started.connect(worker.upload)
-        thread.start()
-        
-        # 显示进度对话框（阻塞直到完成或取消）
-        result = progress_dialog.exec_()
-        
-        # 如果用户取消了对话框
-        if result == QDialog.Rejected:
-            worker.cancelled = True
-            log_manager.info("[VIDEO] 用户取消了上传")
-            QMessageBox.information(self, "提示", "上传已取消")
-            thread.quit()
-            thread.wait(3000)  # 等待线程结束，最多3秒
 
-        self.transfer_worker.finished.connect(lambda success, msg: self._on_delete_model_finished(success, msg, progress_dialog, self.transfer_thread))
+        def cancel_upload():
+            if self.video_upload_worker:
+                self.video_upload_worker.cancel()
+            cancel_btn.setEnabled(False)
+            status_label.setText("正在取消上传...")
         
-        # 启动线程
-        self.transfer_thread.start()
-    
-    def _on_delete_model_finished(self, success, msg, progress_dialog, thread):
-        """删除模型完成回调"""
-        progress_dialog.close()
-        thread.quit()
-        thread.wait()
-        
-        # 清理线程资源
-        self.transfer_worker = None
-        self.transfer_thread = None
-        
-        if success:
-            log_manager.info(f"[DEVICE] 模型删除成功: {msg}")
-            QMessageBox.information(self, "成功", f"模型已删除！\n{msg}")
-            self.statusBar().showMessage("模型删除成功", 3000)
-            
-            # 自动刷新模型列表
-            self.refresh_model_list()
-        else:
-            log_manager.error(f"[DEVICE] 模型删除失败: {msg}")
-            QMessageBox.critical(self, "失败", f"模型删除失败：\n{msg}")
-            self.statusBar().showMessage("模型删除失败", 3000)
+        self.video_upload_thread.started.connect(self.video_upload_worker.run)
+        self.video_upload_worker.progress.connect(update_progress, Qt.QueuedConnection)
+        self.video_upload_worker.finished.connect(upload_finished, Qt.QueuedConnection)
+        self.video_upload_worker.finished.connect(self.video_upload_thread.quit)
+        self.video_upload_worker.finished.connect(self.video_upload_worker.deleteLater)
+        self.video_upload_thread.finished.connect(self.video_upload_thread.deleteLater)
+        self.video_upload_thread.finished.connect(self._clear_video_upload_refs)
+        cancel_btn.clicked.connect(cancel_upload)
+        progress_dialog.rejected.connect(cancel_upload)
+
+        progress_dialog.show()
+        self.video_upload_thread.start()
+
+    def _clear_video_upload_refs(self):
+        """释放视频上传线程引用。"""
+        self.video_upload_worker = None
+        self.video_upload_thread = None
+
 
     def silent_check_disk_and_models(self):
         """静默检查磁盘空间和模型列表（启动时自动执行）"""
@@ -1643,32 +1193,6 @@ class AlgorithmValidationPlatform(QMainWindow):
         except:
             return None
 
-    def _on_push_config_finished(self, success, msg, progress_dialog, thread):
-        """配置文件推送完成回调"""
-        progress_dialog.close()
-        thread.quit()
-        thread.wait()
-        
-        # 清理线程资源
-        self.transfer_worker = None
-        self.transfer_thread = None
-        
-        if success:
-            log_manager.info(f"[DEVICE] 配置文件推送成功: {msg}")
-            QMessageBox.information(
-                self, 
-                "成功", 
-                f"模型推送成功！\n{msg}\n\n"
-                f"💡 提示：请在下方'配置文件管理'区域加载并编辑配置文件，然后点击'推送到设备'"
-            )
-            self.statusBar().showMessage("模型推送完成", 3000)
-            
-            # 自动刷新模型列表
-            self.refresh_model_list()
-        else:
-            log_manager.error(f"[DEVICE] 模型推送失败: {msg}")
-            QMessageBox.critical(self, "失败", f"模型推送失败：\n{msg}")
-            self.statusBar().showMessage("模型推送失败", 3000)
 
     def refresh_model_list(self):
         """刷新模型列表"""
@@ -1718,86 +1242,9 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.critical(self, "错误", f"刷新模型列表失败：\n{str(e)}")
             self.statusBar().showMessage("刷新失败")
 
-    def delete_model_from_device(self, model_name):
-        """检查设备磁盘空间"""
-        if not self.current_device_ip:
-            QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
-            return
-        
-        ip = self.current_device_ip
-        
-        log_manager.info(f"[DISK] 开始检查设备 {ip} 的磁盘空间...")
-        self.statusBar().showMessage(f"正在检查磁盘空间...")
-        
-        try:
-            # 检查 /oem 分区空间
-            disk_info = self.device_manager.check_disk_space(ip, '/oem')
-            
-            if disk_info.get('success'):
-                # 获取模型大小信息
-                models_info = self.device_manager.get_model_sizes(ip)
-                
-                # 构建显示信息
-                info_text = f"<b>📊 /oem 分区使用情况:</b><br><br>"
-                
-                if 'filesystem' in disk_info:
-                    info_text += f"文件系统: {disk_info['filesystem']}<br>"
-                    info_text += f"总容量: <b>{disk_info['size']}</b><br>"
-                    info_text += f"已使用: <b style='color: orange;'>{disk_info['used']}</b><br>"
-                    info_text += f"可用空间: <b style='color: green;'>{disk_info['available']}</b><br>"
-                    info_text += f"使用率: <b style='color: {'red' if int(disk_info['use_percent'].rstrip('%')) > 80 else 'orange' if int(disk_info['use_percent'].rstrip('%')) > 60 else 'green'};'>{disk_info['use_percent']}</b><br><br>"
-                
-                # 检查是否有空间不足警告
-                use_percent = int(disk_info.get('use_percent', '0%').rstrip('%'))
-                if use_percent > 90:
-                    info_text += "<b style='color: red;'>⚠️ 警告: 磁盘空间严重不足！</b><br>"
-                    info_text += "建议删除不需要的模型文件以释放空间。<br><br>"
-                elif use_percent > 80:
-                    info_text += "<b style='color: orange;'>⚠️ 注意: 磁盘空间较紧张</b><br><br>"
-                
-                # 显示模型列表
-                if models_info.get('success') and models_info.get('models'):
-                    info_text += "<b>📦 当前模型文件:</b><br>"
-                    total_size = 0
-                    for model in models_info['models']:
-                        info_text += f"• {model['name']} - {model['size']}<br>"
-                    
-                    info_text += f"<br><i>共 {len(models_info['models'])} 个模型文件</i>"
-                else:
-                    info_text += "<i>没有找到模型文件</i>"
-                
-                self.disk_info_label.setText(info_text)
-                log_manager.info(f"[DISK] 磁盘空间检查完成: {disk_info.get('use_percent', 'N/A')} 已使用")
-                self.statusBar().showMessage(f"磁盘空间检查完成", 3000)
-                
-                # 如果空间不足，提示用户
-                if use_percent > 90:
-                    reply = QMessageBox.question(
-                        self,
-                        "磁盘空间不足",
-                        f"/oem 分区使用率已达 {disk_info['use_percent']}，空间严重不足！\n\n"
-                        f"可用空间: {disk_info['available']}\n\n"
-                        f"是否打开模型管理页面删除旧模型？",
-                        QMessageBox.Yes | QMessageBox.No
-                    )
-                    if reply == QMessageBox.Yes:
-                        # 切换到模型与配置标签页（已经是当前页）
-                        self.refresh_model_list()
-                
-            else:
-                error_msg = disk_info.get('error', '未知错误')
-                self.disk_info_label.setText(f"❌ 检查失败: {error_msg}")
-                log_manager.error(f"[DISK] 磁盘空间检查失败: {error_msg}")
-                QMessageBox.critical(self, "错误", f"检查磁盘空间失败:\n{error_msg}")
-                
-        except Exception as e:
-            log_manager.error(f"[DISK] 检查磁盘空间异常: {str(e)}", exc_info=True)
-            self.disk_info_label.setText(f"❌ 检查异常: {str(e)}")
-            QMessageBox.critical(self, "错误", f"检查磁盘空间时发生异常:\n{str(e)}")
-            self.statusBar().showMessage("刷新失败")
 
     def delete_model_from_device(self, model_name):
-        """从设备删除模型文件（同步执行，无弹窗）"""
+        """从设备删除模型文件（后台线程执行）"""
         if not self.current_device_ip:
             QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
             return
@@ -1816,29 +1263,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         log_manager.info(f"[OPERATION] 准备删除模型: {model_name} from {ip}")
         self.statusBar().showMessage(f"正在删除模型: {model_name}...")
-        
-        try:
-            # 直接调用device_manager的delete_model方法
-            success, msg = self.device_manager.delete_model(model_name, ip)
-            
-            if success:
-                log_manager.info(f"[DEVICE] 模型删除成功: {msg}")
-                self.statusBar().showMessage(f"模型已删除: {model_name}", 3000)
-                
-                # 自动刷新模型列表
-                self.refresh_model_list()
-                
-                # 同时更新oem分区占用显示
-                QTimer.singleShot(500, self.update_oem_usage_display)
-            else:
-                log_manager.error(f"[DEVICE] 模型删除失败: {msg}")
-                QMessageBox.critical(self, "失败", f"模型删除失败：\n{msg}")
-                self.statusBar().showMessage("模型删除失败", 3000)
-                
-        except Exception as e:
-            log_manager.error(f"[DEVICE] 删除模型异常: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "错误", f"删除模型时发生异常:\n{str(e)}")
-            self.statusBar().showMessage("删除失败")
+        self.delete_model(ip, model_name)
 
 
 
@@ -1946,10 +1371,14 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.critical(self, "错误", f"保存失败：\n{str(e)}")
             
     def push_config_to_device(self):
-        """推送配置到设备（同步执行）"""
+        """推送配置到设备（后台线程执行）"""
         # 检查设备是否已连接
         if not self.current_device_ip:
             QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
+            return
+
+        if self._transfer_in_progress():
+            QMessageBox.information(self, "提示", "已有文件传输任务正在进行，请稍后再试")
             return
         
         config_content = self.config_text_edit.toPlainText()
@@ -1966,11 +1395,10 @@ class AlgorithmValidationPlatform(QMainWindow):
         # 如果当前文件是INI格式，使用ini后缀
         if current_file and current_file.endswith('.ini'):
             config_filename = "xbotgo_media.ini"
-            
+
+        temp_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), config_filename)
         try:
             # 保存到临时文件（使用正确的文件名）
-            temp_file = config_filename
-            
             with open(temp_file, 'w', encoding='utf-8') as f:
                 f.write(config_content)
             
@@ -1999,58 +1427,27 @@ class AlgorithmValidationPlatform(QMainWindow):
             
             progress_dialog.show()
             self.statusBar().showMessage(f"正在推送配置文件到 {ip}...")
-            
-            # 同步执行推送操作
-            QApplication.processEvents()  # 确保UI更新
-            
-            # 步骤1: 推送配置文件
-            progress_bar.setValue(30)
-            status_label.setText("正在推送配置文件...")
-            QApplication.processEvents()
-            
-            success, msg = self.device_manager.push_config(temp_file, ip)
-            
-            if success:
-                progress_bar.setValue(70)
-                status_label.setText("配置推送成功，正在重启进程...")
-                QApplication.processEvents()
-                
-                # 步骤2: 重启进程
-                restart_success, restart_msg = self.device_manager.restart_media_process(ip)
-                
-                # 清理临时文件
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                
-                progress_bar.setValue(100)
-                
-                if restart_success:
-                    log_manager.info(f"[DEVICE] 配置推送成功: {msg}")
-                    QMessageBox.information(
-                        self, 
-                        "成功", 
-                        f"配置已成功推送到 {ip}！\n{msg}\n\n✅ multi_media进程已自动重启，新配置已生效"
-                    )
-                    self.statusBar().showMessage("配置推送完成", 3000)
-                else:
-                    log_manager.warning(f"[DEVICE] 配置推送成功但进程重启失败: {restart_msg}")
-                    QMessageBox.warning(
-                        self, 
-                        "部分成功", 
-                        f"配置已推送成功！\n{msg}\n\n⚠️ 但multi_media进程重启失败: {restart_msg}\n请手动重启进程以使配置生效"
-                    )
-                    self.statusBar().showMessage("配置推送成功，但进程重启失败", 3000)
-            else:
-                # 清理临时文件
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                
-                log_manager.error(f"[DEVICE] 配置推送失败: {msg}")
-                QMessageBox.critical(self, "失败", f"配置推送失败：\n{msg}")
-                self.statusBar().showMessage("配置推送失败", 3000)
-            
-            progress_dialog.close()
-            
+
+            self.transfer_worker = FileTransferWorker(
+                self.device_manager,
+                'push_config',
+                config_file=temp_file,
+                device_ip=ip
+            )
+            self.transfer_thread = QThread()
+            self.transfer_worker.moveToThread(self.transfer_thread)
+
+            self.transfer_thread.started.connect(self.transfer_worker.run)
+            self.transfer_worker.progress.connect(
+                lambda percent, msg: self._update_progress(progress_bar, status_label, percent, msg),
+                Qt.QueuedConnection
+            )
+            self.transfer_worker.finished.connect(
+                lambda success, msg: self._on_push_config_finished(success, msg, progress_dialog, self.transfer_thread),
+                Qt.QueuedConnection
+            )
+            self.transfer_thread.start()
+
         except Exception as e:
             # 清理临时文件
             if os.path.exists(temp_file):
@@ -2060,12 +1457,6 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.critical(self, "错误", f"推送配置失败：\n{str(e)}")
             self.statusBar().showMessage("推送配置失败")
             
-    def browse_log_file(self):
-        """浏览选择日志文件"""
-        file_name, _ = QFileDialog.getOpenFileName(self, "选择日志文件", "", "Log Files (*.log);;All Files (*)")
-        if file_name:
-            self.log_file_edit.setText(file_name)
-    
     def browse_device_log_file(self):
         """从设备浏览日志文件"""
         if not self.device_connected or not self.current_device_ip:
@@ -2311,35 +1702,6 @@ class AlgorithmValidationPlatform(QMainWindow):
             log_manager.error(f"[LOG] 删除设备日志文件失败: {str(e)}")
             QMessageBox.critical(self, "错误", f"删除失败:\n{str(e)}")
     
-    def toggle_monitoring(self):
-        """分析日志文件"""
-
-            
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setEnabled(False)
-        progress_layout.addWidget(cancel_btn)
-        
-        progress_dialog.show()
-        self.statusBar().showMessage(f"正在推送配置文件到 {ip}...")
-        
-        # 创建后台线程
-        worker = FileTransferWorker(
-            self.device_manager,
-            'push_config',
-            config_file=temp_file,
-            device_ip=ip
-        )
-        
-        thread = QThread()
-        worker.moveToThread(thread)
-        
-        # 连接信号
-        thread.started.connect(worker.run)
-        worker.progress.connect(lambda percent, msg: self._update_progress(progress_bar, status_label, percent, msg))
-        worker.finished.connect(lambda success, msg: self._on_push_config_finished(success, msg, progress_dialog, thread))
-        
-        # 启动线程
-        thread.start()
     
     def _on_push_config_finished(self, success, msg, progress_dialog, thread):
         """推送配置完成回调"""
@@ -2400,6 +1762,10 @@ class AlgorithmValidationPlatform(QMainWindow):
         if not self.current_device_ip:
             QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
             return
+
+        if getattr(self, "performance_start_thread", None) and self.performance_start_thread.isRunning():
+            QMessageBox.information(self, "提示", "性能监控正在启动中")
+            return
         
         try:
             ip = self.current_device_ip
@@ -2458,30 +1824,15 @@ class AlgorithmValidationPlatform(QMainWindow):
             layout.addWidget(detail_label)
             
             progress_dialog.show()
-            QApplication.processEvents()
-            
+
             def update_progress(percent, message):
-                """更新进度回调"""
                 status_label.setText(message)
                 progress_bar.setValue(percent)
                 detail_label.setText(f"{percent}%")
-                QApplication.processEvents()
-            
-            # 在后台线程中启动监控
-            def start_monitor_worker():
-                try:
-                    update_progress(10, "正在建立SSH连接...")
-                    self.performance_monitor.start_monitoring(ip, ddr_freq, interval, update_progress)
-                    update_progress(100, "监控已启动！")
-                    return True, "success"
-                except Exception as e:
-                    return False, str(e)
-            
-            # 使用 QTimer 延迟执行，让进度对话框先显示
-            def delayed_start():
-                success, msg = start_monitor_worker()
-                progress_dialog.close()
-                
+
+            def start_finished(success, msg):
+                progress_dialog.accept()
+
                 if success:
                     self.is_monitoring = True
                     self.monitor_btn.setText("停止监控")
@@ -2496,12 +1847,32 @@ class AlgorithmValidationPlatform(QMainWindow):
                 else:
                     QMessageBox.critical(self, "启动失败", f"性能监控启动失败：\n{msg}")
                     self.statusBar().showMessage("性能监控启动失败", 3000)
-            
-            QTimer.singleShot(100, delayed_start)
+
+            self.performance_start_thread = QThread()
+            self.performance_start_worker = PerformanceStartWorker(
+                self.performance_monitor,
+                ip,
+                ddr_freq,
+                interval,
+            )
+            self.performance_start_worker.moveToThread(self.performance_start_thread)
+            self.performance_start_thread.started.connect(self.performance_start_worker.run)
+            self.performance_start_worker.progress.connect(update_progress, Qt.QueuedConnection)
+            self.performance_start_worker.finished.connect(start_finished, Qt.QueuedConnection)
+            self.performance_start_worker.finished.connect(self.performance_start_thread.quit)
+            self.performance_start_worker.finished.connect(self.performance_start_worker.deleteLater)
+            self.performance_start_thread.finished.connect(self.performance_start_thread.deleteLater)
+            self.performance_start_thread.finished.connect(self._clear_performance_start_refs)
+            self.performance_start_thread.start()
             
         except Exception as e:
             QMessageBox.critical(self, "启动失败", f"性能监控启动失败：\n{str(e)}")
             self.statusBar().showMessage("性能监控启动失败", 3000)
+
+    def _clear_performance_start_refs(self):
+        """释放性能监控启动线程引用。"""
+        self.performance_start_worker = None
+        self.performance_start_thread = None
         
     def stop_performance_monitor(self):
         """停止性能监控（保留兼容性）"""
@@ -2782,45 +2153,11 @@ class AlgorithmValidationPlatform(QMainWindow):
         try:
             # 检查是否是设备路径
             if log_file.startswith('/userdata/'):
-                # 从设备下载日志文件
                 if not self.device_connected or not self.current_device_ip:
                     QMessageBox.warning(self, "错误", "请先连接设备")
                     return
-                
-                # 显示进度对话框
-                progress_dialog = QDialog(self)
-                progress_dialog.setWindowTitle("下载日志文件")
-                progress_dialog.setModal(True)
-                progress_dialog.setFixedWidth(400)
-                
-                progress_layout = QVBoxLayout(progress_dialog)
-                
-                status_label = QLabel(f"正在从设备下载:\n{log_file}")
-                status_label.setStyleSheet("font-size: 14px; padding: 10px;")
-                progress_layout.addWidget(status_label)
-                
-                progress_bar = QProgressBar()
-                progress_bar.setRange(0, 0)
-                progress_layout.addWidget(progress_bar)
-                
-                progress_dialog.show()
-                QApplication.processEvents()
-                
-                # 下载到临时文件
-                import tempfile
-                temp_dir = tempfile.gettempdir()
-                local_file = os.path.join(temp_dir, os.path.basename(log_file))
-                
-                # 使用SCP下载文件
-                try:
-                    self.device_manager.scp_download_file(log_file, local_file)
-                    log_file = local_file
-                except Exception as download_error:
-                    progress_dialog.close()
-                    QMessageBox.critical(self, "错误", f"下载日志文件失败:\n{str(download_error)}")
-                    return
-                
-                progress_dialog.close()
+                self._download_log_for_analysis(log_file)
+                return
                 
             # 检查本地文件是否存在
             if not os.path.exists(log_file):
@@ -2866,6 +2203,90 @@ class AlgorithmValidationPlatform(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"日志分析失败：\n{str(e)}")
+
+    def _download_log_for_analysis(self, remote_log_file):
+        """后台下载设备日志，完成后继续分析。"""
+        if getattr(self, "log_download_thread", None) and self.log_download_thread.isRunning():
+            QMessageBox.information(self, "提示", "日志正在下载中，请稍后再试")
+            return
+
+        import tempfile
+
+        temp_dir = os.path.join(tempfile.gettempdir(), "algo_platform_logs")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_file = os.path.join(temp_dir, f"{timestamp}_{os.path.basename(remote_log_file)}")
+
+        progress_dialog = QDialog(self)
+        progress_dialog.setWindowTitle("下载日志文件")
+        progress_dialog.setModal(False)
+        progress_dialog.setFixedWidth(460)
+
+        progress_layout = QVBoxLayout(progress_dialog)
+
+        status_label = QLabel(f"正在从设备下载:\n{remote_log_file}")
+        status_label.setStyleSheet("font-size: 14px; padding: 10px;")
+        status_label.setWordWrap(True)
+        progress_layout.addWidget(status_label)
+
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 100)
+        progress_bar.setValue(0)
+        progress_layout.addWidget(progress_bar)
+
+        speed_label = QLabel("速度: 0.00 MB/s    进度: 0.00 / 0.00 MB")
+        speed_label.setStyleSheet("color: #666; padding: 4px 10px;")
+        progress_layout.addWidget(speed_label)
+
+        cancel_btn = QPushButton("取消下载")
+        progress_layout.addWidget(cancel_btn)
+
+        self.log_download_thread = QThread()
+        self.log_download_worker = LogDownloadWorker(self.current_device_ip, remote_log_file, local_file)
+        self.log_download_worker.moveToThread(self.log_download_thread)
+
+        def update_progress(percent, transferred_mb, total_mb, speed_mbps):
+            progress_bar.setValue(percent)
+            speed_label.setText(
+                f"速度: {speed_mbps:.2f} MB/s    进度: {transferred_mb:.2f} / {total_mb:.2f} MB"
+            )
+
+        def cancel_download():
+            if self.log_download_worker:
+                self.log_download_worker.cancel()
+            cancel_btn.setEnabled(False)
+            status_label.setText(f"正在取消下载并清理残留文件:\n{remote_log_file}")
+
+        def download_finished(success, message, downloaded_file):
+            progress_dialog.accept()
+            if success:
+                log_manager.info(f"[LOG] 日志下载完成: {downloaded_file}")
+                self.log_file_edit.setText(downloaded_file)
+                self.statusBar().showMessage("日志下载完成，正在分析...", 3000)
+                self.analyze_log()
+            elif message == "下载已取消":
+                QMessageBox.information(self, "提示", "日志下载已取消，未完成文件已清理")
+                self.statusBar().showMessage("日志下载已取消", 3000)
+            else:
+                QMessageBox.critical(self, "错误", message)
+                self.statusBar().showMessage("日志下载失败", 3000)
+
+        self.log_download_thread.started.connect(self.log_download_worker.run)
+        self.log_download_worker.progress.connect(update_progress, Qt.QueuedConnection)
+        self.log_download_worker.finished.connect(download_finished, Qt.QueuedConnection)
+        self.log_download_worker.finished.connect(self.log_download_thread.quit)
+        self.log_download_worker.finished.connect(self.log_download_worker.deleteLater)
+        self.log_download_thread.finished.connect(self.log_download_thread.deleteLater)
+        self.log_download_thread.finished.connect(self._clear_log_download_refs)
+        cancel_btn.clicked.connect(cancel_download)
+        progress_dialog.rejected.connect(cancel_download)
+
+        progress_dialog.show()
+        self.log_download_thread.start()
+
+    def _clear_log_download_refs(self):
+        """释放日志下载线程引用。"""
+        self.log_download_worker = None
+        self.log_download_thread = None
             
     def plot_log_results(self, log_file):
         """绘制日志分析结果"""
@@ -3428,58 +2849,40 @@ class AlgorithmValidationPlatform(QMainWindow):
             return None
     
     def _wifi_reconnect_attempt(self, device_ip, wifi_ssid, wifi_password, rtsp_0, rtsp_1):
-        """WiFi自动重连尝试（后台线程）"""
-        def reconnect_in_thread():
-            try:
-                log_manager.info(f"[AUTO] 正在通过ADB配置WiFi: {wifi_ssid}")
-                
-                # 使用SmartDeviceManager执行WiFi重连
-                smart_manager = SmartDeviceManager()
-                success, msg, ip, new_rtsp_0, new_rtsp_1 = smart_manager.full_auto_setup(
-                    wifi_ssid, wifi_password
-                )
-                
-                if success and ip:
-                    log_manager.info(f"[AUTO] WiFi重连成功: {ip}")
-                    
-                    # 建立SSH连接到新获取的IP
-                    log_manager.info(f"[AUTO] 正在建立SSH连接到 {ip}...")
-                    ssh_success, ssh_msg = self.device_manager.connect_ssh(ip)
-                    
-                    if ssh_success:
-                        log_manager.info(f"[AUTO] SSH连接成功: {ssh_msg}")
-                        # 在主线程中更新UI
-                        QTimer.singleShot(0, partial(
-                            self._on_auto_connect_success,
-                            ip, new_rtsp_0 or rtsp_0, new_rtsp_1 or rtsp_1,
-                            "WiFi重连成功"
-                        ))
-                    else:
-                        log_manager.error(f"[AUTO] SSH连接失败: {ssh_msg}")
-                        # 在主线程中显示提示
-                        QTimer.singleShot(0, partial(
-                            self._on_auto_connect_failed,
-                            ip, f"WiFi重连成功但SSH连接失败: {ssh_msg}"
-                        ))
-                else:
-                    log_manager.warning(f"[AUTO] WiFi重连失败: {msg}")
-                    # 在主线程中显示提示
-                    QTimer.singleShot(0, partial(
-                        self._on_auto_connect_failed,
-                        device_ip, f"WiFi重连失败: {msg}"
-                    ))
-                    
-            except Exception as e:
-                log_manager.error(f"[AUTO] WiFi重连异常: {str(e)}")
-                QTimer.singleShot(0, partial(
-                    self._on_auto_connect_failed,
-                    device_ip, str(e)
-                ))
-        
-        # 启动后台线程
-        thread = threading.Thread(target=reconnect_in_thread)
-        thread.daemon = True
-        thread.start()
+        """WiFi自动重连尝试（QThread后台任务）"""
+        if getattr(self, "wifi_reconnect_thread", None) and self.wifi_reconnect_thread.isRunning():
+            log_manager.info("[AUTO] WiFi重连任务已在运行，跳过重复启动")
+            return
+
+        self.wifi_reconnect_thread = QThread()
+        self.wifi_reconnect_worker = WiFiReconnectWorker(
+            self.device_manager,
+            device_ip,
+            wifi_ssid,
+            wifi_password,
+            rtsp_0,
+            rtsp_1,
+        )
+        self.wifi_reconnect_worker.moveToThread(self.wifi_reconnect_thread)
+        self.wifi_reconnect_thread.started.connect(self.wifi_reconnect_worker.run)
+        self.wifi_reconnect_worker.finished.connect(self._on_wifi_reconnect_finished, Qt.QueuedConnection)
+        self.wifi_reconnect_worker.finished.connect(self.wifi_reconnect_thread.quit)
+        self.wifi_reconnect_worker.finished.connect(self.wifi_reconnect_worker.deleteLater)
+        self.wifi_reconnect_thread.finished.connect(self.wifi_reconnect_thread.deleteLater)
+        self.wifi_reconnect_thread.finished.connect(self._clear_wifi_reconnect_refs)
+        self.wifi_reconnect_thread.start()
+
+    def _on_wifi_reconnect_finished(self, success, device_ip, rtsp_0, rtsp_1, message):
+        """WiFi重连完成后回到主线程更新界面。"""
+        if success:
+            self._on_auto_connect_success(device_ip, rtsp_0, rtsp_1, message)
+        else:
+            self._on_auto_connect_failed(device_ip, message)
+
+    def _clear_wifi_reconnect_refs(self):
+        """释放WiFi重连线程引用。"""
+        self.wifi_reconnect_worker = None
+        self.wifi_reconnect_thread = None
 
     def _on_auto_connect_failed(self, device_ip, error_msg):
         """自动连接失败处理"""
