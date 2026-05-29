@@ -7,8 +7,86 @@
 import paramiko
 import subprocess
 import os
+import time
+import re
 from datetime import datetime
 from log_manager import log_manager
+
+
+def connect_ssh_with_retry(
+    hostname,
+    username='root',
+    password='',
+    port=22,
+    retries=4,
+    timeout=2.0,
+    banner_timeout=1.5,
+    auth_timeout=2.5,
+    channel_timeout=3.0,
+    retry_delay=0.5,
+):
+    """快速重试 SSH 连接，适合设备刚开机时 SSH banner 还未准备好的场景。"""
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        ssh_client = None
+        start_time = time.time()
+
+        try:
+            ssh_client = paramiko.SSHClient()
+            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh_client.connect(
+                hostname,
+                port=port,
+                username=username,
+                password=password,
+                timeout=timeout,
+                banner_timeout=banner_timeout,
+                auth_timeout=auth_timeout,
+                channel_timeout=channel_timeout,
+                allow_agent=False,
+                look_for_keys=False,
+            )
+
+            elapsed = time.time() - start_time
+            log_manager.info(
+                f"[DEVICE] SSH连接成功: {hostname} (尝试 {attempt}/{retries}, {elapsed:.2f}s)"
+            )
+            return ssh_client, True, "SSH连接成功"
+
+        except paramiko.AuthenticationException as e:
+            if ssh_client:
+                ssh_client.close()
+            log_manager.error(f"[DEVICE] SSH认证失败: {str(e)}")
+            return None, False, f"SSH认证失败: {str(e)}"
+
+        except Exception as e:
+            last_error = e
+            elapsed = time.time() - start_time
+            if ssh_client:
+                ssh_client.close()
+
+            log_manager.warning(
+                f"[DEVICE] SSH连接尝试 {attempt}/{retries} 失败 ({elapsed:.2f}s): {str(e)}"
+            )
+
+            if attempt < retries:
+                sleep_time = min(retry_delay * attempt, 1.0)
+                time.sleep(sleep_time)
+
+    return None, False, f"SSH连接失败: {str(last_error)}"
+
+
+def _run_subprocess_text(command, timeout=10):
+    """Run a subprocess command and decode text output consistently."""
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding='utf-8',
+        errors='ignore',
+        timeout=timeout,
+    )
 
 
 class DeviceManager:
@@ -18,16 +96,166 @@ class DeviceManager:
         self.ssh_client = None
         self.current_device_ip = None  # 保存当前连接的设备IP
         
-    def connect_ssh(self, hostname, username='root', password='', port=22):
+    def connect_ssh(
+        self,
+        hostname,
+        username='root',
+        password='',
+        port=22,
+        retries=4,
+        timeout=2.0,
+        banner_timeout=1.5,
+        auth_timeout=2.5,
+        channel_timeout=3.0,
+        retry_delay=0.5,
+        auto_start_ssh=True,
+    ):
         """建立SSH连接"""
         try:
-            self.ssh_client = paramiko.SSHClient()
-            self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh_client.connect(hostname, port=port, username=username, password=password, timeout=10)
+            self.close_ssh()
+            self.ssh_client, success, msg = connect_ssh_with_retry(
+                hostname,
+                username=username,
+                password=password,
+                port=port,
+                retries=retries,
+                timeout=timeout,
+                banner_timeout=banner_timeout,
+                auth_timeout=auth_timeout,
+                channel_timeout=channel_timeout,
+                retry_delay=retry_delay,
+            )
+            if not success:
+                self.ssh_client = None
+                if auto_start_ssh:
+                    log_manager.warning(f"[DEVICE] SSH连接失败，尝试通过ADB启动SSH服务: {msg}")
+                    adb_success, adb_msg = self.ensure_ssh_service_via_adb()
+                    if adb_success:
+                        log_manager.info("[DEVICE] ADB启动SSH服务完成，重新尝试SSH连接")
+                        self.ssh_client, success, retry_msg = connect_ssh_with_retry(
+                            hostname,
+                            username=username,
+                            password=password,
+                            port=port,
+                            retries=3,
+                            timeout=timeout,
+                            banner_timeout=banner_timeout,
+                            auth_timeout=auth_timeout,
+                            channel_timeout=channel_timeout,
+                            retry_delay=retry_delay,
+                        )
+                        if success:
+                            self.current_device_ip = hostname
+                            return True, "SSH连接成功"
+                        self.ssh_client = None
+                        return False, f"{retry_msg}；已尝试ADB启动SSH服务: {adb_msg}"
+                    return False, f"{msg}；ADB启动SSH服务失败: {adb_msg}"
+                return False, msg
             self.current_device_ip = hostname  # 保存设备IP
             return True, "SSH连接成功"
         except Exception as e:
             return False, f"SSH连接失败: {str(e)}"
+
+    def get_adb_device_id(self):
+        """获取当前可用的USB ADB设备ID。"""
+        try:
+            result = _run_subprocess_text(['adb', 'devices'], timeout=5)
+        except FileNotFoundError:
+            return None, "ADB未安装或未添加到PATH"
+        except subprocess.TimeoutExpired:
+            return None, "ADB设备检测超时"
+        except Exception as e:
+            return None, f"ADB设备检测失败: {str(e)}"
+
+        if result.returncode != 0:
+            return None, f"ADB命令执行失败: {result.stderr.strip()}"
+
+        for line in result.stdout.strip().splitlines()[1:]:
+            if '\tdevice' not in line:
+                continue
+            device_id = line.split('\t')[0].strip()
+            if device_id:
+                return device_id, f"检测到ADB设备: {device_id}"
+
+        return None, "未检测到可用ADB设备"
+
+    def run_adb_shell_command(self, command, device_id=None, timeout=15):
+        """通过ADB执行shell命令。"""
+        if not device_id:
+            device_id, msg = self.get_adb_device_id()
+            if not device_id:
+                return False, msg
+
+        try:
+            result = _run_subprocess_text(
+                ['adb', '-s', device_id, 'shell', command],
+                timeout=timeout,
+            )
+            output = (result.stdout or '').strip()
+            error = (result.stderr or '').strip()
+            if result.returncode == 0:
+                return True, output
+            return False, error or output or f"返回码: {result.returncode}"
+        except subprocess.TimeoutExpired:
+            return False, f"ADB命令超时: {command}"
+        except FileNotFoundError:
+            return False, "ADB未安装或未添加到PATH"
+        except Exception as e:
+            return False, f"ADB命令异常: {str(e)}"
+
+    def ensure_ssh_service_via_adb(self):
+        """通过ADB挂载分区、启动sshd，并清除root密码。"""
+        device_id, msg = self.get_adb_device_id()
+        if not device_id:
+            log_manager.warning(f"[ADB] 无法通过ADB启动SSH服务: {msg}")
+            return False, msg
+
+        init_commands = [
+            ("挂载根文件系统", "mount -o remount,rw /"),
+            ("挂载OEM分区", "mount -o remount,rw /oem"),
+            ("挂载数据分区", "mount -o remount,rw /device_data"),
+            ("启动SSH服务", "/etc/init.d/S50sshd start"),
+            ("清除root密码", "passwd -d root"),
+        ]
+
+        messages = []
+        for desc, command in init_commands:
+            log_manager.info(f"[ADB] {desc}: {command}")
+            success, output = self.run_adb_shell_command(command, device_id=device_id, timeout=15)
+            if success:
+                messages.append(f"{desc}成功")
+                log_manager.info(f"[ADB] {desc}成功")
+            else:
+                messages.append(f"{desc}返回: {output}")
+                log_manager.warning(f"[ADB] {desc}返回: {output}")
+
+        time.sleep(0.8)
+        return True, "；".join(messages)
+
+    def get_current_device_ip_via_adb(self):
+        """通过ADB获取设备当前WiFi IP。"""
+        device_id, msg = self.get_adb_device_id()
+        if not device_id:
+            log_manager.info(f"[ADB] {msg}")
+            return None
+
+        ip_commands = [
+            "ip addr show wlan0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1",
+            "ifconfig wlan0 | grep 'inet addr:' | cut -d: -f2 | awk '{print $1}'",
+            "hostname -I | awk '{print $1}'",
+        ]
+
+        for command in ip_commands:
+            success, output = self.run_adb_shell_command(command, device_id=device_id, timeout=5)
+            if not success or not output:
+                continue
+            ip = output.splitlines()[-1].strip()
+            if re.match(r'\d{1,3}(?:\.\d{1,3}){3}', ip):
+                log_manager.info(f"[ADB] 成功获取设备IP: {ip}")
+                return ip
+
+        log_manager.warning("[ADB] 未能获取到有效的IP地址")
+        return None
             
     def execute_ssh_command(self, command):
         """执行SSH命令（自动重连）"""

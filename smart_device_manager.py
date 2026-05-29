@@ -8,6 +8,7 @@ import subprocess
 import time
 import re
 from log_manager import LogManager
+from device_manager import DeviceManager, connect_ssh_with_retry
 
 log_manager = LogManager()
 
@@ -26,12 +27,7 @@ class SmartDeviceManager:
         
         流程：
         1. 检测ADB USB设备
-        2. 执行初始化命令（mount、启动SSH等）
-        3. 弹出WiFi配置对话框
-        4. 通过ADB配置WiFi
-        5. 等待并获取设备IP
-        6. 切换到SSH连接
-        7. 返回设备IP供后续使用
+        2. 返回ADB设备ID，供UI继续收集WiFi信息
         
         Returns:
             tuple: (success, message, device_ip)
@@ -43,15 +39,8 @@ class SmartDeviceManager:
         if not success:
             return False, msg, None
         
-        # Step 2: 执行初始化命令
-        success, msg = self._initialize_device()
-        if not success:
-            return False, f"设备初始化失败: {msg}", None
-        
-        # Step 3-5: 需要用户输入WiFi信息
-        # 这部分由UI层处理，这里只提供方法
-        
-        return True, "设备初始化完成，请配置WiFi", self.adb_device_id
+        # WiFi信息由UI层收集，后续 full_auto_setup 会按“配网 -> 获取IP -> 启动SSH”的顺序执行。
+        return True, "已检测到设备，请配置WiFi", self.adb_device_id
     
     def _detect_adb_device(self):
         """检测ADB USB设备"""
@@ -62,7 +51,7 @@ class SmartDeviceManager:
                 ['adb', 'devices'],
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=5
             )
             
             if result.returncode != 0:
@@ -213,7 +202,7 @@ class SmartDeviceManager:
                     ['adb', '-s', self.adb_device_id, 'shell', cmd],
                     capture_output=True,
                     text=True,
-                    timeout=10
+                    timeout=5
                 )
                 
                 if result.returncode == 0 and result.stdout.strip():
@@ -250,30 +239,52 @@ class SmartDeviceManager:
         log_manager.info(f"[AUTO] 测试SSH连接到 {self.device_ip}...")
         
         try:
-            import paramiko
-            
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(
-                self.device_ip, 
-                port=22, 
-                username='root', 
-                password='', 
-                timeout=10
+            ssh, success, msg = connect_ssh_with_retry(
+                self.device_ip,
+                username='root',
+                password='',
+                port=22,
+                retries=4,
+                timeout=2.0,
+                banner_timeout=1.5,
+                auth_timeout=2.5,
+                retry_delay=0.5,
             )
-            
-            # 测试基本命令
-            stdin, stdout, stderr = ssh.exec_command("echo 'SSH connected'")
-            output = stdout.read().decode('utf-8').strip()
-            
-            ssh.close()
-            
-            if output == "SSH connected":
-                self.ssh_client = None  # 关闭测试连接
-                log_manager.info(f"[AUTO] SSH连接成功: {self.device_ip}")
-                return True, f"SSH连接成功: {self.device_ip}"
-            else:
+
+            if not success or not ssh:
+                log_manager.warning(f"[AUTO] SSH连接失败，尝试通过ADB启动SSH服务: {msg}")
+                adb_success, adb_msg = DeviceManager().ensure_ssh_service_via_adb()
+                if not adb_success:
+                    log_manager.error(f"[AUTO] SSH连接失败，且ADB启动SSH服务失败: {adb_msg}")
+                    return False, f"SSH连接失败: {msg}；ADB启动SSH服务失败: {adb_msg}"
+
+                ssh, success, msg = connect_ssh_with_retry(
+                    self.device_ip,
+                    username='root',
+                    password='',
+                    port=22,
+                    retries=3,
+                    timeout=2.0,
+                    banner_timeout=1.5,
+                    auth_timeout=2.5,
+                    retry_delay=0.5,
+                )
+                if not success or not ssh:
+                    log_manager.error(f"[AUTO] ADB启动SSH服务后仍连接失败: {msg}")
+                    return False, f"SSH连接失败: {msg}；已尝试ADB启动SSH服务: {adb_msg}"
+
+            try:
+                # 测试基本命令
+                stdin, stdout, stderr = ssh.exec_command("echo 'SSH connected'", timeout=5)
+                output = stdout.read().decode('utf-8').strip()
+
+                if output == "SSH connected":
+                    self.ssh_client = None  # 关闭测试连接
+                    log_manager.info(f"[AUTO] SSH连接成功: {self.device_ip}")
+                    return True, f"SSH连接成功: {self.device_ip}"
                 return False, "SSH测试失败"
+            finally:
+                ssh.close()
                 
         except Exception as e:
             log_manager.error(f"[AUTO] SSH连接失败: {e}")
@@ -316,18 +327,14 @@ class SmartDeviceManager:
         if not success:
             return False, msg, None, None, None
         
-        # Step 2: 初始化设备
-        success, msg = self._initialize_device()
-        if not success:
-            return False, f"初始化失败: {msg}", None, None, None
-        
-        # Step 3: 配置WiFi
+        # Step 2: 先配置WiFi。设备默认可能未启动SSH，必须先让设备入网拿到当前IP。
         success, msg = self.configure_wifi_via_adb(wifi_ssid, wifi_password)
         if not success:
             return False, f"WiFi配置失败: {msg}", None, None, None
         
-        # Step 4: 获取IP
-        max_retries = 5
+        # Step 3: 获取IP
+        max_retries = 8
+        retry_delay = 1.5
         for attempt in range(max_retries):
             log_manager.info(f"[AUTO] 尝试获取IP ({attempt + 1}/{max_retries})...")
             ip = self.get_device_ip()
@@ -335,12 +342,20 @@ class SmartDeviceManager:
             if ip:
                 break
             
-            log_manager.info(f"[AUTO] 第{attempt + 1}次尝试失败，等待5秒后重试...")
-            time.sleep(5)
+            if attempt < max_retries - 1:
+                log_manager.info(
+                    f"[AUTO] 第{attempt + 1}次尝试失败，等待{retry_delay:.1f}秒后重试..."
+                )
+                time.sleep(retry_delay)
         
         if not ip:
             return False, "无法获取设备IP地址，请检查WiFi连接", None, None, None
         
+        # Step 4: 入网后再启动SSH服务
+        success, msg = self._initialize_device()
+        if not success:
+            return False, f"初始化失败: {msg}", ip, None, None
+
         # Step 5: 测试SSH
         success, msg = self.test_ssh_connection(ip)
         if not success:

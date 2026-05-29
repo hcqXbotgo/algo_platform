@@ -259,6 +259,15 @@ class WiFiPerfTestWorker(QObject):
     result_ready = pyqtSignal(dict)
     finished = pyqtSignal(bool, str)
 
+    @staticmethod
+    def _fmt(value, digits=2, suffix=""):
+        if value is None:
+            return "N/A"
+        try:
+            return f"{float(value):.{digits}f}{suffix}"
+        except (TypeError, ValueError):
+            return str(value)
+
     def __init__(self, tester, mode, duration, bandwidth=None, bandwidths=None):
         super().__init__()
         self.tester = tester
@@ -313,9 +322,18 @@ class WiFiPerfTestWorker(QObject):
             self.finished.emit(False, "测试已取消")
         elif result:
             self.result_ready.emit(result)
+            self.progress.emit(
+                100,
+                "测试完成: "
+                f"带宽={self._fmt(result.get('bandwidth_target'), 0, 'Mbps')}, "
+                f"吞吐量={self._fmt(result.get('throughput_mbps'), 2, 'Mbps')}, "
+                f"RSSI={self._fmt(result.get('rssi_dbm'), 0, 'dBm')}, "
+                f"协商速率={self._fmt(result.get('link_speed_mbps'), 1, 'Mbps')}",
+            )
             self.finished.emit(
                 True,
-                f"测试完成: 吞吐量={result['throughput_mbps']}Mbps, 丢包={result['loss_percent']}%",
+                f"测试完成: 吞吐量={self._fmt(result.get('throughput_mbps'), 2, 'Mbps')}, "
+                f"丢包={self._fmt(result.get('loss_percent'), 2, '%')}",
             )
         else:
             self.finished.emit(False, msg)
@@ -331,7 +349,17 @@ class WiFiPerfTestWorker(QObject):
             if current < total_count:
                 self.progress.emit(progress, f"测试进度: {current}/{total_count} (带宽={bandwidth}Mbps)")
             else:
-                self.progress.emit(100, "测试完成")
+                if result:
+                    self.progress.emit(
+                        100,
+                        "测试完成: "
+                        f"带宽={self._fmt(result.get('bandwidth_target'), 0, 'Mbps')}, "
+                        f"吞吐量={self._fmt(result.get('throughput_mbps'), 2, 'Mbps')}, "
+                        f"RSSI={self._fmt(result.get('rssi_dbm'), 0, 'dBm')}, "
+                        f"协商速率={self._fmt(result.get('link_speed_mbps'), 1, 'Mbps')}",
+                    )
+                else:
+                    self.progress.emit(100, "测试完成")
 
             if result:
                 self.result_ready.emit(result)
@@ -431,3 +459,107 @@ class WiFiReconnectWorker(QObject):
         except Exception as e:
             log_manager.error(f"[AUTO] WiFi重连异常: {str(e)}", exc_info=True)
             self.finished.emit(False, self.device_ip, self.rtsp_0, self.rtsp_1, str(e))
+
+
+class AutoConnectWorker(QObject):
+    """启动时自动连接设备的后台任务。"""
+
+    status = pyqtSignal(str)
+    finished = pyqtSignal(bool, str, str, str, str)
+
+    def __init__(self, device_manager, config):
+        super().__init__()
+        self.device_manager = device_manager
+        self.config = config or {}
+
+    def _run_wifi_setup(self, fallback_ip, rtsp_0, rtsp_1):
+        from smart_device_manager import SmartDeviceManager
+
+        wifi_ssid = self.config.get('wifi_ssid', '')
+        wifi_password = self.config.get('wifi_password', '')
+        if not wifi_ssid or not wifi_password:
+            return False, fallback_ip, rtsp_0, rtsp_1, "缺少WiFi配置信息，无法自动重连"
+
+        self.status.emit("正在通过ADB重新配置WiFi...")
+        log_manager.info("[AUTO] 先通过ADB配置WiFi，入网后再启动SSH服务")
+        smart_manager = SmartDeviceManager()
+        success, msg, ip, new_rtsp_0, new_rtsp_1 = smart_manager.full_auto_setup(
+            wifi_ssid,
+            wifi_password,
+        )
+        if not success or not ip:
+            return False, fallback_ip, rtsp_0, rtsp_1, f"WiFi重连失败: {msg}"
+
+        self.status.emit(f"正在连接设备: {ip}...")
+        ssh_success, ssh_msg = self.device_manager.connect_ssh(ip)
+        if not ssh_success:
+            return False, ip, rtsp_0, rtsp_1, f"WiFi重连成功但SSH连接失败: {ssh_msg}"
+
+        return True, ip, new_rtsp_0 or rtsp_0, new_rtsp_1 or rtsp_1, "WiFi重连成功"
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            device_ip = self.config.get('device_ip')
+            rtsp_0 = self.config.get('rtsp_0')
+            rtsp_1 = self.config.get('rtsp_1')
+
+            if not device_ip:
+                self.finished.emit(False, "", "", "", "配置文件中没有设备IP")
+                return
+
+            self.status.emit("正在检测设备状态...")
+            log_manager.info(f"[AUTO] 检测到上次配置的设备: {device_ip}，开始后台连接")
+
+            current_ip = self.device_manager.get_current_device_ip_via_adb()
+            if current_ip:
+                log_manager.info(f"[AUTO] ADB检测到设备当前IP: {current_ip}")
+                if current_ip != device_ip:
+                    log_manager.warning(f"[AUTO] IP不一致: 配置IP={device_ip}, 当前IP={current_ip}")
+                    self.status.emit(f"检测到新IP，正在连接设备: {current_ip}...")
+                    ssh_success, ssh_msg = self.device_manager.connect_ssh(current_ip)
+                    if ssh_success:
+                        self.finished.emit(
+                            True,
+                            current_ip,
+                            f"rtsp://{current_ip}/live/0",
+                            f"rtsp://{current_ip}/live/1",
+                            "检测到设备IP变化并自动连接成功",
+                        )
+                        return
+                    log_manager.warning(f"[AUTO] 当前IP直连失败: {ssh_msg}，尝试WiFi重连")
+                    success, ip, new_rtsp_0, new_rtsp_1, msg = self._run_wifi_setup(
+                        device_ip,
+                        rtsp_0,
+                        rtsp_1,
+                    )
+                    self.finished.emit(success, ip, new_rtsp_0 or "", new_rtsp_1 or "", msg)
+                    return
+            else:
+                log_manager.info("[AUTO] 未能通过ADB获取设备IP，将尝试配置IP直连")
+
+            target_ip = current_ip or device_ip
+            self.status.emit(f"正在连接设备: {target_ip}...")
+            # 旧IP直连失败时先走配网流程，不急着对可能已经失效的地址启动sshd。
+            ssh_success, ssh_msg = self.device_manager.connect_ssh(
+                target_ip,
+                auto_start_ssh=bool(current_ip),
+            )
+            if ssh_success:
+                self.finished.emit(True, target_ip, rtsp_0 or "", rtsp_1 or "", "SSH连接成功")
+                return
+
+            log_manager.warning(f"[AUTO] SSH直连失败: {ssh_msg}")
+            success, ip, new_rtsp_0, new_rtsp_1, msg = self._run_wifi_setup(
+                target_ip,
+                rtsp_0,
+                rtsp_1,
+            )
+            if success:
+                self.finished.emit(True, ip, new_rtsp_0 or "", new_rtsp_1 or "", msg)
+            else:
+                self.finished.emit(False, ip, new_rtsp_0 or "", new_rtsp_1 or "", f"{ssh_msg}；{msg}")
+
+        except Exception as e:
+            log_manager.error(f"[AUTO] 自动连接后台任务异常: {str(e)}", exc_info=True)
+            self.finished.emit(False, self.config.get('device_ip', ''), "", "", str(e))

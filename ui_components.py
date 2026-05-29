@@ -674,6 +674,7 @@ class WiFiPerfTab:
             font-size: 14px;
         """)
         parent.wifi_test_status_label.setAlignment(Qt.AlignCenter)
+        parent.wifi_test_status_label.setWordWrap(True)
         control_layout.addWidget(parent.wifi_test_status_label)
         
         # 进度条
@@ -759,8 +760,9 @@ class WiFiPerfTab:
         chart_group = QGroupBox("📈 性能趋势图")
         chart_layout = QVBoxLayout()
         
-        parent.wifi_perf_figure = Figure(figsize=(12, 6))
+        parent.wifi_perf_figure = Figure(figsize=(14, 8))
         parent.wifi_perf_canvas = FigureCanvas(parent.wifi_perf_figure)
+        parent.wifi_perf_canvas.setMinimumHeight(420)
         chart_layout.addWidget(parent.wifi_perf_canvas)
         
         chart_group.setLayout(chart_layout)
@@ -774,6 +776,11 @@ class WiFiPerfTab:
         export_csv_btn.clicked.connect(parent.export_wifi_perf_csv)
         export_csv_btn.setStyleSheet("background-color: #3498db; color: white; padding: 10px; font-weight: bold;")
         export_layout.addWidget(export_csv_btn)
+
+        export_curve_btn = QPushButton("🖼️ 导出曲线图")
+        export_curve_btn.clicked.connect(parent.export_wifi_perf_plot)
+        export_curve_btn.setStyleSheet("background-color: #2ecc71; color: white; padding: 10px; font-weight: bold;")
+        export_layout.addWidget(export_curve_btn)
         
         clear_results_btn = QPushButton("🗑️ 清空结果")
         clear_results_btn.clicked.connect(parent.clear_wifi_results)

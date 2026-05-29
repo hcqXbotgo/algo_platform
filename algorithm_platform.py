@@ -6,7 +6,6 @@
 
 import sys
 import os
-import subprocess
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QMessageBox, QGroupBox, QFormLayout,
@@ -28,7 +27,6 @@ import matplotlib.pyplot as plt
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']  # 用来正常显示中文标签
 plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
 import json
-import re
 import numpy as np
 from datetime import datetime
 
@@ -52,6 +50,7 @@ from ui_components import (
     WiFiPerfTab,
 )
 from workers import (
+    AutoConnectWorker,
     FileTransferWorker,
     LogDownloadWorker,
     PerformanceStartWorker,
@@ -356,16 +355,6 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         log_manager.info(f"[OPERATION] 开始RTMP推流: URL={rtmp_url}, Quality={quality}")
         
-        reply = QMessageBox.question(
-            self, 
-            "确认", 
-            f"确定要开始RTMP推流吗？\n\n服务器: {rtmp_url}\n画质: {quality}",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
-        if reply == QMessageBox.No:
-            return
-        
         self.statusBar().showMessage(f"正在启动RTMP推流 ({quality})...")
         self.rtmp_status_label.setText("📺 RTMP推流状态: 启动中...")
         self.rtmp_status_label.setStyleSheet("""
@@ -394,7 +383,6 @@ class AlgorithmValidationPlatform(QMainWindow):
                     font-size: 14px;
                     font-weight: bold;
                 """)
-                QMessageBox.information(self, "成功", f"{msg}\n\nRTMP推流已启动！")
                 self.statusBar().showMessage(f"RTMP推流已启动 ({quality})", 3000)
             else:
                 log_manager.error(f"[RTMP] 推流启动失败: {msg}")
@@ -410,11 +398,11 @@ class AlgorithmValidationPlatform(QMainWindow):
                 self.statusBar().showMessage("RTMP推流启动失败", 3000)
                 
         except Exception as e:
-            error_msg = f"RTMP停止推流异常: {str(e)}"
+            error_msg = f"RTMP推流异常: {str(e)}"
             log_manager.error(f"[RTMP] {error_msg}")
             QMessageBox.critical(self, "错误", error_msg)
             self.rtmp_status_label.setText("❌ RTMP推流状态: 异常")
-            self.statusBar().showMessage("RTMP停止推流异常", 3000)
+            self.statusBar().showMessage("RTMP推流异常", 3000)
 
     def stop_rtmp_streaming(self):
         """停止RTMP推流"""
@@ -424,16 +412,6 @@ class AlgorithmValidationPlatform(QMainWindow):
             return
         
         log_manager.info("[OPERATION] 停止RTMP推流")
-        
-        reply = QMessageBox.question(
-            self, 
-            "确认", 
-            "确定要停止RTMP推流吗？",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
-        if reply == QMessageBox.No:
-            return
         
         self.statusBar().showMessage("正在停止RTMP推流...")
         self.rtmp_status_label.setText("📺 RTMP推流状态: 停止中...")
@@ -462,7 +440,6 @@ class AlgorithmValidationPlatform(QMainWindow):
                     color: #7f8c8d;
                     font-size: 14px;
                 """)
-                QMessageBox.information(self, "成功", msg)
                 self.statusBar().showMessage("RTMP推流已停止", 3000)
             else:
                 log_manager.error(f"[RTMP] 推流停止失败: {msg}")
@@ -511,16 +488,22 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.wifi_device_ip_label.setStyleSheet("color: #27ae60; font-weight: bold; padding: 5px;")
         
         # 获取WiFi信息
+        self.wifi_perf_tester.set_device_ip(self.current_device_ip)
         wifi_info = self.wifi_perf_tester.get_wifi_info()
         
-        rssi = wifi_info['rssi']
-        speed = wifi_info['link_speed']
+        rssi = wifi_info.get('rssi')
+        speed = wifi_info.get('link_speed')
         
-        self.wifi_rssi_label.setText(f"{rssi} dBm")
-        self.wifi_speed_label.setText(f"{speed} Mbps")
+        rssi_text = "N/A" if rssi is None else f"{rssi:.0f} dBm"
+        speed_text = "N/A" if speed is None else f"{speed:.1f} Mbps"
+
+        self.wifi_rssi_label.setText(rssi_text)
+        self.wifi_speed_label.setText(speed_text)
         
         # 根据RSSI设置颜色
-        if rssi < -70:
+        if rssi is None:
+            color = "#7f8c8d"  # 灰色 - 未获取到
+        elif rssi < -70:
             color = "#e74c3c"  # 红色 - 信号弱
         elif rssi < -50:
             color = "#f39c12"  # 橙色 - 信号中等
@@ -529,7 +512,15 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         self.wifi_rssi_label.setStyleSheet(f"color: {color}; font-weight: bold; padding: 5px; font-size: 14px;")
         
-        log_manager.info(f"WiFi信息: RSSI={rssi}dBm, 速率={speed}Mbps")
+        if wifi_info.get("valid"):
+            self.statusBar().showMessage("WiFi信息已刷新", 3000)
+        else:
+            self.statusBar().showMessage("未读取到有效WiFi信息，请检查SSH和无线接口", 5000)
+
+        log_manager.info(
+            f"WiFi信息: RSSI={rssi_text}, 速率={speed_text}, "
+            f"iface={wifi_info.get('interface')}, source={wifi_info.get('source')}"
+        )
     
     def start_wifi_perf_test(self):
         """开始WiFi性能测试"""
@@ -572,6 +563,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.information(self, "提示", "当前已有WiFi测试正在运行")
             return
 
+        self.current_wifi_plot_mode = mode
         self.start_test_btn.setEnabled(False)
         self.stop_test_btn.setEnabled(True)
         self.wifi_test_status_label.setText("🔄 测试状态: 正在启动iperf3服务器...")
@@ -630,14 +622,22 @@ class AlgorithmValidationPlatform(QMainWindow):
         """添加结果到表格"""
         row = self.wifi_result_table.rowCount()
         self.wifi_result_table.insertRow(row)
+
+        def fmt_optional(value, suffix="", precision=1):
+            if value is None:
+                return "N/A"
+            try:
+                return f"{float(value):.{precision}f}{suffix}"
+            except (TypeError, ValueError):
+                return str(value)
         
         self.wifi_result_table.setItem(row, 0, QTableWidgetItem(str(result['bandwidth_target'])))
-        self.wifi_result_table.setItem(row, 1, QTableWidgetItem(f"{result['throughput_mbps']:.2f}"))
-        self.wifi_result_table.setItem(row, 2, QTableWidgetItem(f"{result['jitter_ms']:.2f}"))
-        self.wifi_result_table.setItem(row, 3, QTableWidgetItem(f"{result['loss_percent']:.2f}%"))
-        self.wifi_result_table.setItem(row, 4, QTableWidgetItem(f"{result['avg_latency_ms']:.2f}"))
-        self.wifi_result_table.setItem(row, 5, QTableWidgetItem(f"{result['rssi_dbm']}"))
-        self.wifi_result_table.setItem(row, 6, QTableWidgetItem(f"{result['link_speed_mbps']:.1f}"))
+        self.wifi_result_table.setItem(row, 1, QTableWidgetItem(fmt_optional(result.get('throughput_mbps'), precision=2)))
+        self.wifi_result_table.setItem(row, 2, QTableWidgetItem(fmt_optional(result.get('jitter_ms'), precision=2)))
+        self.wifi_result_table.setItem(row, 3, QTableWidgetItem(fmt_optional(result.get('loss_percent'), suffix="%", precision=2)))
+        self.wifi_result_table.setItem(row, 4, QTableWidgetItem(fmt_optional(result.get('avg_latency_ms'), precision=2)))
+        self.wifi_result_table.setItem(row, 5, QTableWidgetItem(fmt_optional(result.get('rssi_dbm'), precision=0)))
+        self.wifi_result_table.setItem(row, 6, QTableWidgetItem(fmt_optional(result.get('link_speed_mbps'), precision=1)))
         self.wifi_result_table.setItem(row, 7, QTableWidgetItem(result['timestamp']))
     
     def _update_wifi_chart(self):
@@ -648,45 +648,96 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.wifi_perf_figure.clear()
         
         # 创建子图
-        ax1 = self.wifi_perf_figure.add_subplot(2, 2, 1)
-        ax2 = self.wifi_perf_figure.add_subplot(2, 2, 2)
-        ax3 = self.wifi_perf_figure.add_subplot(2, 2, 3)
-        ax4 = self.wifi_perf_figure.add_subplot(2, 2, 4)
-        
-        # 提取数据
-        bandwidths = [r['bandwidth_target'] for r in self.wifi_perf_tester.test_results]
-        throughputs = [r['throughput_mbps'] for r in self.wifi_perf_tester.test_results]
-        jitters = [r['jitter_ms'] for r in self.wifi_perf_tester.test_results]
-        losses = [r['loss_percent'] for r in self.wifi_perf_tester.test_results]
-        latencies = [r['avg_latency_ms'] for r in self.wifi_perf_tester.test_results]
-        
-        # 吞吐量 vs 目标带宽
-        ax1.plot(bandwidths, throughputs, 'o-', linewidth=2, markersize=8, color='#27ae60')
-        ax1.set_xlabel('目标带宽 (Mbps)', fontsize=10)
+        ax1 = self.wifi_perf_figure.add_subplot(3, 2, 1)
+        ax2 = self.wifi_perf_figure.add_subplot(3, 2, 2)
+        ax3 = self.wifi_perf_figure.add_subplot(3, 2, 3)
+        ax4 = self.wifi_perf_figure.add_subplot(3, 2, 4)
+        ax5 = self.wifi_perf_figure.add_subplot(3, 2, 5)
+        ax6 = self.wifi_perf_figure.add_subplot(3, 2, 6)
+
+        results = self.wifi_perf_tester.test_results
+        plot_mode = getattr(self, "current_wifi_plot_mode", None)
+        if plot_mode is None and results:
+            plot_mode = results[-1].get("test_mode", "multi")
+
+        if plot_mode == "single":
+            single_results = [r for r in results if r.get("test_mode", "single") == "single"]
+            result = single_results[-1] if single_results else results[-1]
+            series = result.get("interval_series") or []
+            if not series:
+                series = [
+                    {
+                        "time_s": result.get("duration", 0),
+                        "throughput_mbps": result.get("throughput_mbps"),
+                        "jitter_ms": result.get("jitter_ms"),
+                        "loss_percent": result.get("loss_percent"),
+                    }
+                ]
+
+            x_values = [point.get("time_s") for point in series]
+            throughputs = [point.get("throughput_mbps") for point in series]
+            jitters = [point.get("jitter_ms") for point in series]
+            losses = [point.get("loss_percent") for point in series]
+            latencies = [result.get("avg_latency_ms") for _ in series]
+            rssis = [result.get("rssi_dbm") for _ in series]
+            link_speeds = [result.get("link_speed_mbps") for _ in series]
+            x_label = "时间 (s)"
+            title_suffix = f" - {result.get('bandwidth_target')}Mbps"
+        else:
+            chart_results = [r for r in results if r.get("test_mode") == "multi"]
+            if not chart_results:
+                chart_results = results
+            x_values = [r.get('bandwidth_target') for r in chart_results]
+            throughputs = [r.get('throughput_mbps') for r in chart_results]
+            jitters = [r.get('jitter_ms') for r in chart_results]
+            losses = [r.get('loss_percent') for r in chart_results]
+            latencies = [r.get('avg_latency_ms') for r in chart_results]
+            rssis = [r.get('rssi_dbm') for r in chart_results]
+            link_speeds = [r.get('link_speed_mbps') for r in chart_results]
+            x_label = "目标带宽 (Mbps)"
+            title_suffix = ""
+
+        # 吞吐量
+        ax1.plot(x_values, throughputs, 'o-', linewidth=2, markersize=8, color='#27ae60')
+        ax1.set_xlabel(x_label, fontsize=10)
         ax1.set_ylabel('实际吞吐量 (Mbps)', fontsize=10)
-        ax1.set_title('吞吐量测试', fontsize=12, fontweight='bold')
+        ax1.set_title(f'吞吐量测试{title_suffix}', fontsize=12, fontweight='bold')
         ax1.grid(True, alpha=0.3)
         
-        # 抖动 vs 目标带宽
-        ax2.plot(bandwidths, jitters, 's-', linewidth=2, markersize=8, color='#e74c3c')
-        ax2.set_xlabel('目标带宽 (Mbps)', fontsize=10)
+        # 抖动
+        ax2.plot(x_values, jitters, 's-', linewidth=2, markersize=8, color='#e74c3c')
+        ax2.set_xlabel(x_label, fontsize=10)
         ax2.set_ylabel('抖动 (ms)', fontsize=10)
         ax2.set_title('网络抖动', fontsize=12, fontweight='bold')
         ax2.grid(True, alpha=0.3)
         
-        # 丢包率 vs 目标带宽
-        ax3.plot(bandwidths, losses, '^-', linewidth=2, markersize=8, color='#f39c12')
-        ax3.set_xlabel('目标带宽 (Mbps)', fontsize=10)
+        # 丢包率
+        ax3.plot(x_values, losses, '^-', linewidth=2, markersize=8, color='#f39c12')
+        ax3.set_xlabel(x_label, fontsize=10)
         ax3.set_ylabel('丢包率 (%)', fontsize=10)
         ax3.set_title('丢包率', fontsize=12, fontweight='bold')
         ax3.grid(True, alpha=0.3)
         
-        # 延迟 vs 目标带宽
-        ax4.plot(bandwidths, latencies, 'D-', linewidth=2, markersize=8, color='#3498db')
-        ax4.set_xlabel('目标带宽 (Mbps)', fontsize=10)
+        # 延迟
+        ax4.plot(x_values, latencies, 'D-', linewidth=2, markersize=8, color='#3498db')
+        ax4.set_xlabel(x_label, fontsize=10)
         ax4.set_ylabel('平均延迟 (ms)', fontsize=10)
         ax4.set_title('通信延迟', fontsize=12, fontweight='bold')
         ax4.grid(True, alpha=0.3)
+
+        # RSSI
+        ax5.plot(x_values, rssis, 'v-', linewidth=2, markersize=8, color='#8e44ad')
+        ax5.set_xlabel(x_label, fontsize=10)
+        ax5.set_ylabel('RSSI (dBm)', fontsize=10)
+        ax5.set_title('信号强度', fontsize=12, fontweight='bold')
+        ax5.grid(True, alpha=0.3)
+
+        # 协商速率
+        ax6.plot(x_values, link_speeds, 'P-', linewidth=2, markersize=8, color='#16a085')
+        ax6.set_xlabel(x_label, fontsize=10)
+        ax6.set_ylabel('协商速率 (Mbps)', fontsize=10)
+        ax6.set_title('协商速率', fontsize=12, fontweight='bold')
+        ax6.grid(True, alpha=0.3)
         
         # 使用tight_layout并捕获警告，避免布局问题导致递归重绘
         try:
@@ -724,16 +775,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             self._update_test_status(False, "当前没有正在运行的测试")
             return
 
-        reply = QMessageBox.question(
-            self, 
-            "确认", 
-            "确定要停止当前测试吗？",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
-        if reply == QMessageBox.No:
-            return
-
+        log_manager.info("[WIFI] 停止 WiFi 性能测试请求已发送")
         worker.cancel()
         self.wifi_test_status_label.setText("⏹️ 测试状态: 正在停止...")
         self.wifi_test_status_label.setStyleSheet("""
@@ -760,6 +802,36 @@ class AlgorithmValidationPlatform(QMainWindow):
             log_manager.info(f"WiFi性能测试结果已导出: {filepath}")
         else:
             QMessageBox.critical(self, "错误", msg)
+
+    def export_wifi_perf_plot(self):
+        """导出WiFi性能测试曲线图"""
+        if not self.wifi_perf_tester.test_results:
+            QMessageBox.warning(self, "警告", "没有可导出的测试结果")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"wifi_perf_curve_{timestamp}.png"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出WiFi性能曲线图",
+            default_name,
+            "PNG图片 (*.png);;JPEG图片 (*.jpg);;PDF文件 (*.pdf);;All Files (*)",
+        )
+
+        if not file_path:
+            return
+
+        try:
+            if not os.path.splitext(file_path)[1]:
+                file_path += ".png"
+            self._update_wifi_chart()
+            self.wifi_perf_figure.savefig(file_path, dpi=150, bbox_inches='tight')
+            QMessageBox.information(self, "成功", f"曲线图已导出到:\n{file_path}")
+            self.statusBar().showMessage(f"WiFi曲线图已导出: {os.path.basename(file_path)}", 3000)
+            log_manager.info(f"[WIFI] 性能曲线图已导出: {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出曲线图失败:\n{str(e)}")
+            log_manager.error(f"[WIFI] 导出性能曲线图失败: {str(e)}", exc_info=True)
     
     def clear_wifi_results(self):
         """清空WiFi测试结果"""
@@ -1764,42 +1836,14 @@ class AlgorithmValidationPlatform(QMainWindow):
             return
 
         if getattr(self, "performance_start_thread", None) and self.performance_start_thread.isRunning():
-            QMessageBox.information(self, "提示", "性能监控正在启动中")
+            log_manager.info("[PERF] 性能监控正在启动中，忽略重复点击")
+            self.statusBar().showMessage("性能监控正在启动中", 3000)
             return
         
         try:
             ip = self.current_device_ip
             ddr_freq = self.ddr_freq_spin.value()
             interval = self.monitor_interval_spin.value()
-            
-            # 检查是否已设置DDR工具路径
-            if not hasattr(self.performance_monitor, 'local_tool_path') or not self.performance_monitor.local_tool_path:
-                # 提示用户选择DDR测试工具文件
-                reply = QMessageBox.question(
-                    self,
-                    "选择DDR测试工具",
-                    "首次使用需要选择DDR带宽测试工具文件(rk-msch-probe-for-user-64bit-1)。\n\n"
-                    "是否现在选择该工具文件？\n\n"
-                    "（如果设备已有该工具，可以跳过）",
-                    QMessageBox.Yes | QMessageBox.No
-
-
-                )
-                
-                if reply == QMessageBox.Yes:
-                    tool_file, _ = QFileDialog.getOpenFileName(
-                        self, 
-                        "选择DDR测试工具", 
-                        "", 
-                        "Executable Files (*);;All Files (*)"
-                    )
-                    
-                    if tool_file:
-                        success, msg = self.performance_monitor.set_tool_path(tool_file)
-                        if success:
-                            self.statusBar().showMessage(f"DDR工具已设置: {os.path.basename(tool_file)}", 3000)
-                        else:
-                            QMessageBox.warning(self, "警告", msg)
             
             # 显示进度对话框
             progress_dialog = QDialog(self)
@@ -1838,10 +1882,8 @@ class AlgorithmValidationPlatform(QMainWindow):
                     self.monitor_btn.setText("停止监控")
                     self.monitor_btn.setStyleSheet("background-color: #f44336; color: white;")
                     self.update_timer.start(interval * 1000)
-                    QMessageBox.information(
-                        self, 
-                        "监控已启动", 
-                        f"性能监控已启动！\n\n设备IP: {ip}\n采样间隔: {interval}秒\nDDR频率: {ddr_freq} MHz"
+                    log_manager.info(
+                        f"[PERF] 性能监控已启动: ip={ip}, interval={interval}s, ddr_freq={ddr_freq}MHz"
                     )
                     self.statusBar().showMessage(f"性能监控运行中 - 采样间隔: {interval}秒", 5000)
                 else:
@@ -1887,10 +1929,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.is_monitoring = False
             self.monitor_btn.setText("开始监控")
             self.monitor_btn.setStyleSheet("background-color: #4CAF50; color: white;")
-            
-            # 显示停止提示
-            msg = "性能监控已停止！"
-            QMessageBox.information(self, "监控已停止", msg)
+            log_manager.info("[PERF] 性能监控已停止")
             self.statusBar().showMessage("性能监控已停止", 3000)
             
         except Exception as e:
@@ -1901,9 +1940,15 @@ class AlgorithmValidationPlatform(QMainWindow):
         """更新性能数据"""
         data = self.performance_monitor.get_latest_data()
         ddr_modules = data.get('ddr_modules', {})
-        
-        # 更新表格 - 显示NPU各Core、CPU、内存(MB)、DDR总带宽和各模块
-        self.perf_table.setRowCount(22)
+        ddr_status = data.get('ddr_status', '未启动')
+        ddr_error = data.get('ddr_error')
+        if ddr_error:
+            ddr_error = str(ddr_error)
+            if len(ddr_error) > 120:
+                ddr_error = ddr_error[:117] + "..."
+            ddr_status = f"{ddr_status}: {ddr_error}"
+
+        # 更新表格 - 显示NPU各Core、CPU、内存(MB)、DDR状态、DDR总带宽和各模块
         metrics = [
             ("NPU Core0占用率", f"{data.get('npu_core0', 0):.1f}%"),
             ("NPU Core1占用率", f"{data.get('npu_core1', 0):.1f}%"),
@@ -1911,6 +1956,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             ("CPU占用率", f"{data.get('cpu_usage', 0):.1f}%"),
             ("内存使用", f"{data.get('memory_used_mb', 0):.0f} / {data.get('memory_total_mb', 0):.0f} MB"),
             ("内存占用率", f"{data.get('memory_usage', 0):.1f}%"),
+            ("DDR状态", ddr_status),
             ("DDR总带宽", f"{data.get('ddr_total', 0):.2f} MB/s"),
             ("DDR-CPU", f"{ddr_modules.get('cpu', 0):.2f} MB/s"),
             ("DDR-CCI_M1", f"{ddr_modules.get('cci_m1', 0):.2f} MB/s"),
@@ -1928,6 +1974,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             ("DDR-UFSHC", f"{ddr_modules.get('ufshc', 0):.2f} MB/s"),
             ("DDR-Others", f"{ddr_modules.get('others', 0):.2f} MB/s"),
         ]
+        self.perf_table.setRowCount(len(metrics))
         
         for i, (metric, value) in enumerate(metrics):
             self.perf_table.setItem(i, 0, QTableWidgetItem(metric))
@@ -2435,7 +2482,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         
     def browse_video_file(self):
         """浏览选择视频文件"""
-        file_name, _ = QFileDialog.getOpenFileName(self, "选择视频文件", "", "Video Files (*.mp4 *.avi *.mov)")
+        file_name, _ = QFileDialog.getOpenFileName(self, "选择视频文件", "", "Video Files (*.mp4 *.avi *.mov *.h264 *.h265)")
         if file_name:
             self.video_file_edit.setText(file_name)
             
@@ -2570,7 +2617,8 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.is_tracking = True
             self.track_btn.setText("停止追踪")
             self.track_btn.setStyleSheet("background-color: #f44336; color: white; padding: 10px;")
-            QMessageBox.information(self, "成功", f"已启动追踪\n模式ID: {mode_id}")
+            log_manager.info(f"[TRACK] 已启动追踪: mode_id={mode_id}")
+            self.statusBar().showMessage(f"追踪已启动: 模式ID {mode_id}", 3000)
         else:
             QMessageBox.critical(self, "失败", f"启动追踪失败\n{msg}")
             
@@ -2581,7 +2629,8 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.is_tracking = False
             self.track_btn.setText("启动追踪")
             self.track_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px;")
-            QMessageBox.information(self, "成功", "已停止追踪")
+            log_manager.info("[TRACK] 已停止追踪")
+            self.statusBar().showMessage("追踪已停止", 3000)
         else:
             QMessageBox.critical(self, "失败", f"停止追踪失败\n{msg}")
     
@@ -2684,97 +2733,46 @@ class AlgorithmValidationPlatform(QMainWindow):
                 config = json.load(f)
             
             device_ip = config.get('device_ip')
-            rtsp_0 = config.get('rtsp_0')
-            rtsp_1 = config.get('rtsp_1')
-            wifi_ssid = config.get('wifi_ssid', '')
-            wifi_password = config.get('wifi_password', '')
             
             if not device_ip:
                 log_manager.warning("[AUTO] 配置文件中没有设备IP")
                 return
-            
-            log_manager.info(f"[AUTO] 检测到上次配置的设备: {device_ip}，开始智能连接流程...")
-            self.statusBar().showMessage(f"正在检测设备状态...", 5000)
-            
-            # Step 0: 通过ADB检测设备当前实际IP
-            log_manager.info("[AUTO] Step 0: 通过ADB检测设备当前IP...")
-            current_ip = self._get_current_device_ip_via_adb()
-            
-            if current_ip:
-                log_manager.info(f"[AUTO] 检测到设备当前IP: {current_ip}")
-                
-                # 比较当前IP与配置IP是否一致
-                if current_ip != device_ip:
-                    log_manager.warning(f"[AUTO] IP不一致！配置IP: {device_ip}, 当前IP: {current_ip}")
-                    
-                    # IP不一致，需要重新配置WiFi获取正确IP
-                    if wifi_ssid and wifi_password:
-                        log_manager.info(f"[AUTO] 将通过WiFi重连获取正确IP (SSID: {wifi_ssid})")
-                        self.statusBar().showMessage("检测到IP变化，正在重新配置WiFi...", 5000)
-                        
-                        # 在后台线程中执行WiFi重连
-                        self._wifi_reconnect_attempt(device_ip, wifi_ssid, wifi_password, rtsp_0, rtsp_1)
-                        return
-                    else:
-                        log_manager.error("[AUTO] IP不一致但没有WiFi配置信息，无法自动修复")
-                        self._on_auto_connect_failed(device_ip, f"IP地址已变化（{device_ip} → {current_ip}），但缺少WiFi配置信息")
-                        return
-                else:
-                    log_manager.info(f"[AUTO] IP一致 ({current_ip})，可以直接进行SSH连接")
-            else:
-                log_manager.warning("[AUTO] 未能通过ADB获取设备IP，将尝试直接SSH连接")
-            
-            # Step 1: 使用正确的IP进行SSH连接
-            target_ip = current_ip if current_ip else device_ip
-            log_manager.info(f"[AUTO] Step 1: 尝试SSH连接到 {target_ip}...")
-            self.statusBar().showMessage(f"正在连接设备: {target_ip}...", 5000)
-            
-            test_success, test_msg = self.device_manager.connect_ssh(target_ip)
-            
-            if test_success:
-                # SSH直连成功
-                log_manager.info(f"[AUTO] SSH连接成功: {test_msg}")
-                self._on_auto_connect_success(target_ip, rtsp_0, rtsp_1, "SSH连接成功")
+
+            if getattr(self, "auto_connect_thread", None) and self.auto_connect_thread.isRunning():
                 return
-            
-            # SSH连接失败，进入WiFi重连流程
-            log_manager.info(f"[AUTO] SSH连接失败: {test_msg}，尝试WiFi重连...")
-            
-            # Step 2: 检查是否有WiFi信息，尝试ADB+WiFi自动重连
-            if wifi_ssid and wifi_password:
-                log_manager.info("[AUTO] Step 2: 检测到WiFi信息，尝试ADB+WiFi自动重连...")
-                self.statusBar().showMessage("正在通过WiFi重新连接设备...", 5000)
-                
-                # 在后台线程中执行WiFi重连
-                self._wifi_reconnect_attempt(device_ip, wifi_ssid, wifi_password, rtsp_0, rtsp_1)
-                return
-            
-            # Step 3: 没有WiFi信息或WiFi重连失败，提示用户一键配置
-            log_manager.info("[AUTO] Step 3: 无法自动连接，提示用户一键配置")
-            self.statusBar().showMessage("自动连接失败，请使用'一键配置设备'", 3000)
-            
-            # 弹出对话框询问是否清除配置
-            reply = QMessageBox.question(
-                self,
-                "连接失败",
-                f"无法自动连接到上次配置的设备 ({device_ip})\n\n"
-                f"错误信息: {test_msg}\n\n"
-                f"请选择：\n"
-                f"• 是 - 清除旧配置，打开一键配置向导\n"
-                f"• 否 - 保留配置，稍后手动重试",
-                QMessageBox.Yes | QMessageBox.No
+
+            log_manager.info(f"[AUTO] 检测到上次配置的设备: {device_ip}，启动后台连接流程...")
+            self.statusBar().showMessage("正在后台检测设备状态...", 5000)
+
+            self.auto_connect_thread = QThread()
+            self.auto_connect_worker = AutoConnectWorker(self.device_manager, config)
+            self.auto_connect_worker.moveToThread(self.auto_connect_thread)
+            self.auto_connect_thread.started.connect(self.auto_connect_worker.run)
+            self.auto_connect_worker.status.connect(
+                lambda message: self.statusBar().showMessage(message, 5000),
+                Qt.QueuedConnection,
             )
-            
-            if reply == QMessageBox.Yes:
-                if os.path.exists(self.device_config_file):
-                    os.remove(self.device_config_file)
-                    log_manager.info("[AUTO] 已清除无效的设备配置")
-                
-                # 自动打开一键配置对话框
-                QTimer.singleShot(500, self.open_device_setup)
-                
+            self.auto_connect_worker.finished.connect(self._on_auto_connect_worker_finished, Qt.QueuedConnection)
+            self.auto_connect_worker.finished.connect(self.auto_connect_thread.quit)
+            self.auto_connect_worker.finished.connect(self.auto_connect_worker.deleteLater)
+            self.auto_connect_thread.finished.connect(self.auto_connect_thread.deleteLater)
+            self.auto_connect_thread.finished.connect(self._clear_auto_connect_refs)
+            self.auto_connect_thread.start()
+
         except Exception as e:
             log_manager.error(f"[AUTO] 自动连接异常: {str(e)}", exc_info=True)
+
+    def _on_auto_connect_worker_finished(self, success, device_ip, rtsp_0, rtsp_1, message):
+        """启动自动连接后台任务完成。"""
+        if success:
+            self._on_auto_connect_success(device_ip, rtsp_0, rtsp_1, message)
+        else:
+            self._on_auto_connect_failed(device_ip or "未知设备", message)
+
+    def _clear_auto_connect_refs(self):
+        """释放启动自动连接线程引用。"""
+        self.auto_connect_worker = None
+        self.auto_connect_thread = None
     
     def _get_current_device_ip_via_adb(self):
         """通过ADB获取设备当前实际IP地址
@@ -2782,71 +2780,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         Returns:
             str: 设备IP地址，如果获取失败返回None
         """
-        try:
-            log_manager.info("[ADB] 正在检测ADB设备并获取IP...")
-            
-            # 检查ADB设备连接
-            result = subprocess.run(
-                ['adb', 'devices'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            
-            if result.returncode != 0:
-                log_manager.warning(f"[ADB] ADB命令执行失败: {result.stderr.strip()}")
-                return None
-            
-            # 解析设备列表
-            lines = result.stdout.strip().split('\n')
-            devices = []
-            for line in lines[1:]:  # 跳过第一行标题
-                if '\tdevice' in line or '\t\tdevice' in line:
-                    device_id = line.split('\t')[0].strip()
-                    if device_id and device_id != 'List of devices attached':
-                        devices.append(device_id)
-            
-            if not devices:
-                log_manager.info("[ADB] 未检测到ADB设备（可能未连接USB）")
-                return None
-            
-            # 使用第一个设备
-            device_id = devices[0]
-            log_manager.info(f"[ADB] 检测到设备: {device_id}")
-            
-            # 尝试多种方式获取IP
-            ip_commands = [
-                "ip addr show wlan0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1",
-                "ifconfig wlan0 | grep 'inet addr:' | cut -d: -f2 | awk '{print $1}'",
-                "hostname -I | awk '{print $1}'",
-            ]
-            
-            for cmd in ip_commands:
-                log_manager.debug(f"[ADB] 尝试命令: {cmd}")
-                result = subprocess.run(
-                    ['adb', '-s', device_id, 'shell', cmd],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                
-                if result.returncode == 0 and result.stdout.strip():
-                    ip = result.stdout.strip().split('\n')[-1].strip()
-                    # 验证IP格式
-                    import re
-                    if re.match(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', ip):
-                        log_manager.info(f"[ADB] 成功获取设备IP: {ip}")
-                        return ip
-            
-            log_manager.warning("[ADB] 未能获取到有效的IP地址")
-            return None
-            
-        except FileNotFoundError:
-            log_manager.warning("[ADB] ADB未安装或未添加到PATH")
-            return None
-        except Exception as e:
-            log_manager.error(f"[ADB] 获取IP失败: {str(e)}")
-            return None
+        return self.device_manager.get_current_device_ip_via_adb()
     
     def _wifi_reconnect_attempt(self, device_ip, wifi_ssid, wifi_password, rtsp_0, rtsp_1):
         """WiFi自动重连尝试（QThread后台任务）"""
@@ -2923,6 +2857,18 @@ class AlgorithmValidationPlatform(QMainWindow):
         if rtsp_0 and rtsp_1:
             self.rtsp_label_0.setText(f"RTSP 0: {rtsp_0}")
             self.rtsp_label_1.setText(f"RTSP 1: {rtsp_1}")
+
+        try:
+            wifi_ssid = ''
+            wifi_password = ''
+            if os.path.exists(self.device_config_file):
+                with open(self.device_config_file, 'r', encoding='utf-8') as f:
+                    saved_config = json.load(f)
+                wifi_ssid = saved_config.get('wifi_ssid', '')
+                wifi_password = saved_config.get('wifi_password', '')
+            self.save_device_config(device_ip, rtsp_0, rtsp_1, wifi_ssid, wifi_password)
+        except Exception as e:
+            log_manager.warning(f"[AUTO] 自动连接后更新设备配置失败: {e}")
         
         # 更新视频源管理页面的设备IP显示
         self.rtsp_device_ip_label.setText(device_ip)

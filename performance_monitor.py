@@ -5,11 +5,13 @@
 注意：DDR带宽通过实时阻塞命令读取，已移除旧的轮询获取方式
 """
 
-import paramiko
 import threading
 import time
 import os
+import re
 from datetime import datetime
+
+from device_manager import DeviceManager, connect_ssh_with_retry
 
 
 class PerformanceMonitor:
@@ -49,11 +51,20 @@ class PerformanceMonitor:
         self.monitor_thread = None
         self.tool_path = "/userdata/rk-msch-probe-for-user-64bit-1"
         self.local_tool_path = None  # 本地工具文件路径，需要外部设置
+        bundled_tool = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "rk-msch-probe-for-user-64bit-1",
+        )
+        if os.path.exists(bundled_tool):
+            self.local_tool_path = bundled_tool
         
         # DDR监控相关
         self.ddr_process = None  # 阻塞命令的SSH通道
         self.ddr_reader_thread = None  # 读取输出的线程
         self.latest_ddr_data = {}  # 最新解析的DDR数据
+        self.ddr_status = "未启动"
+        self.ddr_last_error = ""
+        self.ddr_output_tail = []
         
         # NPU监控相关
         self.latest_npu_data = {'core0': 0.0, 'core1': 0.0, 'avg': 0.0}
@@ -65,6 +76,28 @@ class PerformanceMonitor:
             return True, f"工具路径已设置: {local_path}"
         else:
             return False, f"工具文件不存在: {local_path}"
+
+    def _get_fallback_tool_path(self):
+        """获取随上位机一起打包的 DDR 工具路径。"""
+        bundled_tool = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "rk-msch-probe-for-user-64bit-1",
+        )
+        if os.path.exists(bundled_tool):
+            return bundled_tool
+        return None
+
+    def _resolve_local_tool_path(self):
+        """解析可用的本地 DDR 工具路径。"""
+        if self.local_tool_path and os.path.exists(self.local_tool_path):
+            return self.local_tool_path
+
+        fallback_tool = self._get_fallback_tool_path()
+        if fallback_tool:
+            self.local_tool_path = fallback_tool
+            return fallback_tool
+
+        return None
         
     def start_monitoring(self, device_ip, ddr_freq=1848, interval=2, progress_callback=None):
         """开始监控
@@ -78,6 +111,10 @@ class PerformanceMonitor:
         self.device_ip = device_ip
         self.ddr_freq = ddr_freq
         self.monitoring = True
+        self.latest_ddr_data = {}
+        self.ddr_status = "初始化中"
+        self.ddr_last_error = ""
+        self.ddr_output_tail = []
         
         # 建立SSH连接
         try:
@@ -85,9 +122,14 @@ class PerformanceMonitor:
                 progress_callback(20, "正在建立SSH连接...")
             print(f"[性能监控] 正在连接设备 {device_ip}...")
             
-            self.ssh_client = paramiko.SSHClient()
-            self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh_client.connect(device_ip, port=22, username='root', password='', timeout=10)
+            self.ssh_client, ssh_success, ssh_msg = connect_ssh_with_retry(device_ip)
+            if not ssh_success:
+                print(f"[性能监控] SSH直连失败，尝试通过ADB启动SSH服务: {ssh_msg}")
+                adb_success, adb_msg = DeviceManager().ensure_ssh_service_via_adb()
+                if adb_success:
+                    self.ssh_client, ssh_success, ssh_msg = connect_ssh_with_retry(device_ip, retries=3)
+                if not ssh_success:
+                    raise Exception(f"{ssh_msg}; ADB启动SSH服务: {adb_msg}")
             
             if progress_callback:
                 progress_callback(40, "SSH连接成功")
@@ -125,30 +167,38 @@ class PerformanceMonitor:
             'ddr_modules': []
         }
         
-        # 检查DDR工具并启动DDR监控（在后台线程中执行，避免阻塞主流程）
+        # 检查DDR工具并启动DDR监控。当前函数运行在后台 worker 中，可以同步等待结果。
         if progress_callback:
             progress_callback(50, "检查DDR测试工具...")
-        
-        def init_ddr_in_thread():
-            # 1. 确保工具可用
-            if self._ensure_tool_available(progress_callback):
-                # 2. 启动DDR监控进程
-                if progress_callback:
-                    progress_callback(85, "启动DDR监控...")
-                self._start_ddr_monitoring()
+
+        def ddr_progress(percent, message):
+            if progress_callback:
+                progress_callback(50 + int(percent * 0.3), message)
+
+        if self._ensure_tool_available(ddr_progress):
+            if progress_callback:
+                progress_callback(85, "启动DDR监控...")
+            if self._start_ddr_monitoring():
+                if self._wait_for_ddr_initial_state(timeout=2.0):
+                    if progress_callback:
+                        progress_callback(90, "DDR监控已启动，等待采样数据...")
+                elif progress_callback:
+                    msg = self.ddr_last_error or self.ddr_status
+                    progress_callback(90, f"DDR监控异常: {msg}")
             else:
-                print("[性能监控] 警告: DDR工具不可用，将跳过DDR监控")
+                msg = self.ddr_last_error or "未知错误"
+                print(f"[性能监控] 警告: DDR监控启动失败: {msg}")
                 if progress_callback:
-                    progress_callback(85, "DDR工具不可用，跳过DDR监控")
-        
-        # 在后台线程中初始化DDR监控
-        ddr_init_thread = threading.Thread(target=init_ddr_in_thread)
-        ddr_init_thread.daemon = True
-        ddr_init_thread.start()
+                    progress_callback(90, f"DDR监控未启动: {msg}")
+        else:
+            self.ddr_status = "工具不可用"
+            print("[性能监控] 警告: DDR工具不可用，将跳过DDR监控")
+            if progress_callback:
+                progress_callback(90, "DDR工具不可用，跳过DDR监控")
         
         # 启动监控线程
         if progress_callback:
-            progress_callback(90, "启动主监控线程...")
+            progress_callback(92, "启动主监控线程...")
         
         self.monitor_thread = threading.Thread(target=self._monitor_loop, args=(interval,))
         self.monitor_thread.daemon = True
@@ -158,6 +208,17 @@ class PerformanceMonitor:
             progress_callback(100, "监控已启动！")
         
         print(f"[性能监控] 监控线程已启动")
+
+    def _wait_for_ddr_initial_state(self, timeout=2.0):
+        """等待DDR工具给出第一批数据或快速失败。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.ddr_status == "运行中":
+                return True
+            if self.ddr_status in ("异常", "已退出"):
+                return False
+            time.sleep(0.1)
+        return True
         
     def stop_monitoring(self):
         """停止监控"""
@@ -171,6 +232,10 @@ class PerformanceMonitor:
             except:
                 pass
             self.ddr_process = None
+
+        if self.ssh_client:
+            self._execute_command("pkill -f '[r]k-msch-probe-for-user-64bit-1' >/dev/null 2>&1 || true")
+        self.ddr_status = "已停止"
         
         # 等待读取线程结束
         if self.ddr_reader_thread:
@@ -186,22 +251,35 @@ class PerformanceMonitor:
             self.ssh_client.close()
             self.ssh_client = None
             
+    def _set_ddr_error(self, message):
+        self.ddr_status = "异常"
+        self.ddr_last_error = message
+
+    def _build_ddr_command(self):
+        tool_dir = os.path.dirname(self.tool_path) or "/userdata"
+        tool_name = os.path.basename(self.tool_path)
+        return f"cd {tool_dir} && ./{tool_name} -c rk3576 -f {self.ddr_freq} -l 2 2>&1"
+
     def _start_ddr_monitoring(self):
         """启动DDR阻塞监控命令"""
         try:
             # 确保工具可用后再启动
             if not self._check_tool_exists():
+                self._set_ddr_error("设备上未找到可执行DDR工具")
                 print("[DDR] 工具不存在，无法启动DDR监控")
-                return
+                return False
 
-            command = f"{self.tool_path} -c rk3576 -f {self.ddr_freq}"
+            self._execute_command("pkill -f '[r]k-msch-probe-for-user-64bit-1' >/dev/null 2>&1 || true")
+            command = self._build_ddr_command()
             print(f"[DDR] 启动阻塞监控命令: {command}")
             
             # 使用exec_command启动阻塞命令
             # 注意：这里直接使用 ssh_client.exec_command 可能会因为缓冲问题导致读取不及时
             # 使用 get_transport().open_session() 更底层一些，便于控制
             self.ddr_process = self.ssh_client.get_transport().open_session()
+            self.ddr_process.get_pty(width=180, height=40)
             self.ddr_process.exec_command(command)
+            self.ddr_status = "已启动，等待数据"
             
             # 启动读取线程
             self.ddr_reader_thread = threading.Thread(target=self._read_ddr_output)
@@ -209,31 +287,71 @@ class PerformanceMonitor:
             self.ddr_reader_thread.start()
             
             print("[DDR] DDR监控进程已启动")
+            return True
             
         except Exception as e:
+            self._set_ddr_error(str(e))
             print(f"[DDR] 启动监控失败: {e}")
+            return False
             
     def _read_ddr_output(self):
         """持续读取DDR监控输出"""
         buffer = ""
+
+        def handle_text(text):
+            nonlocal buffer
+            if not text:
+                return
+            buffer += text
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                if line.strip():
+                    self._record_ddr_line(line.strip())
         
         try:
             while self.monitoring and self.ddr_process:
-                # 读取输出
+                has_data = False
                 if self.ddr_process.recv_ready():
                     data = self.ddr_process.recv(4096).decode('utf-8', errors='ignore')
-                    buffer += data
-                    
-                    # 按行处理
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        if line.strip():
-                            self._parse_ddr_line(line)
-                else:
+                    handle_text(data)
+                    has_data = True
+
+                if self.ddr_process.recv_stderr_ready():
+                    data = self.ddr_process.recv_stderr(4096).decode('utf-8', errors='ignore')
+                    handle_text(data)
+                    has_data = True
+
+                if self.ddr_process.exit_status_ready():
+                    while self.ddr_process.recv_ready():
+                        handle_text(self.ddr_process.recv(4096).decode('utf-8', errors='ignore'))
+                    while self.ddr_process.recv_stderr_ready():
+                        handle_text(self.ddr_process.recv_stderr(4096).decode('utf-8', errors='ignore'))
+                    if buffer.strip():
+                        self._record_ddr_line(buffer.strip())
+                        buffer = ""
+
+                    exit_code = self.ddr_process.recv_exit_status()
+                    tail = "; ".join(self.ddr_output_tail[-5:])
+                    if self.monitoring:
+                        if exit_code == 0:
+                            self.ddr_status = "已退出"
+                        else:
+                            self._set_ddr_error(f"进程退出码 {exit_code}: {tail}")
+                        print(f"[DDR] 监控进程退出: code={exit_code}, tail={tail}")
+                    break
+
+                if not has_data:
                     time.sleep(0.1)  # 短暂休眠避免CPU占用过高
                     
         except Exception as e:
+            self._set_ddr_error(str(e))
             print(f"[DDR读取] 异常: {e}")
+
+    def _record_ddr_line(self, line):
+        self.ddr_output_tail.append(line)
+        self.ddr_output_tail = self.ddr_output_tail[-20:]
+        print(f"[DDR输出] {line}")
+        self._parse_ddr_line(line)
             
     def _parse_ddr_line(self, line):
         """解析DDR输出行"""
@@ -242,18 +360,21 @@ class PerformanceMonitor:
             # 格式: "master bw(MB/s)       158.05    82.30    75.75     0.00  2017.36   447.48 ..."
             if 'master bw(MB/s)' in line:
                 self._parse_ddr_bandwidth_line(line)
+                return
+
+            lower_line = line.lower()
+            if 'ddr load:' in lower_line or ('load:' in lower_line and 'recorded' not in lower_line):
+                self._parse_ddr_total_line(line)
         except Exception as e:
             print(f"[DDR解析] 失败: {e}, 行: {line[:100]}")
             
     def _parse_ddr_bandwidth_line(self, line):
         """解析带宽行，提取各模块数据"""
         try:
-            import re
-            
             # 提取所有数字（带宽值）
             values = re.findall(r'[\d.]+', line)
             
-            if len(values) >= 14:  # 确保有足够的模块数据
+            if values:
                 # 根据表头顺序: cpu, cci_m1, cci_m2, gmac, isp, vicap, npu, crypto, rga, vpss, gpu, hdcp, vop, ufshc, others, total
                 modules = ['cpu', 'cci_m1', 'cci_m2', 'gmac', 'isp', 'vicap', 'npu', 
                           'crypto', 'rga', 'vpss', 'gpu', 'hdcp', 'vop', 'ufshc', 'others', 'total']
@@ -262,15 +383,37 @@ class PerformanceMonitor:
                 for i, module in enumerate(modules):
                     if i < len(values):
                         ddr_data[module] = float(values[i])
+
+                if 'total' not in ddr_data:
+                    ddr_data['total'] = float(values[-1])
                 
                 # 保存最新数据
                 self.latest_ddr_data = ddr_data
+                self.ddr_status = "运行中"
+                self.ddr_last_error = ""
                 
                 print(f"[DDR] 解析成功 - Total: {ddr_data.get('total', 0):.2f} MB/s, "
                       f"NPU: {ddr_data.get('npu', 0):.2f}, ISP: {ddr_data.get('isp', 0):.2f}")
                 
         except Exception as e:
             print(f"[DDR解析] 带宽行解析失败: {e}")
+
+    def _parse_ddr_total_line(self, line):
+        """解析DDR简要输出中的总带宽。"""
+        try:
+            match = re.search(r'(?:ddr\s+load|load):\s*([0-9]+(?:\.[0-9]+)?)\s*MB/s', line, re.IGNORECASE)
+            if not match:
+                return
+
+            total = float(match.group(1))
+            ddr_data = self.latest_ddr_data.copy()
+            ddr_data['total'] = total
+            self.latest_ddr_data = ddr_data
+            self.ddr_status = "运行中"
+            self.ddr_last_error = ""
+            print(f"[DDR] 解析总带宽 - Total: {total:.2f} MB/s")
+        except Exception as e:
+            print(f"[DDR解析] 总带宽行解析失败: {e}")
 
     def _monitor_loop(self, interval):
         """监控循环"""
@@ -338,7 +481,9 @@ class PerformanceMonitor:
                     'memory_total_mb': memory_total_mb,
                     'memory_usage': memory_usage,
                     'ddr_total': ddr_total,
-                    'ddr_modules': ddr_modules
+                    'ddr_modules': ddr_modules,
+                    'ddr_status': self.ddr_status,
+                    'ddr_error': self.ddr_last_error
                 }
                 
             except Exception as e:
@@ -372,7 +517,7 @@ class PerformanceMonitor:
             
     def _check_tool_exists(self):
         """检查设备上是否存在DDR带宽测试工具"""
-        command = f"test -f {self.tool_path} && echo 'exists' || echo 'not_exists'"
+        command = f"test -x {self.tool_path} && echo 'exists' || echo 'not_exists'"
         output = self._execute_command(command)
         return output == 'exists'
         
@@ -382,11 +527,12 @@ class PerformanceMonitor:
         Args:
             progress_callback: 进度回调函数，接收(百分比, 消息)参数
         """
-        if not self.local_tool_path:
-            return False, "未设置本地工具文件路径"
-            
-        if not os.path.exists(self.local_tool_path):
-            return False, f"本地工具文件不存在: {self.local_tool_path}"
+        local_tool_path = self._resolve_local_tool_path()
+        if not local_tool_path:
+            return False, "未找到可用的本地 DDR 工具文件"
+
+        if not os.path.exists(local_tool_path):
+            return False, f"本地工具文件不存在: {local_tool_path}"
         
         try:
             print(f"[DDR工具] 开始推送DDR带宽测试工具到设备...")
@@ -394,18 +540,18 @@ class PerformanceMonitor:
                 progress_callback(10, "正在建立连接...")
             
             # 获取文件大小
-            file_size = os.path.getsize(self.local_tool_path)
+            file_size = os.path.getsize(local_tool_path)
             file_size_mb = file_size / (1024 * 1024)
             print(f"[DDR工具] 文件大小: {file_size_mb:.2f} MB")
             
             if progress_callback:
                 progress_callback(20, f"正在上传工具 ({file_size_mb:.2f} MB)...")
             
-            # 创建SFTP连接
-            transport = paramiko.Transport((self.device_ip, 22))
-            transport.connect(username='root', password='')
-            
-            sftp = paramiko.SFTPClient.from_transport(transport)
+            if not self.ssh_client:
+                return False, "SSH未连接，无法推送DDR工具"
+
+            self._execute_command("mkdir -p /userdata")
+            sftp = self.ssh_client.open_sftp()
             
             # 确保目标目录存在
             if progress_callback:
@@ -415,6 +561,7 @@ class PerformanceMonitor:
                 sftp.stat('/userdata')
             except FileNotFoundError:
                 print("[DDR工具] 错误: /userdata 目录不存在")
+                sftp.close()
                 return False, "/userdata 目录不存在"
             
             # 上传文件（带进度）
@@ -426,7 +573,7 @@ class PerformanceMonitor:
                     msg = f"正在上传... {transferred/(1024*1024):.1f}/{total/(1024*1024):.1f} MB"
                     progress_callback(percent, msg)
             
-            sftp.put(self.local_tool_path, remote_path, callback=upload_progress)
+            sftp.put(local_tool_path, remote_path, callback=upload_progress)
             
             if progress_callback:
                 progress_callback(95, "设置文件权限...")
@@ -435,7 +582,6 @@ class PerformanceMonitor:
             sftp.chmod(remote_path, 0o755)
             
             sftp.close()
-            transport.close()
             
             if progress_callback:
                 progress_callback(100, "验证文件...")
@@ -453,12 +599,19 @@ class PerformanceMonitor:
             
     def _ensure_tool_available(self, progress_callback=None):
         """确保DDR带宽测试工具可用"""
-        if not self._check_tool_exists():
-            print("设备上未找到DDR带宽测试工具，尝试推送...")
-            success, msg = self._push_tool_to_device(progress_callback)
-            if not success:
-                print(f"工具推送失败: {msg}")
-                return False
+        if self._check_tool_exists():
+            return True
+
+        local_tool_path = self._resolve_local_tool_path()
+        if not local_tool_path:
+            print("本地 DDR 工具不存在，无法推送")
+            return False
+
+        print("设备上未找到DDR带宽测试工具，尝试推送...")
+        success, msg = self._push_tool_to_device(progress_callback)
+        if not success:
+            print(f"工具推送失败: {msg}")
+            return False
         return True
             
     def _get_npu_load(self):
