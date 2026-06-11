@@ -41,6 +41,7 @@ Thumbs.db
 *.png
 *.jpg
 *.gif
+outputs/
 
 # Logs directory
 logs/
@@ -48,7 +49,9 @@ logs/
 # Temporary files
 temp_*.json
 temp_*.ini
+_tmp_video_source/
 *.tmp
+device_config.json
 
 # Reports
 report_*.txt

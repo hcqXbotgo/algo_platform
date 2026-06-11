@@ -6,8 +6,12 @@
 """
 
 import os
+import re
+import subprocess
+import sys
 import time
 import traceback
+from datetime import datetime
 
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 
@@ -148,6 +152,275 @@ class VideoUploadWorker(QObject):
                 self.finished.emit(success, msg)
         except Exception as e:
             self.finished.emit(False, f"上传异常: {str(e)}")
+
+
+class VideoSourceApplyWorker(QObject):
+    """应用视频源配置并重启 multi_media 的后台任务。"""
+
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, device_manager, device_ip, source_type, remote_video_path=None):
+        super().__init__()
+        self.device_manager = device_manager
+        self.device_ip = device_ip
+        self.source_type = source_type
+        self.remote_video_path = remote_video_path
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            self.progress.emit(10, "正在更新 model_config.json...")
+            success, msg = self.device_manager.apply_video_source_config(
+                self.device_ip,
+                self.source_type,
+                self.remote_video_path,
+            )
+            self.progress.emit(100, "完成" if success else "失败")
+            self.finished.emit(success, msg)
+        except Exception as e:
+            log_manager.error(f"[VIDEO] 应用视频源异常: {str(e)}", exc_info=True)
+            self.finished.emit(False, str(e))
+
+
+class DeviceVideoListWorker(QObject):
+    """后台读取设备 /userdata 视频文件，避免 SSH 列表卡住界面。"""
+
+    finished = pyqtSignal(bool, str, list)
+
+    def __init__(self, device_manager, device_ip):
+        super().__init__()
+        self.device_manager = device_manager
+        self.device_ip = device_ip
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            success, msg, videos = self.device_manager.list_device_videos(self.device_ip)
+            self.finished.emit(success, msg, videos)
+        except Exception as e:
+            log_manager.error(f"[VIDEO] 刷新设备视频列表失败: {str(e)}", exc_info=True)
+            self.finished.emit(False, str(e), [])
+
+
+class DetectionMergeWorker(QObject):
+    """拉取追踪结果并调用 merge_detections.py 合成带框视频。"""
+
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(bool, str, str)
+
+    def __init__(self, device_manager, device_ip, remote_video_path, workspace_dir, local_video_path=None):
+        super().__init__()
+        self.device_manager = device_manager
+        self.device_ip = device_ip
+        self.remote_video_path = remote_video_path
+        self.workspace_dir = workspace_dir
+        self.local_video_path = local_video_path
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def _safe_name(self, name):
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+
+    def _remote_detection_path(self):
+        base, _ = os.path.splitext(self.remote_video_path)
+        return f"{base}_detections.json"
+
+    def _find_existing_video(self, video_name):
+        candidates = []
+        if self.local_video_path:
+            candidates.append(self.local_video_path)
+
+        for root, dirs, files in os.walk(self.workspace_dir):
+            dirs[:] = [
+                d for d in dirs
+                if d not in {".git", "__pycache__", "_tmp_video_source", "logs"}
+            ]
+            for name in files:
+                if name.lower() == video_name.lower():
+                    candidates.append(os.path.join(root, name))
+
+        for path in candidates:
+            if path and os.path.isfile(path) and os.path.basename(path).lower() == video_name.lower():
+                return os.path.abspath(path)
+        return None
+
+    def _download(self, remote_path, local_path, start, end):
+        def progress_callback(transferred, total):
+            if total <= 0:
+                return
+            percent = start + int((transferred / total) * (end - start))
+            self.progress.emit(min(percent, end), f"正在下载 {os.path.basename(remote_path)}")
+
+        return self.device_manager.download_remote_file(
+            self.device_ip,
+            remote_path,
+            local_path,
+            progress_callback=progress_callback,
+        )
+
+    def _probe_total_frames(self, video_path):
+        try:
+            cmd = [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-count_frames",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "csv=p=0",
+                video_path,
+            ]
+            output = subprocess.check_output(cmd, timeout=15).decode(errors="ignore").strip()
+            if output and output != "N/A":
+                return int(output)
+        except Exception:
+            pass
+        try:
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            if cap.isOpened():
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                cap.release()
+                if total > 0:
+                    return total
+            cap.release()
+        except Exception:
+            pass
+        return None
+
+    def _build_merge_command(self, json_path, video_path, output_path):
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "merge_detections.py")
+        if not os.path.exists(script_path):
+            return None, None, None, "未找到 merge_detections.py"
+
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_config.json")
+        base_args = [
+            json_path,
+            video_path,
+            output_path,
+            "--config",
+            config_path,
+            "--hwa",
+            "--draw-backend",
+            "opencv",
+            "--hwdecode",
+            "auto",
+        ]
+
+        env = os.environ.copy()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        cmd = [sys.executable, script_path] + base_args
+        cmd_text = subprocess.list2cmdline(cmd)
+        return cmd, env, cmd_text, None
+
+    def _run_merge(self, json_path, video_path, output_path, total_frames):
+        cmd, env, cmd_text, error = self._build_merge_command(json_path, video_path, output_path)
+        if error:
+            return False, error
+
+        self.progress.emit(55, "正在合成带框视频...")
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+        except Exception as e:
+            return False, f"启动合成脚本失败: {str(e)}"
+
+        buffer = ""
+        recent_lines = []
+
+        def remember(line):
+            if not line:
+                return
+            recent_lines.append(line)
+            del recent_lines[:-30]
+
+        while True:
+            chunk = process.stdout.read(1) if process.stdout else ""
+            if not chunk and process.poll() is not None:
+                break
+            if not chunk:
+                time.sleep(0.05)
+                continue
+
+            buffer += chunk
+            if chunk in ("\n", "\r"):
+                line = buffer.strip()
+                buffer = ""
+                remember(line)
+                match = re.search(r"(\d+)\s+frames", line)
+                if match and total_frames:
+                    done = int(match.group(1))
+                    percent = 55 + int(min(done / total_frames, 1.0) * 43)
+                    self.progress.emit(percent, f"正在合成带框视频: {done}/{total_frames} 帧")
+                elif line:
+                    self.progress.emit(55, line[-120:])
+
+        rc = process.wait()
+        if rc != 0:
+            remember(buffer.strip())
+            detail = "\n".join(recent_lines[-20:]) or "脚本没有输出更多错误信息"
+            return False, f"合成脚本退出码 {rc}\n命令: {cmd_text}\n脚本输出:\n{detail}"
+        return True, output_path
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            if not self.remote_video_path:
+                self.finished.emit(False, "请选择设备视频", "")
+                return
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            video_name = os.path.basename(self.remote_video_path)
+            stem = os.path.splitext(video_name)[0]
+            local_dir = os.path.join(self.workspace_dir, "outputs", "merged_videos", f"{timestamp}_{self._safe_name(stem)}")
+            os.makedirs(local_dir, exist_ok=True)
+
+            local_video = self._find_existing_video(video_name)
+            remote_json = self._remote_detection_path()
+            local_json = os.path.join(local_dir, os.path.basename(remote_json))
+            output_video = os.path.join(local_dir, f"{stem}_overlay.mp4")
+
+            if local_video:
+                self.progress.emit(35, f"复用本机视频: {local_video}")
+            else:
+                local_video = os.path.join(local_dir, video_name)
+                self.progress.emit(5, "正在拉取源视频...")
+                success, msg = self._download(self.remote_video_path, local_video, 5, 35)
+                if not success:
+                    self.finished.emit(False, msg, "")
+                    return
+
+            self.progress.emit(36, "正在拉取追踪JSON...")
+            success, msg = self._download(remote_json, local_json, 36, 50)
+            if not success:
+                self.finished.emit(False, f"追踪JSON下载失败: {remote_json}\n{msg}", "")
+                return
+
+            total_frames = self._probe_total_frames(local_video)
+            success, msg = self._run_merge(local_json, local_video, output_video, total_frames)
+            if not success:
+                self.finished.emit(False, msg, "")
+                return
+
+            self.progress.emit(100, "合成完成")
+            self.finished.emit(True, "合成完成", output_video)
+        except Exception as e:
+            log_manager.error(f"[VIDEO] 合成带框视频失败: {str(e)}", exc_info=True)
+            self.finished.emit(False, str(e), "")
 
 
 class LogDownloadWorker(QObject):

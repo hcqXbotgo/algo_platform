@@ -9,6 +9,8 @@ import subprocess
 import os
 import time
 import re
+import json
+import shlex
 from datetime import datetime
 from log_manager import log_manager
 
@@ -490,8 +492,15 @@ class DeviceManager:
         try:
             remote_path = "/userdata/"
             remote_full_path = os.path.join(remote_path, os.path.basename(video_file))
+            file_size = os.path.getsize(video_file)
             
             log_manager.info(f"[VIDEO] 开始上传视频: {os.path.basename(video_file)}")
+            log_manager.info(f"[VIDEO] 文件大小: {file_size / 1024 / 1024:.2f} MB")
+
+            adb_success, adb_msg = self._push_video_via_adb(video_file, remote_full_path, file_size, progress_callback)
+            if adb_success:
+                return True, adb_msg
+            log_manager.warning(f"[VIDEO] ADB上传不可用，回退SSH: {adb_msg}")
             
             # 创建SSH客户端并设置超时
             ssh_client = paramiko.SSHClient()
@@ -499,10 +508,6 @@ class DeviceManager:
             ssh_client.connect(device_ip, port=22, username='root', password='', timeout=15)
             
             sftp = ssh_client.open_sftp()
-            
-            # 获取文件大小
-            file_size = os.path.getsize(video_file)
-            log_manager.info(f"[VIDEO] 文件大小: {file_size / 1024 / 1024:.2f} MB")
             
             # 定义进度回调
             def _progress_callback(transferred, total):
@@ -539,6 +544,176 @@ class DeviceManager:
         except Exception as e:
             log_manager.error(f"[VIDEO] 视频上传异常: {str(e)}", exc_info=True)
             return False, f"视频上传失败: {str(e)}"
+
+    def _push_video_via_adb(self, video_file, remote_full_path, file_size, progress_callback=None):
+        """优先通过USB ADB推送视频；失败时由调用方回退SSH。"""
+        device_id, msg = self.get_adb_device_id()
+        if not device_id:
+            return False, msg
+
+        try:
+            if progress_callback:
+                progress_callback(0, file_size)
+
+            result = subprocess.run(
+                ["adb", "-s", device_id, "push", video_file, remote_full_path],
+                capture_output=True,
+                text=True,
+            )
+            output = (result.stdout or "").strip()
+            error = (result.stderr or "").strip()
+            if result.returncode != 0:
+                return False, error or output or f"adb push返回码: {result.returncode}"
+
+            stat_success, stat_output = self.run_adb_shell_command(
+                f"stat -c %s {shlex.quote(remote_full_path)}",
+                device_id=device_id,
+                timeout=10,
+            )
+            if stat_success:
+                try:
+                    uploaded_size = int(str(stat_output).strip().splitlines()[-1])
+                    if uploaded_size != file_size:
+                        return False, f"ADB上传验证失败: 本地={file_size}, 远程={uploaded_size}"
+                except (ValueError, IndexError):
+                    log_manager.warning(f"[VIDEO] ADB文件大小解析失败: {stat_output}")
+
+            if progress_callback:
+                progress_callback(file_size, file_size)
+            log_manager.info(f"[VIDEO] ADB上传成功: {remote_full_path}")
+            return True, f"视频已通过ADB上传到 {remote_full_path} ({file_size / 1024 / 1024:.2f} MB)"
+        except Exception as e:
+            return False, f"ADB上传失败: {str(e)}"
+
+    def list_device_videos(self, device_ip):
+        """列出设备 /userdata 目录下的视频文件。"""
+        try:
+            if not self.ssh_client:
+                self.connect_ssh(device_ip)
+
+            command = (
+                "find /userdata -maxdepth 1 -type f 2>/dev/null | "
+                "grep -Ei '\\.(h264|264|h265|265|hevc|mp4|ts|mkv|avi|mov)$' | "
+                "while read f; do ls -lh \"$f\"; done"
+            )
+            success, output = self.execute_ssh_command(command)
+            if not success:
+                return False, f"获取视频列表失败: {output}", []
+
+            videos = []
+            for line in output.strip().splitlines():
+                parts = line.split()
+                if len(parts) < 9:
+                    continue
+                remote_path = parts[-1]
+                videos.append(
+                    {
+                        "name": os.path.basename(remote_path),
+                        "path": remote_path,
+                        "size": parts[4],
+                        "mtime": " ".join(parts[5:8]),
+                        "raw": line,
+                    }
+                )
+            return True, f"找到 {len(videos)} 个视频文件", videos
+        except Exception as e:
+            log_manager.error(f"[VIDEO] 获取设备视频列表失败: {str(e)}", exc_info=True)
+            return False, f"获取设备视频列表失败: {str(e)}", []
+
+    def download_remote_file(self, device_ip, remote_path, local_path, progress_callback=None):
+        """通过 SFTP 下载设备文件。"""
+        ssh_client = None
+        sftp = None
+        try:
+            ssh_client = paramiko.SSHClient()
+            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh_client.connect(device_ip, port=22, username='root', password='', timeout=15)
+            sftp = ssh_client.open_sftp()
+            total = sftp.stat(remote_path).st_size
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+            def _progress(transferred, total_size):
+                if progress_callback:
+                    progress_callback(transferred, total_size or total)
+
+            sftp.get(remote_path, local_path, callback=_progress)
+            return True, local_path
+        except Exception as e:
+            return False, f"下载失败: {str(e)}"
+        finally:
+            try:
+                if sftp:
+                    sftp.close()
+                if ssh_client:
+                    ssh_client.close()
+            except Exception:
+                pass
+
+    def _update_config_video_source(self, config, video_src_type):
+        changed = 0
+        for mode in config.get("modes", []) or []:
+            for model in mode.get("models", []) or []:
+                if isinstance(model, dict):
+                    model["videoSrcType"] = video_src_type
+                    changed += 1
+        return changed
+
+    def apply_video_source_config(self, device_ip, source_type, remote_video_path=None):
+        """修改 model_config.json 中的 videoSrcType 并重启 multi_media。"""
+        config_filename = "model_config.json"
+        temp_dir = "_tmp_video_source"
+        temp_file = os.path.join(temp_dir, config_filename)
+        try:
+            if source_type not in ("camera", "file"):
+                return False, f"未知视频源类型: {source_type}"
+            if source_type == "file" and not remote_video_path:
+                return False, "请选择设备 /userdata 下的视频文件"
+
+            os.makedirs(temp_dir, exist_ok=True)
+            success, result = self.pull_config(config_filename, device_ip, temp_file)
+            if not success:
+                return False, result
+
+            with open(temp_file, "r", encoding="utf-8") as f:
+                config = json.load(f)
+
+            video_src_type = "FILE_H264" if source_type == "file" else "ANA_CAMERA"
+            changed = self._update_config_video_source(config, video_src_type)
+            if changed == 0:
+                return False, "model_config.json 中未找到可修改的 models/videoSrcType"
+
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+
+            success, msg = self.push_config(temp_file, device_ip)
+            if not success:
+                return False, msg
+
+            extra_env = None
+            if source_type == "file":
+                extra_env = {
+                    "DECODE_MODE": "MPP",
+                    "H264_VIDEO_PATH": remote_video_path,
+                }
+
+            restart_success, restart_msg = self.restart_media_process(device_ip, extra_env=extra_env)
+            if not restart_success:
+                return False, f"配置已更新，但 multi_media 重启失败: {restart_msg}"
+
+            if source_type == "file":
+                return True, f"已切换到本地视频: {remote_video_path}，并使用 MPP 硬解启动"
+            return True, "已切换到摄像头并重启 multi_media"
+        except Exception as e:
+            log_manager.error(f"[VIDEO] 应用视频源配置失败: {str(e)}", exc_info=True)
+            return False, f"应用视频源配置失败: {str(e)}"
+        finally:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                if os.path.isdir(temp_dir):
+                    os.rmdir(temp_dir)
+            except OSError:
+                pass
             
     def list_models(self, device_ip, connection_type='SSH'):
         """列出设备上的模型文件"""
@@ -722,54 +897,7 @@ class DeviceManager:
             log_manager.error(f"[DISK] 获取模型大小失败: {str(e)}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
-    def update_video_source(self, device_ip, ini_path, video_src):
-        """更新视频源配置"""
-        try:
-            if not self.ssh_client:
-                self.connect_ssh(device_ip)
-                
-            # 读取当前配置
-            command = f"cat {ini_path}"
-            success, content = self.execute_ssh_command(command)
-            
-            if not success:
-                return False, f"读取配置失败: {content}"
-                
-            # 修改配置
-            lines = content.split('\n')
-            new_lines = []
-            in_video_section = False
-            
-            for line in lines:
-                if line.strip() == '[video_src]':
-                    in_video_section = True
-                    new_lines.append(line)
-                elif in_video_section and line.startswith('source'):
-                    new_lines.append(f"source = {video_src}")
-                    in_video_section = False
-                else:
-                    new_lines.append(line)
-                    
-            # 如果没有找到video_src部分，添加它
-            if not any('[video_src]' in line for line in lines):
-                new_lines.append('\n[video_src]')
-                new_lines.append(f'source = {video_src}')
-                
-            new_content = '\n'.join(new_lines)
-            
-            # 写回文件
-            command = f"echo '{new_content}' > {ini_path}"
-            success, msg = self.execute_ssh_command(command)
-            
-            if success:
-                return True, "视频源配置已更新"
-            else:
-                return False, f"写入配置失败: {msg}"
-                
-        except Exception as e:
-            return False, f"更新配置失败: {str(e)}"
-            
-    def restart_media_process(self, device_ip):
+    def restart_media_process(self, device_ip, extra_env=None):
         """重启multi_media进程"""
         try:
             if not self.ssh_client:
@@ -802,8 +930,12 @@ class DeviceManager:
             # 确保日志目录存在
             self.execute_ssh_command(f"mkdir -p {log_dir}")
             
+            env_parts = ["export LD_LIBRARY_PATH=/oem/usr/lib:/lib"]
+            for key, value in (extra_env or {}).items():
+                env_parts.append(f"export {key}={shlex.quote(str(value))}")
+
             start_command = (
-                "export LD_LIBRARY_PATH=/oem/usr/lib:/lib && "
+                " && ".join(env_parts) + " && "
                 f"exec setsid /oem/usr/bin/multi_media "
                 f"> {log_file} 2>&1 < /dev/null &"
             )

@@ -6,18 +6,20 @@
 
 import sys
 import os
+import time
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QMessageBox, QGroupBox, QFormLayout,
     QLineEdit, QComboBox, QTextEdit, QProgressBar, QSplitter, QTableWidget,
     QTableWidgetItem, QHeaderView, QCheckBox, QSpinBox, QDoubleSpinBox,
     QRadioButton, QButtonGroup, QDialog, QDialogButtonBox, QStatusBar,
-    QMenuBar, QAction, QToolBar, QInputDialog, QFrame, QAbstractItemView
+    QMenuBar, QAction, QToolBar, QInputDialog, QFrame, QAbstractItemView,
+    QListWidgetItem, QSlider
 )
 
 from PyQt5.QtCore import Qt, QTimer, QThread
 
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QImage, QPixmap
 import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.figure import Figure
@@ -51,9 +53,12 @@ from ui_components import (
 )
 from workers import (
     AutoConnectWorker,
+    DetectionMergeWorker,
+    DeviceVideoListWorker,
     FileTransferWorker,
     LogDownloadWorker,
     PerformanceStartWorker,
+    VideoSourceApplyWorker,
     VideoUploadWorker,
     WiFiPerfTestWorker,
     WiFiReconnectWorker,
@@ -92,6 +97,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.ssh_available = False
         self.adb_available = False
         self.current_device_ip = None
+        self.local_video_cache = {}
         
         # 创建工具栏
         self.create_toolbar()
@@ -108,6 +114,17 @@ class AlgorithmValidationPlatform(QMainWindow):
             os.path.dirname(os.path.abspath(__file__)), 
             'device_config.json'
         )
+        self.workspace_dir = os.path.dirname(os.path.abspath(__file__))
+        self.outputs_dir = os.path.join(self.workspace_dir, "outputs")
+        self.log_analysis_output_dir = os.path.join(self.outputs_dir, "log_analysis")
+        self.performance_output_dir = os.path.join(self.outputs_dir, "performance")
+        self.reports_output_dir = os.path.join(self.outputs_dir, "reports")
+        for output_dir in (
+            self.log_analysis_output_dir,
+            self.performance_output_dir,
+            self.reports_output_dir,
+        ):
+            os.makedirs(output_dir, exist_ok=True)
         
         # 启动时自动连接设备（延迟500ms）
         QTimer.singleShot(500, self.auto_connect_device)
@@ -119,7 +136,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         # 一键配置按钮（主要入口）
         setup_action = QAction("🚀 一键配置设备", self)
-        setup_action.setToolTip("自动完成：USB连接 → WiFi配置 → SSH设置 → RTSP生成")
+        setup_action.setToolTip("自动完成：USB连接 → WiFi配置 → SSH设置")
         setup_action.triggered.connect(self.open_device_setup)
         toolbar.addAction(setup_action)
         
@@ -132,13 +149,9 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         toolbar.addSeparator()
         
-        # RTSP地址显示
-        self.rtsp_label_0 = QLabel("RTSP 0: N/A")
-        self.rtsp_label_1 = QLabel("RTSP 1: N/A")
-        self.rtsp_label_0.setStyleSheet("color: blue; padding: 5px;")
-        self.rtsp_label_1.setStyleSheet("color: blue; padding: 5px;")
-        toolbar.addWidget(self.rtsp_label_0)
-        toolbar.addWidget(self.rtsp_label_1)
+        # 兼容旧配置字段，不再在工具栏显示RTSP信息
+        self.rtsp_label_0 = QLabel("")
+        self.rtsp_label_1 = QLabel("")
         
         # 保存引用以便后续更新
         self.toolbar = toolbar
@@ -165,14 +178,10 @@ class AlgorithmValidationPlatform(QMainWindow):
                 self.status_label.setText(f"✅ {device_ip}")
                 self.status_label.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
                 
-                # 更新RTSP显示
-                if rtsp_0 and rtsp_1:
-                    self.rtsp_label_0.setText(f"RTSP 0: {rtsp_0}")
-                    self.rtsp_label_1.setText(f"RTSP 1: {rtsp_1}")
-                
                 # 更新视频源管理页面的设备IP显示
                 self.rtsp_device_ip_label.setText(device_ip)
                 self.rtsp_device_ip_label.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
+                self.refresh_device_videos()
                 
                 # 保存设备配置（包括WiFi信息）
                 self.save_device_config(device_ip, rtsp_0, rtsp_1, wifi_ssid, wifi_password)
@@ -191,8 +200,6 @@ class AlgorithmValidationPlatform(QMainWindow):
                     "配置成功", 
                     f"设备配置已完成！\n\n"
                     f"设备IP: {device_ip}\n"
-                    f"RTSP 0: {rtsp_0}\n"
-                    f"RTSP 1: {rtsp_1}\n"
                     f"MQTT: 已自动连接到 {device_ip}:1883\n\n"
                     f"✅ 配置已保存，下次启动时将自动连接\n\n"
                     f"现在可以使用所有功能了。"
@@ -1105,8 +1112,10 @@ class AlgorithmValidationPlatform(QMainWindow):
             progress_dialog.accept()
 
             if success:
+                self.local_video_cache[os.path.basename(video_file)] = video_file
                 QMessageBox.information(self, "成功", f"视频上传成功！\n{msg}")
                 log_manager.info(f"[VIDEO] 上传完成: {msg}")
+                self.refresh_device_videos()
             elif msg == "上传已取消":
                 QMessageBox.information(self, "提示", msg)
                 log_manager.info("[VIDEO] 用户取消了上传")
@@ -1137,6 +1146,81 @@ class AlgorithmValidationPlatform(QMainWindow):
         """释放视频上传线程引用。"""
         self.video_upload_worker = None
         self.video_upload_thread = None
+
+    def refresh_device_videos(self):
+        """刷新设备 /userdata 下的视频列表。"""
+        if not hasattr(self, "device_video_list"):
+            return
+        self.device_video_list.clear()
+        self.selected_device_video_label.setText("未选择视频")
+
+        if not self.current_device_ip:
+            self.device_video_list.addItem("请先连接设备")
+            return
+
+        if getattr(self, "device_video_thread", None) and self.device_video_thread.isRunning():
+            self.device_video_list.addItem("正在刷新设备视频列表...")
+            return
+
+        self.device_video_list.addItem("正在刷新设备视频列表...")
+        self.statusBar().showMessage("正在刷新设备视频列表...", 3000)
+
+        self.device_video_thread = QThread()
+        self.device_video_worker = DeviceVideoListWorker(
+            self.device_manager,
+            self.current_device_ip,
+        )
+        self.device_video_worker.moveToThread(self.device_video_thread)
+
+        def finished(success, msg, videos):
+            self.device_video_list.clear()
+            self.selected_device_video_label.setText("未选择视频")
+
+            if not success:
+                self.device_video_list.addItem(msg)
+                self.statusBar().showMessage(msg, 5000)
+                return
+
+            if not videos:
+                self.device_video_list.addItem("设备 /userdata 下暂无视频文件")
+                self.statusBar().showMessage("设备 /userdata 下暂无视频文件", 3000)
+                return
+
+            for video in videos:
+                item = QListWidgetItem(f"{video['name']}    {video.get('size', '')}    {video.get('mtime', '')}")
+                item.setData(Qt.UserRole, video)
+                self.device_video_list.addItem(item)
+            self.statusBar().showMessage(msg, 3000)
+
+        self.device_video_thread.started.connect(self.device_video_worker.run)
+        self.device_video_worker.finished.connect(finished, Qt.QueuedConnection)
+        self.device_video_worker.finished.connect(self.device_video_thread.quit)
+        self.device_video_worker.finished.connect(self.device_video_worker.deleteLater)
+        self.device_video_thread.finished.connect(self.device_video_thread.deleteLater)
+        self.device_video_thread.finished.connect(self._clear_device_video_refs)
+        self.device_video_thread.start()
+
+    def _clear_device_video_refs(self):
+        self.device_video_worker = None
+        self.device_video_thread = None
+
+    def on_device_video_selected(self):
+        """更新已选择的视频显示。"""
+        video = self._get_selected_device_video()
+        if video:
+            self.file_source_radio.setChecked(True)
+            self.selected_device_video_label.setText(f"已选择: {video['path']}")
+        else:
+            self.selected_device_video_label.setText("未选择视频")
+
+    def _get_selected_device_video(self):
+        if not hasattr(self, "device_video_list"):
+            return None
+        items = self.device_video_list.selectedItems()
+        if not items:
+            return None
+        data = items[0].data(Qt.UserRole)
+        return data if isinstance(data, dict) else None
 
 
     def silent_check_disk_and_models(self):
@@ -2075,10 +2159,14 @@ class AlgorithmValidationPlatform(QMainWindow):
             return
         
         # 选择保存路径
+        default_path = os.path.join(
+            getattr(self, "performance_output_dir", os.getcwd()),
+            f"performance_trend_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+        )
         file_path, _ = QFileDialog.getSaveFileName(
-            self, 
-            "导出性能趋势图", 
-            "performance_trend.png", 
+            self,
+            "导出性能趋势图",
+            default_path,
             "PNG图片 (*.png);;所有文件 (*)"
         )
         
@@ -2236,7 +2324,10 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.plot_log_results(log_file)
             
             # 保存CSV
-            self.log_analyzer.save_csv("frame_data.csv", "summary.csv")
+            os.makedirs(self.log_analysis_output_dir, exist_ok=True)
+            frame_csv = os.path.join(self.log_analysis_output_dir, "frame_data.csv")
+            summary_csv = os.path.join(self.log_analysis_output_dir, "summary.csv")
+            self.log_analyzer.save_csv(frame_csv, summary_csv)
             
             total_frames = sum(stats['frame_count'] for stats in results.values())
             QMessageBox.information(
@@ -2244,7 +2335,7 @@ class AlgorithmValidationPlatform(QMainWindow):
                 "成功", 
                 f"✅ 日志分析完成！\n\n"
                 f" 共分析了 {len(results)} 个模型，总计 {total_frames} 帧\n"
-                f" 已生成 frame_data.csv 和 summary.csv"
+                f" 已生成 {frame_csv} 和 {summary_csv}"
             )
             self.statusBar().showMessage(f"日志分析完成，共 {len(results)} 个模型，{total_frames} 帧", 3000)
             
@@ -2377,8 +2468,11 @@ class AlgorithmValidationPlatform(QMainWindow):
     def export_csv(self):
         """导出CSV文件"""
         if hasattr(self.log_analyzer, 'data') and self.log_analyzer.data:
-            self.log_analyzer.save_csv("frame_data.csv", "summary.csv")
-            QMessageBox.information(self, "成功", "CSV文件已导出到当前目录")
+            os.makedirs(self.log_analysis_output_dir, exist_ok=True)
+            frame_csv = os.path.join(self.log_analysis_output_dir, "frame_data.csv")
+            summary_csv = os.path.join(self.log_analysis_output_dir, "summary.csv")
+            self.log_analyzer.save_csv(frame_csv, summary_csv)
+            QMessageBox.information(self, "成功", f"CSV文件已导出到:\n{self.log_analysis_output_dir}")
         else:
             QMessageBox.warning(self, "警告", "请先分析日志文件")
             
@@ -2389,9 +2483,12 @@ class AlgorithmValidationPlatform(QMainWindow):
             return
         
         # 选择保存目录
+        default_plot_dir = os.path.join(self.log_analysis_output_dir, "plots")
+        os.makedirs(default_plot_dir, exist_ok=True)
         save_dir = QFileDialog.getExistingDirectory(
             self, 
-            "选择保存图片的目录"
+            "选择保存图片的目录",
+            default_plot_dir,
         )
         
         if not save_dir:
@@ -2459,54 +2556,341 @@ class AlgorithmValidationPlatform(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出失败：\n{str(e)}")
             
-    def connect_rtsp(self):
-        """连接RTSP流"""
-        if not self.current_device_ip:
-            QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
-            return
-        
-        ip = self.current_device_ip
-        
-        streams = []
-        if self.rtsp_channel1.isChecked():
-            streams.append(f"rtsp://{ip}/live/0")
-        if self.rtsp_channel2.isChecked():
-            streams.append(f"rtsp://{ip}/live/1")
-            
-        if not streams:
-            QMessageBox.warning(self, "警告", "请至少选择一个RTSP通道")
-            return
-            
-        self.video_manager.connect_rtsp(streams)
-        QMessageBox.information(self, "成功", f"已连接RTSP流:\n" + "\n".join(streams))
-        
     def browse_video_file(self):
         """浏览选择视频文件"""
         file_name, _ = QFileDialog.getOpenFileName(self, "选择视频文件", "", "Video Files (*.mp4 *.avi *.mov *.h264 *.h265)")
         if file_name:
             self.video_file_edit.setText(file_name)
+            self.local_video_cache[os.path.basename(file_name)] = file_name
             
     def apply_video_source(self):
         """应用视频源设置"""
         if not self.current_device_ip:
             QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
             return
-        
-        source = self.video_source_combo.currentText()
-        ip = self.current_device_ip
-        
-        # 修改xbotgo_media.ini
-        ini_path = "/oem/usr/conf/xbot_media.ini"
-        if source == "本地视频(/userdata)":
-            video_src = "local"
-        else:
-            video_src = "rtsp"
-            
-        success, msg = self.device_manager.update_video_source(ip, ini_path, video_src)
-        if success:
-            QMessageBox.information(self, "成功", f"视频源已设置为: {source}\n{msg}")
-        else:
-            QMessageBox.critical(self, "失败", f"设置失败：\n{msg}")
+
+        if getattr(self, "video_source_thread", None) and self.video_source_thread.isRunning():
+            QMessageBox.information(self, "提示", "视频源设置正在应用中")
+            return
+
+        source_type = "camera" if self.camera_source_radio.isChecked() else "file"
+        selected_video = self._get_selected_device_video()
+        remote_video_path = selected_video["path"] if selected_video else None
+        if source_type == "file" and not remote_video_path:
+            QMessageBox.warning(self, "错误", "请选择设备 /userdata 下的具体视频文件")
+            return
+
+        progress_dialog = QDialog(self)
+        progress_dialog.setWindowTitle("应用视频源设置")
+        progress_dialog.setModal(True)
+        progress_dialog.setFixedSize(420, 150)
+        layout = QVBoxLayout(progress_dialog)
+        status_label = QLabel("正在应用视频源设置...")
+        status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(status_label)
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 100)
+        layout.addWidget(progress_bar)
+
+        self.video_source_thread = QThread()
+        self.video_source_worker = VideoSourceApplyWorker(
+            self.device_manager,
+            self.current_device_ip,
+            source_type,
+            remote_video_path,
+        )
+        self.video_source_worker.moveToThread(self.video_source_thread)
+
+        def update_progress(percent, message):
+            progress_bar.setValue(percent)
+            status_label.setText(message)
+
+        def finished(success, msg):
+            progress_dialog.accept()
+            if success:
+                QMessageBox.information(self, "成功", msg)
+                self.statusBar().showMessage(msg, 5000)
+            else:
+                QMessageBox.critical(self, "失败", msg)
+                self.statusBar().showMessage("视频源设置失败", 5000)
+
+        self.video_source_thread.started.connect(self.video_source_worker.run)
+        self.video_source_worker.progress.connect(update_progress, Qt.QueuedConnection)
+        self.video_source_worker.finished.connect(finished, Qt.QueuedConnection)
+        self.video_source_worker.finished.connect(self.video_source_thread.quit)
+        self.video_source_worker.finished.connect(self.video_source_worker.deleteLater)
+        self.video_source_thread.finished.connect(self.video_source_thread.deleteLater)
+        self.video_source_thread.finished.connect(self._clear_video_source_refs)
+        progress_dialog.show()
+        self.video_source_thread.start()
+
+    def _clear_video_source_refs(self):
+        self.video_source_worker = None
+        self.video_source_thread = None
+
+    def merge_tracking_video(self):
+        """拉取追踪 JSON 并合成带框视频。"""
+        if not self.current_device_ip:
+            QMessageBox.warning(self, "错误", "请先连接设备")
+            return
+        selected_video = self._get_selected_device_video()
+        if not selected_video:
+            QMessageBox.warning(self, "错误", "请选择设备 /userdata 下的视频文件")
+            return
+        if getattr(self, "merge_thread", None) and self.merge_thread.isRunning():
+            QMessageBox.information(self, "提示", "视频合成正在进行中")
+            return
+
+        self.merge_progress_bar.setValue(0)
+        self.merge_status_label.setText("准备合成...")
+        self.open_merged_video_btn.setEnabled(False)
+        self.fullscreen_merged_video_btn.setEnabled(False)
+        video_name = os.path.basename(selected_video["path"])
+        local_video_path = self.local_video_cache.get(video_name)
+        current_local_video = self.video_file_edit.text() if hasattr(self, "video_file_edit") else ""
+        if (
+            not local_video_path
+            and current_local_video
+            and os.path.isfile(current_local_video)
+            and os.path.basename(current_local_video).lower() == video_name.lower()
+        ):
+            local_video_path = current_local_video
+
+        self.merge_thread = QThread()
+        self.merge_worker = DetectionMergeWorker(
+            self.device_manager,
+            self.current_device_ip,
+            selected_video["path"],
+            os.path.dirname(os.path.abspath(__file__)),
+            local_video_path=local_video_path,
+        )
+        self.merge_worker.moveToThread(self.merge_thread)
+
+        def update_progress(percent, message):
+            self.merge_progress_bar.setValue(percent)
+            self.merge_status_label.setText(message)
+
+        def finished(success, message, output_path):
+            if success:
+                self.last_merged_video_path = output_path
+                self.merge_status_label.setText(f"合成完成: {output_path}")
+                self.open_merged_video_btn.setEnabled(True)
+                self.fullscreen_merged_video_btn.setEnabled(True)
+                self.statusBar().showMessage("带框视频合成完成", 5000)
+            else:
+                self.merge_status_label.setText(f"合成失败: {message}")
+                QMessageBox.critical(self, "合成失败", message)
+
+        self.merge_thread.started.connect(self.merge_worker.run)
+        self.merge_worker.progress.connect(update_progress, Qt.QueuedConnection)
+        self.merge_worker.finished.connect(finished, Qt.QueuedConnection)
+        self.merge_worker.finished.connect(self.merge_thread.quit)
+        self.merge_worker.finished.connect(self.merge_worker.deleteLater)
+        self.merge_thread.finished.connect(self.merge_thread.deleteLater)
+        self.merge_thread.finished.connect(self._clear_merge_refs)
+        self.merge_thread.start()
+
+    def _clear_merge_refs(self):
+        self.merge_worker = None
+        self.merge_thread = None
+
+    def play_merged_video(self):
+        """播放合成视频。"""
+        self._play_video_file(getattr(self, "last_merged_video_path", None), fullscreen=False)
+
+    def play_merged_video_fullscreen(self):
+        """全屏播放合成视频。"""
+        self._play_video_file(getattr(self, "last_merged_video_path", None), fullscreen=True)
+
+    def _play_video_file(self, path, fullscreen=False):
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "提示", "暂无可播放的合成视频")
+            return
+
+        try:
+            import cv2
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle(os.path.basename(path))
+            dialog.resize(1080, 680)
+            layout = QVBoxLayout(dialog)
+
+            video_label = QLabel()
+            video_label.setAlignment(Qt.AlignCenter)
+            video_label.setMinimumSize(640, 360)
+            video_label.setStyleSheet("background-color: #111;")
+            layout.addWidget(video_label, 1)
+
+            info_label = QLabel()
+            info_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(info_label)
+
+            frame_slider = QSlider(Qt.Horizontal)
+            layout.addWidget(frame_slider)
+
+            btn_layout = QHBoxLayout()
+            play_btn = QPushButton("暂停")
+            prev_btn = QPushButton("上一帧")
+            next_btn = QPushButton("下一帧")
+            fullscreen_btn = QPushButton("全屏/退出全屏")
+            close_btn = QPushButton("关闭")
+            btn_layout.addWidget(play_btn)
+            btn_layout.addWidget(prev_btn)
+            btn_layout.addWidget(next_btn)
+            btn_layout.addWidget(fullscreen_btn)
+            btn_layout.addWidget(close_btn)
+            layout.addLayout(btn_layout)
+
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                raise RuntimeError("OpenCV 无法打开该视频文件")
+
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30)
+            if fps <= 0:
+                fps = 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total_frames > 0:
+                frame_slider.setRange(0, total_frames - 1)
+            else:
+                frame_slider.setEnabled(False)
+
+            timer = QTimer(dialog)
+            timer.setTimerType(Qt.PreciseTimer)
+            state = {
+                "playing": True,
+                "current_frame": -1,
+                "anchor_time": time.perf_counter(),
+                "anchor_frame": -1,
+                "last_frame": None,
+                "slider_dragging": False,
+            }
+
+            def update_info():
+                frame_no = max(0, state["current_frame"])
+                total_text = str(total_frames) if total_frames > 0 else "?"
+                seconds = frame_no / fps if fps else 0
+                status = "播放中" if state["playing"] else "已暂停"
+                info_label.setText(
+                    f"{status} | 帧 {frame_no + 1}/{total_text} | "
+                    f"{seconds:.2f}s | {fps:.2f} FPS"
+                )
+
+            def render_frame(frame, frame_index):
+                state["last_frame"] = frame
+                state["current_frame"] = max(0, int(frame_index))
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb.shape
+                image = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+                pixmap = QPixmap.fromImage(image)
+                video_label.setPixmap(
+                    pixmap.scaled(
+                        video_label.size(),
+                        Qt.KeepAspectRatio,
+                        Qt.FastTransformation,
+                    )
+                )
+                if total_frames > 0 and not state["slider_dragging"]:
+                    frame_slider.blockSignals(True)
+                    frame_slider.setValue(min(state["current_frame"], total_frames - 1))
+                    frame_slider.blockSignals(False)
+                update_info()
+
+            def seek_frame(frame_index):
+                if total_frames > 0:
+                    frame_index = max(0, min(int(frame_index), total_frames - 1))
+                else:
+                    frame_index = max(0, int(frame_index))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                ok, frame = cap.read()
+                if not ok:
+                    return False
+                render_frame(frame, frame_index)
+                return True
+
+            def pause_playback():
+                state["playing"] = False
+                timer.stop()
+                play_btn.setText("播放")
+                update_info()
+
+            def start_playback():
+                if total_frames > 0 and state["current_frame"] >= total_frames - 1:
+                    seek_frame(0)
+                state["playing"] = True
+                state["anchor_time"] = time.perf_counter()
+                state["anchor_frame"] = state["current_frame"]
+                play_btn.setText("暂停")
+                timer.start(8)
+                update_info()
+
+            def toggle_playback():
+                if state["playing"]:
+                    pause_playback()
+                else:
+                    start_playback()
+
+            def show_timed_frame():
+                if not state["playing"]:
+                    return
+                elapsed_frames = int((time.perf_counter() - state["anchor_time"]) * fps)
+                target_frame = state["anchor_frame"] + elapsed_frames
+                if target_frame <= state["current_frame"]:
+                    return
+                if total_frames > 0 and target_frame >= total_frames:
+                    seek_frame(total_frames - 1)
+                    pause_playback()
+                    return
+                if target_frame > state["current_frame"] + 1:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                ok, frame = cap.read()
+                if not ok:
+                    pause_playback()
+                    return
+                actual_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (target_frame + 1)) - 1
+                render_frame(frame, actual_pos)
+
+            def step_frame(delta):
+                pause_playback()
+                seek_frame(state["current_frame"] + delta)
+
+            def on_slider_pressed():
+                state["slider_dragging"] = True
+                pause_playback()
+
+            def on_slider_released():
+                state["slider_dragging"] = False
+                seek_frame(frame_slider.value())
+
+            def cleanup():
+                timer.stop()
+                cap.release()
+
+            def toggle_fullscreen():
+                dialog.showNormal() if dialog.isFullScreen() else dialog.showFullScreen()
+                if state["last_frame"] is not None:
+                    render_frame(state["last_frame"], state["current_frame"])
+
+            play_btn.clicked.connect(toggle_playback)
+            prev_btn.clicked.connect(lambda: step_frame(-1))
+            next_btn.clicked.connect(lambda: step_frame(1))
+            frame_slider.sliderPressed.connect(on_slider_pressed)
+            frame_slider.sliderReleased.connect(on_slider_released)
+            fullscreen_btn.clicked.connect(toggle_fullscreen)
+            close_btn.clicked.connect(dialog.accept)
+            dialog.finished.connect(cleanup)
+            timer.timeout.connect(show_timed_frame)
+            seek_frame(0)
+            start_playback()
+            dialog.showFullScreen() if fullscreen else dialog.show()
+            self._video_player_dialog = dialog
+            self._video_player_timer = timer
+            self._video_player_capture = cap
+        except Exception as e:
+            log_manager.warning(f"[VIDEO] OpenCV播放器不可用，使用系统播放器: {e}")
+            try:
+                os.startfile(path)
+            except Exception as open_error:
+                QMessageBox.critical(self, "播放失败", str(open_error))
             
     def load_track_modes(self):
         """从设备加载追踪模式配置"""
@@ -2631,6 +3015,13 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.track_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px;")
             log_manager.info("[TRACK] 已停止追踪")
             self.statusBar().showMessage("追踪已停止", 3000)
+            if (
+                hasattr(self, "file_source_radio")
+                and self.file_source_radio.isChecked()
+                and self._get_selected_device_video()
+            ):
+                self.merge_status_label.setText("追踪已停止，正在自动拉取JSON并合成带框视频...")
+                self.merge_tracking_video()
         else:
             QMessageBox.critical(self, "失败", f"停止追踪失败\n{msg}")
     
@@ -2685,7 +3076,8 @@ class AlgorithmValidationPlatform(QMainWindow):
     def export_report(self):
         """导出综合报告"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_file = f"report_{timestamp}.txt"
+        os.makedirs(self.reports_output_dir, exist_ok=True)
+        report_file = os.path.join(self.reports_output_dir, f"report_{timestamp}.txt")
         
         try:
             with open(report_file, 'w', encoding='utf-8') as f:
@@ -2853,11 +3245,6 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.status_label.setText(f"✅ {device_ip} (自动连接)")
         self.status_label.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
         
-        # 更新RTSP显示
-        if rtsp_0 and rtsp_1:
-            self.rtsp_label_0.setText(f"RTSP 0: {rtsp_0}")
-            self.rtsp_label_1.setText(f"RTSP 1: {rtsp_1}")
-
         try:
             wifi_ssid = ''
             wifi_password = ''
@@ -2873,6 +3260,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         # 更新视频源管理页面的设备IP显示
         self.rtsp_device_ip_label.setText(device_ip)
         self.rtsp_device_ip_label.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
+        self.refresh_device_videos()
         
         # 自动连接MQTT
         log_manager.info(f"[AUTO] 正在自动连接MQTT Broker: {device_ip}:1883")
@@ -2891,8 +3279,6 @@ class AlgorithmValidationPlatform(QMainWindow):
             f"✅ 已成功连接到上次配置的设备\n\n"
             f"连接方式: {success_msg}\n"
             f"设备IP: {device_ip}\n"
-            f"RTSP 0: {rtsp_0 or 'N/A'}\n"
-            f"RTSP 1: {rtsp_1 or 'N/A'}\n\n"
             f"您现在可以直接使用所有功能了。"
         )
         

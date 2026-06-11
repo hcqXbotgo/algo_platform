@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QFormLayout, QLineEdit, QComboBox, QTextEdit,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
     QCheckBox, QSpinBox, QDoubleSpinBox, QFrame, QAbstractItemView,
-    QMessageBox
+    QMessageBox, QListWidget, QRadioButton, QButtonGroup
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
@@ -398,29 +398,15 @@ class VideoTab:
         """创建视频源管理标签页"""
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        # RTSP配置
-        rtsp_group = QGroupBox("RTSP流配置")
-        rtsp_layout = QFormLayout()
-        
-        # 显示当前设备IP（只读）
-        parent.rtsp_device_ip_label = QLabel("未连接设备")
-        parent.rtsp_device_ip_label.setStyleSheet("color: #7f8c8d; padding: 5px;")
-        rtsp_layout.addRow("设备IP:", parent.rtsp_device_ip_label)
-        
-        parent.rtsp_channel1 = QCheckBox("通道0 (rtsp://IP/live/0)")
-        parent.rtsp_channel1.setChecked(True)
-        rtsp_layout.addRow(parent.rtsp_channel1)
-        
-        parent.rtsp_channel2 = QCheckBox("通道1 (rtsp://IP/live/1)")
-        rtsp_layout.addRow(parent.rtsp_channel2)
-        
-        connect_rtsp_btn = QPushButton("连接RTSP流")
-        connect_rtsp_btn.clicked.connect(parent.connect_rtsp)
-        rtsp_layout.addRow(connect_rtsp_btn)
-        
-        rtsp_group.setLayout(rtsp_layout)
-        layout.addWidget(rtsp_group)
+
+        status_group = QGroupBox("设备视频源")
+        status_layout = QFormLayout()
+        parent.video_device_ip_label = QLabel("未连接设备")
+        parent.video_device_ip_label.setStyleSheet("color: #7f8c8d; padding: 5px;")
+        parent.rtsp_device_ip_label = parent.video_device_ip_label
+        status_layout.addRow("设备IP:", parent.video_device_ip_label)
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
         
         # 本地视频上传
         local_group = QGroupBox("本地视频管理")
@@ -441,21 +427,74 @@ class VideoTab:
         
         local_group.setLayout(local_layout)
         layout.addWidget(local_group)
+
+        # 设备视频列表
+        device_video_group = QGroupBox("设备 /userdata 视频文件")
+        device_video_layout = QVBoxLayout()
+        refresh_video_btn = QPushButton("刷新设备视频列表")
+        refresh_video_btn.clicked.connect(parent.refresh_device_videos)
+        device_video_layout.addWidget(refresh_video_btn)
+
+        parent.device_video_list = QListWidget()
+        parent.device_video_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        parent.device_video_list.setMinimumHeight(180)
+        device_video_layout.addWidget(parent.device_video_list)
+
+        parent.selected_device_video_label = QLabel("未选择视频")
+        parent.selected_device_video_label.setStyleSheet("color: #7f8c8d; padding: 4px;")
+        device_video_layout.addWidget(parent.selected_device_video_label)
+        parent.device_video_list.itemSelectionChanged.connect(parent.on_device_video_selected)
+
+        device_video_group.setLayout(device_video_layout)
+        layout.addWidget(device_video_group)
         
         # 视频源切换
         source_group = QGroupBox("视频源选择")
-        source_layout = QFormLayout()
-        
-        parent.video_source_combo = QComboBox()
-        parent.video_source_combo.addItems(["本地视频(/userdata)", "RTSP摄像头流"])
-        source_layout.addRow("视频源:", parent.video_source_combo)
-        
+        source_layout = QVBoxLayout()
+        parent.video_source_group = QButtonGroup(parent)
+        parent.camera_source_radio = QRadioButton("摄像头")
+        parent.file_source_radio = QRadioButton("本地视频（设备 /userdata）")
+        parent.camera_source_radio.setChecked(True)
+        parent.video_source_group.addButton(parent.camera_source_radio)
+        parent.video_source_group.addButton(parent.file_source_radio)
+        source_layout.addWidget(parent.camera_source_radio)
+        source_layout.addWidget(parent.file_source_radio)
+
         apply_source_btn = QPushButton("应用视频源设置")
         apply_source_btn.clicked.connect(parent.apply_video_source)
-        source_layout.addRow(apply_source_btn)
-        
+        source_layout.addWidget(apply_source_btn)
+
         source_group.setLayout(source_layout)
         layout.addWidget(source_group)
+
+        # 追踪结果合成
+        merge_group = QGroupBox("追踪结果合成与播放")
+        merge_layout = QVBoxLayout()
+        merge_btn_layout = QHBoxLayout()
+        pull_merge_btn = QPushButton("拉取追踪JSON并合成带框视频")
+        pull_merge_btn.clicked.connect(parent.merge_tracking_video)
+        parent.open_merged_video_btn = QPushButton("播放合成视频")
+        parent.open_merged_video_btn.clicked.connect(parent.play_merged_video)
+        parent.open_merged_video_btn.setEnabled(False)
+        parent.fullscreen_merged_video_btn = QPushButton("全屏播放")
+        parent.fullscreen_merged_video_btn.clicked.connect(parent.play_merged_video_fullscreen)
+        parent.fullscreen_merged_video_btn.setEnabled(False)
+        merge_btn_layout.addWidget(pull_merge_btn)
+        merge_btn_layout.addWidget(parent.open_merged_video_btn)
+        merge_btn_layout.addWidget(parent.fullscreen_merged_video_btn)
+        merge_layout.addLayout(merge_btn_layout)
+
+        parent.merge_progress_bar = QProgressBar()
+        parent.merge_progress_bar.setRange(0, 100)
+        parent.merge_progress_bar.setValue(0)
+        merge_layout.addWidget(parent.merge_progress_bar)
+
+        parent.merge_status_label = QLabel("等待合成")
+        parent.merge_status_label.setStyleSheet("color: #7f8c8d; padding: 4px;")
+        merge_layout.addWidget(parent.merge_status_label)
+
+        merge_group.setLayout(merge_layout)
+        layout.addWidget(merge_group)
         
         return widget
 
