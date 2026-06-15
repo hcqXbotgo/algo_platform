@@ -649,24 +649,77 @@ class DeviceManager:
             except Exception:
                 pass
 
-    def _update_config_video_source(self, config, video_src_type):
+    def _get_config_mode(self, config, mode_id):
+        for mode in config.get("modes", []) or []:
+            if mode_id is None or str(mode.get("id")) == str(mode_id):
+                return mode
+        return None
+
+    def _update_config_video_source(self, config, video_src_type, mode_id=None, model_index=None):
         changed = 0
         for mode in config.get("modes", []) or []:
-            for model in mode.get("models", []) or []:
+            if mode_id is not None and str(mode.get("id")) != str(mode_id):
+                continue
+            models = mode.get("models", []) or []
+            if model_index is not None:
+                if model_index < 0 or model_index >= len(models):
+                    continue
+                targets = [models[model_index]]
+            else:
+                targets = models
+            for model in targets:
                 if isinstance(model, dict):
                     model["videoSrcType"] = video_src_type
                     changed += 1
         return changed
 
-    def apply_video_source_config(self, device_ip, source_type, remote_video_path=None):
-        """修改 model_config.json 中的 videoSrcType 并重启 multi_media。"""
+    def _update_tracking_mode_fields(self, config, mode_id, mode_updates=None):
+        if not mode_updates:
+            return 0
+
+        mode = self._get_config_mode(config, mode_id)
+        if not mode:
+            return 0
+
+        changed = 0
+        for field, value in (mode_updates.get("mode_fields") or {}).items():
+            mode[field] = value
+            changed += 1
+
+        model_fields = mode_updates.get("model_fields") or {}
+        if model_fields:
+            model_index = int(mode_updates.get("model_index", 0) or 0)
+            models = mode.get("models", []) or []
+            if model_index < 0 or model_index >= len(models):
+                return changed
+            model = models[model_index]
+            if isinstance(model, dict):
+                for field, value in model_fields.items():
+                    model[field] = value
+                    changed += 1
+
+        return changed
+
+    def apply_video_source_config(
+        self,
+        device_ip,
+        source_type,
+        remote_video_path=None,
+        mode_id=None,
+        video_src_type=None,
+        mode_updates=None,
+    ):
+        """修改 model_config.json 中的指定追踪模式配置并重启 multi_media。"""
         config_filename = "model_config.json"
         temp_dir = "_tmp_video_source"
         temp_file = os.path.join(temp_dir, config_filename)
         try:
             if source_type not in ("camera", "file"):
                 return False, f"未知视频源类型: {source_type}"
-            if source_type == "file" and not remote_video_path:
+            video_src_type = video_src_type or ("FILE_H264" if source_type == "file" else "ANA_CAMERA")
+            if video_src_type not in ("ANA_CAMERA", "CAP_CAMERA", "FILE_H264"):
+                return False, f"未知 videoSrcType: {video_src_type}"
+            if video_src_type == "FILE_H264" and not remote_video_path:
                 return False, "请选择设备 /userdata 下的视频文件"
 
             os.makedirs(temp_dir, exist_ok=True)
@@ -677,10 +730,20 @@ class DeviceManager:
             with open(temp_file, "r", encoding="utf-8") as f:
                 config = json.load(f)
 
-            video_src_type = "FILE_H264" if source_type == "file" else "ANA_CAMERA"
-            changed = self._update_config_video_source(config, video_src_type)
+            changed = self._update_tracking_mode_fields(config, mode_id, mode_updates=mode_updates)
+            model_index = None
+            if mode_updates and "model_index" in mode_updates:
+                model_index = int(mode_updates.get("model_index", 0) or 0)
+            changed += self._update_config_video_source(
+                config,
+                video_src_type,
+                mode_id=mode_id,
+                model_index=model_index,
+            )
             if changed == 0:
-                return False, "model_config.json 中未找到可修改的 models/videoSrcType"
+                if mode_id is not None:
+                    return False, f"model_config.json 中未找到模式 {mode_id} 下可修改的配置"
+                return False, "model_config.json 中未找到可修改的配置"
 
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
@@ -690,7 +753,7 @@ class DeviceManager:
                 return False, msg
 
             extra_env = None
-            if source_type == "file":
+            if video_src_type == "FILE_H264":
                 extra_env = {
                     "DECODE_MODE": "MPP",
                     "H264_VIDEO_PATH": remote_video_path,
@@ -700,9 +763,10 @@ class DeviceManager:
             if not restart_success:
                 return False, f"配置已更新，但 multi_media 重启失败: {restart_msg}"
 
-            if source_type == "file":
-                return True, f"已切换到本地视频: {remote_video_path}，并使用 MPP 硬解启动"
-            return True, "已切换到摄像头并重启 multi_media"
+            mode_text = f"模式 {mode_id} " if mode_id is not None else ""
+            if video_src_type == "FILE_H264":
+                return True, f"已更新{mode_text}配置，切换到本地视频: {remote_video_path}，并使用 MPP 硬解启动"
+            return True, f"已更新{mode_text}配置，切换到 {video_src_type} 并重启 multi_media"
         except Exception as e:
             log_manager.error(f"[VIDEO] 应用视频源配置失败: {str(e)}", exc_info=True)
             return False, f"应用视频源配置失败: {str(e)}"

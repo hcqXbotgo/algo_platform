@@ -160,12 +160,24 @@ class VideoSourceApplyWorker(QObject):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, device_manager, device_ip, source_type, remote_video_path=None):
+    def __init__(
+        self,
+        device_manager,
+        device_ip,
+        source_type,
+        remote_video_path=None,
+        mode_id=None,
+        video_src_type=None,
+        mode_updates=None,
+    ):
         super().__init__()
         self.device_manager = device_manager
         self.device_ip = device_ip
         self.source_type = source_type
         self.remote_video_path = remote_video_path
+        self.mode_id = mode_id
+        self.video_src_type = video_src_type
+        self.mode_updates = mode_updates
 
     @pyqtSlot()
     def run(self):
@@ -175,6 +187,9 @@ class VideoSourceApplyWorker(QObject):
                 self.device_ip,
                 self.source_type,
                 self.remote_video_path,
+                mode_id=self.mode_id,
+                video_src_type=self.video_src_type,
+                mode_updates=self.mode_updates,
             )
             self.progress.emit(100, "完成" if success else "失败")
             self.finished.emit(success, msg)

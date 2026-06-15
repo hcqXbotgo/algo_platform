@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QFormLayout, QLineEdit, QComboBox, QTextEdit,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
     QCheckBox, QSpinBox, QDoubleSpinBox, QFrame, QAbstractItemView,
-    QMessageBox, QListWidget, QRadioButton, QButtonGroup
+    QMessageBox, QListWidget
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
@@ -68,14 +68,105 @@ class ModelConfigTab:
         
         list_group.setLayout(list_layout)
         layout.addWidget(list_group)
+
+        task_group = QGroupBox("追踪任务配置")
+        task_layout = QFormLayout()
+
+        mode_layout = QHBoxLayout()
+        parent.track_mode_combo = QComboBox()
+        parent.track_mode_combo.currentIndexChanged.connect(parent.on_track_mode_changed)
+        refresh_modes_btn = QPushButton("刷新模式")
+        refresh_modes_btn.clicked.connect(parent.load_track_modes)
+        mode_layout.addWidget(parent.track_mode_combo, 1)
+        mode_layout.addWidget(refresh_modes_btn)
+        task_layout.addRow("追踪模式:", mode_layout)
+
+        parent.track_mode_detail_label = QLabel("请选择追踪模式")
+        parent.track_mode_detail_label.setWordWrap(True)
+        parent.track_mode_detail_label.setStyleSheet("color: #5f6c7b; padding: 4px;")
+        task_layout.addRow("模式信息:", parent.track_mode_detail_label)
+
+        mode_param_layout = QHBoxLayout()
+        parent.mot_frame_rate_spin = QSpinBox()
+        parent.mot_frame_rate_spin.setRange(1, 120)
+        parent.mot_frame_rate_spin.setSuffix(" fps")
+        parent.pitch_initial_angle_spin = QDoubleSpinBox()
+        parent.pitch_initial_angle_spin.setRange(-90.0, 90.0)
+        parent.pitch_initial_angle_spin.setDecimals(2)
+        parent.pitch_initial_angle_spin.setSingleStep(0.5)
+        mode_param_layout.addWidget(QLabel("motFrameRate:"))
+        mode_param_layout.addWidget(parent.mot_frame_rate_spin)
+        mode_param_layout.addWidget(QLabel("pitchInitialAngle:"))
+        mode_param_layout.addWidget(parent.pitch_initial_angle_spin)
+        mode_param_layout.addStretch()
+        task_layout.addRow("模式参数:", mode_param_layout)
+
+        parent.tracking_video_source_combo = QComboBox()
+        parent.tracking_video_source_combo.addItem("ANA_CAMERA 摄像头", "ANA_CAMERA")
+        parent.tracking_video_source_combo.addItem("CAP_CAMERA 摄像头", "CAP_CAMERA")
+        parent.tracking_video_source_combo.addItem("FILE_H264 设备本地视频", "FILE_H264")
+        parent.tracking_video_source_combo.currentIndexChanged.connect(parent.on_tracking_video_source_changed)
+        task_layout.addRow("视频源类型:", parent.tracking_video_source_combo)
+
+        video_layout = QHBoxLayout()
+        parent.tracking_video_combo = QComboBox()
+        refresh_videos_btn = QPushButton("刷新视频")
+        refresh_videos_btn.clicked.connect(parent.refresh_device_videos)
+        video_layout.addWidget(parent.tracking_video_combo, 1)
+        video_layout.addWidget(refresh_videos_btn)
+        task_layout.addRow("本地视频:", video_layout)
+
+        parent.tracking_model_entry_combo = QComboBox()
+        parent.tracking_model_entry_combo.currentIndexChanged.connect(parent.on_tracking_model_entry_changed)
+        task_layout.addRow("模型条目:", parent.tracking_model_entry_combo)
+
+        parent.tracking_model_path_combo = QComboBox()
+        parent.tracking_model_path_combo.setEditable(True)
+        task_layout.addRow("models/modelPath:", parent.tracking_model_path_combo)
+
+        model_size_layout = QHBoxLayout()
+        parent.model_width_spin = QSpinBox()
+        parent.model_width_spin.setRange(1, 8192)
+        parent.model_height_spin = QSpinBox()
+        parent.model_height_spin.setRange(1, 8192)
+        model_size_layout.addWidget(QLabel("width:"))
+        model_size_layout.addWidget(parent.model_width_spin)
+        model_size_layout.addWidget(QLabel("height:"))
+        model_size_layout.addWidget(parent.model_height_spin)
+        model_size_layout.addStretch()
+        task_layout.addRow("modelSize:", model_size_layout)
+
+        parent.labels_combo = QComboBox()
+        parent.labels_combo.setEditable(True)
+        task_layout.addRow("labels:", parent.labels_combo)
+
+        parent.anchor_info_combo = QComboBox()
+        parent.anchor_info_combo.setEditable(True)
+        task_layout.addRow("anchorInfo:", parent.anchor_info_combo)
+
+        action_layout = QHBoxLayout()
+        apply_task_btn = QPushButton("应用选中模式配置")
+        apply_task_btn.clicked.connect(parent.apply_tracking_task_config)
+        parent.track_btn = QPushButton("启动追踪")
+        parent.track_btn.clicked.connect(parent.toggle_tracking)
+        parent.track_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px;")
+        action_layout.addWidget(apply_task_btn)
+        action_layout.addWidget(parent.track_btn)
+        task_layout.addRow(action_layout)
+
+        parent.is_tracking = False
+        task_group.setLayout(task_layout)
+        layout.addWidget(task_group)
+
+        parent.load_track_modes()
         
         # ========== 分隔线 ==========
         separator = QLabel()
         separator.setFrameStyle(QFrame.HLine | QFrame.Sunken)
         layout.addWidget(separator)
         
-        # ========== 下半部分：参数配置 ==========
-        config_group = QGroupBox("⚙️ 配置文件管理")
+        # ========== 下半部分：高级参数配置 ==========
+        config_group = QGroupBox("高级配置文件管理")
         config_layout = QVBoxLayout()
         
         # 配置文件选择
@@ -102,7 +193,7 @@ class ModelConfigTab:
         layout.addWidget(config_group)
         
         # 配置编辑器
-        edit_group = QGroupBox("📝 配置编辑器")
+        edit_group = QGroupBox("高级配置编辑器")
         edit_layout = QVBoxLayout()
         
         parent.config_text_edit = QTextEdit()
@@ -177,27 +268,6 @@ class PerformanceTab:
         
         mqtt_group.setLayout(mqtt_layout)
         layout.addWidget(mqtt_group)
-        
-        # 追踪模式选择（使用单个按钮切换状态）
-        track_group = QGroupBox("追踪模式")
-        track_layout = QFormLayout()
-        
-        parent.track_mode_combo = QComboBox()
-        # 从配置文件加载模式
-        parent.load_track_modes()
-        track_layout.addRow("追踪模式:", parent.track_mode_combo)
-        
-        # 创建单个按钮，根据状态切换文本
-        parent.track_btn = QPushButton("启动追踪")
-        parent.track_btn.clicked.connect(parent.toggle_tracking)
-        parent.track_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px;")
-        track_layout.addRow(parent.track_btn)
-        
-        # 追踪状态标记
-        parent.is_tracking = False
-        
-        track_group.setLayout(track_layout)
-        layout.addWidget(track_group)
         
         # 进程控制
         process_group = QGroupBox("进程控制")
@@ -448,25 +518,6 @@ class VideoTab:
         device_video_group.setLayout(device_video_layout)
         layout.addWidget(device_video_group)
         
-        # 视频源切换
-        source_group = QGroupBox("视频源选择")
-        source_layout = QVBoxLayout()
-        parent.video_source_group = QButtonGroup(parent)
-        parent.camera_source_radio = QRadioButton("摄像头")
-        parent.file_source_radio = QRadioButton("本地视频（设备 /userdata）")
-        parent.camera_source_radio.setChecked(True)
-        parent.video_source_group.addButton(parent.camera_source_radio)
-        parent.video_source_group.addButton(parent.file_source_radio)
-        source_layout.addWidget(parent.camera_source_radio)
-        source_layout.addWidget(parent.file_source_radio)
-
-        apply_source_btn = QPushButton("应用视频源设置")
-        apply_source_btn.clicked.connect(parent.apply_video_source)
-        source_layout.addWidget(apply_source_btn)
-
-        source_group.setLayout(source_layout)
-        layout.addWidget(source_group)
-
         # 追踪结果合成
         merge_group = QGroupBox("追踪结果合成与播放")
         merge_layout = QVBoxLayout()

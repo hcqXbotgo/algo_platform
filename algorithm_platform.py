@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QFileDialog, QMessageBox, QGroupBox, QFormLayout,
     QLineEdit, QComboBox, QTextEdit, QProgressBar, QSplitter, QTableWidget,
     QTableWidgetItem, QHeaderView, QCheckBox, QSpinBox, QDoubleSpinBox,
-    QRadioButton, QButtonGroup, QDialog, QDialogButtonBox, QStatusBar,
+    QDialog, QDialogButtonBox, QStatusBar,
     QMenuBar, QAction, QToolBar, QInputDialog, QFrame, QAbstractItemView,
     QListWidgetItem, QSlider
 )
@@ -98,6 +98,10 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.adb_available = False
         self.current_device_ip = None
         self.local_video_cache = {}
+        self.track_modes_config = None
+        self.track_modes = []
+        self.device_videos = []
+        self.available_device_models = []
         
         # 创建工具栏
         self.create_toolbar()
@@ -313,7 +317,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         tab_widget.addTab(self.create_rtmp_tab(), "RTMP直播")  # 新增
         tab_widget.addTab(self.create_performance_tab(), "性能监控")  # 包含算法控制和进程控制
         tab_widget.addTab(self.create_log_analysis_tab(), "日志分析")
-        tab_widget.addTab(self.create_video_tab(), "视频源管理")
+        tab_widget.addTab(self.create_video_tab(), "视频文件与回放")
         tab_widget.addTab(self.create_wifi_perf_tab(), "WiFi性能测试")  # 新增WiFi性能测试
         # 移除独立的"算法控制"标签页，已合并到性能监控页面
 
@@ -1149,20 +1153,38 @@ class AlgorithmValidationPlatform(QMainWindow):
 
     def refresh_device_videos(self):
         """刷新设备 /userdata 下的视频列表。"""
-        if not hasattr(self, "device_video_list"):
+        has_list = hasattr(self, "device_video_list")
+        has_combo = hasattr(self, "tracking_video_combo")
+        if not has_list and not has_combo:
             return
-        self.device_video_list.clear()
-        self.selected_device_video_label.setText("未选择视频")
+        previous_tracking_video_path = None
+        if has_list:
+            self.device_video_list.clear()
+            self.selected_device_video_label.setText("未选择视频")
+        if has_combo:
+            current_data = self.tracking_video_combo.currentData()
+            if isinstance(current_data, dict):
+                previous_tracking_video_path = current_data.get("path")
+            self.tracking_video_combo.clear()
 
         if not self.current_device_ip:
-            self.device_video_list.addItem("请先连接设备")
+            if has_list:
+                self.device_video_list.addItem("请先连接设备")
+            if has_combo:
+                self.tracking_video_combo.addItem("请先连接设备", None)
             return
 
         if getattr(self, "device_video_thread", None) and self.device_video_thread.isRunning():
-            self.device_video_list.addItem("正在刷新设备视频列表...")
+            if has_list:
+                self.device_video_list.addItem("正在刷新设备视频列表...")
+            if has_combo:
+                self.tracking_video_combo.addItem("正在刷新...", None)
             return
 
-        self.device_video_list.addItem("正在刷新设备视频列表...")
+        if has_list:
+            self.device_video_list.addItem("正在刷新设备视频列表...")
+        if has_combo:
+            self.tracking_video_combo.addItem("正在刷新...", None)
         self.statusBar().showMessage("正在刷新设备视频列表...", 3000)
 
         self.device_video_thread = QThread()
@@ -1173,23 +1195,30 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.device_video_worker.moveToThread(self.device_video_thread)
 
         def finished(success, msg, videos):
-            self.device_video_list.clear()
-            self.selected_device_video_label.setText("未选择视频")
+            self.device_videos = videos if success else []
+            if hasattr(self, "device_video_list"):
+                self.device_video_list.clear()
+                self.selected_device_video_label.setText("未选择视频")
+            if hasattr(self, "tracking_video_combo"):
+                self._populate_tracking_video_combo(self.device_videos, previous_tracking_video_path)
 
             if not success:
-                self.device_video_list.addItem(msg)
+                if hasattr(self, "device_video_list"):
+                    self.device_video_list.addItem(msg)
                 self.statusBar().showMessage(msg, 5000)
                 return
 
             if not videos:
-                self.device_video_list.addItem("设备 /userdata 下暂无视频文件")
+                if hasattr(self, "device_video_list"):
+                    self.device_video_list.addItem("设备 /userdata 下暂无视频文件")
                 self.statusBar().showMessage("设备 /userdata 下暂无视频文件", 3000)
                 return
 
-            for video in videos:
-                item = QListWidgetItem(f"{video['name']}    {video.get('size', '')}    {video.get('mtime', '')}")
-                item.setData(Qt.UserRole, video)
-                self.device_video_list.addItem(item)
+            if hasattr(self, "device_video_list"):
+                for video in videos:
+                    item = QListWidgetItem(f"{video['name']}    {video.get('size', '')}    {video.get('mtime', '')}")
+                    item.setData(Qt.UserRole, video)
+                    self.device_video_list.addItem(item)
             self.statusBar().showMessage(msg, 3000)
 
         self.device_video_thread.started.connect(self.device_video_worker.run)
@@ -1208,10 +1237,39 @@ class AlgorithmValidationPlatform(QMainWindow):
         """更新已选择的视频显示。"""
         video = self._get_selected_device_video()
         if video:
-            self.file_source_radio.setChecked(True)
+            if hasattr(self, "file_source_radio"):
+                self.file_source_radio.setChecked(True)
+            if hasattr(self, "tracking_video_source_combo"):
+                self._set_combo_by_data(self.tracking_video_source_combo, "FILE_H264")
+            if hasattr(self, "tracking_video_combo"):
+                for i in range(self.tracking_video_combo.count()):
+                    data = self.tracking_video_combo.itemData(i)
+                    if isinstance(data, dict) and data.get("path") == video.get("path"):
+                        self.tracking_video_combo.setCurrentIndex(i)
+                        break
             self.selected_device_video_label.setText(f"已选择: {video['path']}")
         else:
             self.selected_device_video_label.setText("未选择视频")
+
+    def _populate_tracking_video_combo(self, videos, selected_path=None):
+        if not hasattr(self, "tracking_video_combo"):
+            return
+        current_path = selected_path
+        current_data = self.tracking_video_combo.currentData()
+        if not current_path and isinstance(current_data, dict):
+            current_path = current_data.get("path")
+
+        self.tracking_video_combo.blockSignals(True)
+        self.tracking_video_combo.clear()
+        if not videos:
+            self.tracking_video_combo.addItem("设备 /userdata 下暂无视频", None)
+        else:
+            for video in videos:
+                text = f"{video.get('name', '')}    {video.get('size', '')}    {video.get('mtime', '')}"
+                self.tracking_video_combo.addItem(text, video)
+                if current_path and video.get("path") == current_path:
+                    self.tracking_video_combo.setCurrentIndex(self.tracking_video_combo.count() - 1)
+        self.tracking_video_combo.blockSignals(False)
 
     def _get_selected_device_video(self):
         if not hasattr(self, "device_video_list"):
@@ -1364,6 +1422,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         try:
             models = self.device_manager.list_models(ip, 'SSH')
+            self.available_device_models = [model.get('name', '') for model in models if model.get('name')]
             
             self.model_table.setRowCount(len(models))
             for i, model in enumerate(models):
@@ -1392,6 +1451,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             
             # 更新oem分区占用显示
             QTimer.singleShot(100, self.update_oem_usage_display)
+            self._refresh_tracking_model_path_options()
             
         except Exception as e:
             log_manager.error(f"刷新模型列表失败: {str(e)}")
@@ -2565,6 +2625,40 @@ class AlgorithmValidationPlatform(QMainWindow):
             
     def apply_video_source(self):
         """应用视频源设置"""
+        config_updates = self._collect_tracking_config_updates()
+        if config_updates is None:
+            return
+        source_type, selected_video = self._get_tracking_source_selection()
+        self._run_video_source_apply(
+            source_type,
+            selected_video,
+            mode_id=self._get_selected_track_mode_id(),
+            video_src_type=self._get_tracking_video_src_type(),
+            mode_updates=config_updates,
+        )
+
+    def apply_tracking_task_config(self):
+        """只应用当前追踪任务配置，不启动追踪。"""
+        config_updates = self._collect_tracking_config_updates()
+        if config_updates is None:
+            return
+        source_type, selected_video = self._get_tracking_source_selection()
+        self._run_video_source_apply(
+            source_type,
+            selected_video,
+            mode_id=self._get_selected_track_mode_id(),
+            video_src_type=self._get_tracking_video_src_type(),
+            mode_updates=config_updates,
+        )
+
+    def _run_video_source_apply(
+        self,
+        source_type,
+        selected_video,
+        mode_id=None,
+        video_src_type=None,
+        mode_updates=None,
+    ):
         if not self.current_device_ip:
             QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
             return
@@ -2573,19 +2667,22 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.information(self, "提示", "视频源设置正在应用中")
             return
 
-        source_type = "camera" if self.camera_source_radio.isChecked() else "file"
-        selected_video = self._get_selected_device_video()
+        if mode_id is None:
+            QMessageBox.warning(self, "错误", "请选择追踪模式")
+            return
+
+        video_src_type = video_src_type or ("FILE_H264" if source_type == "file" else "ANA_CAMERA")
         remote_video_path = selected_video["path"] if selected_video else None
-        if source_type == "file" and not remote_video_path:
+        if video_src_type == "FILE_H264" and not remote_video_path:
             QMessageBox.warning(self, "错误", "请选择设备 /userdata 下的具体视频文件")
             return
 
         progress_dialog = QDialog(self)
-        progress_dialog.setWindowTitle("应用视频源设置")
+        progress_dialog.setWindowTitle("应用追踪任务配置")
         progress_dialog.setModal(True)
         progress_dialog.setFixedSize(420, 150)
         layout = QVBoxLayout(progress_dialog)
-        status_label = QLabel("正在应用视频源设置...")
+        status_label = QLabel("正在更新选中追踪模式配置...")
         status_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(status_label)
         progress_bar = QProgressBar()
@@ -2598,6 +2695,9 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.current_device_ip,
             source_type,
             remote_video_path,
+            mode_id=mode_id,
+            video_src_type=video_src_type,
+            mode_updates=mode_updates,
         )
         self.video_source_worker.moveToThread(self.video_source_thread)
 
@@ -2608,11 +2708,12 @@ class AlgorithmValidationPlatform(QMainWindow):
         def finished(success, msg):
             progress_dialog.accept()
             if success:
-                QMessageBox.information(self, "成功", msg)
+                self.load_track_modes()
                 self.statusBar().showMessage(msg, 5000)
+                QMessageBox.information(self, "成功", msg)
             else:
                 QMessageBox.critical(self, "失败", msg)
-                self.statusBar().showMessage("视频源设置失败", 5000)
+                self.statusBar().showMessage("追踪任务配置失败", 5000)
 
         self.video_source_thread.started.connect(self.video_source_worker.run)
         self.video_source_worker.progress.connect(update_progress, Qt.QueuedConnection)
@@ -2633,7 +2734,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         if not self.current_device_ip:
             QMessageBox.warning(self, "错误", "请先连接设备")
             return
-        selected_video = self._get_selected_device_video()
+        selected_video = self._get_tracking_video_selection()
         if not selected_video:
             QMessageBox.warning(self, "错误", "请选择设备 /userdata 下的视频文件")
             return
@@ -2891,7 +2992,303 @@ class AlgorithmValidationPlatform(QMainWindow):
                 os.startfile(path)
             except Exception as open_error:
                 QMessageBox.critical(self, "播放失败", str(open_error))
-            
+
+    def _format_track_mode_label(self, mode):
+        mode_id = mode.get("id", "")
+        desc = mode.get("desc") or mode.get("name") or "未命名模式"
+        return f"[{mode_id}] {desc}"
+
+    def _populate_track_mode_controls(self, modes):
+        if not hasattr(self, "track_mode_combo"):
+            return
+        current_mode_id = self.track_mode_combo.currentData()
+        self.track_mode_combo.blockSignals(True)
+        self.track_mode_combo.clear()
+        for mode in modes:
+            self.track_mode_combo.addItem(self._format_track_mode_label(mode), mode.get("id"))
+            if current_mode_id is not None and str(mode.get("id")) == str(current_mode_id):
+                self.track_mode_combo.setCurrentIndex(self.track_mode_combo.count() - 1)
+        self.track_mode_combo.blockSignals(False)
+        self.on_track_mode_changed()
+
+    def _get_mode_by_id(self, mode_id):
+        for mode in getattr(self, "track_modes", []) or []:
+            if str(mode.get("id")) == str(mode_id):
+                return mode
+        return None
+
+    def _as_json_text(self, value):
+        if value is None:
+            return ""
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    def _set_combo_by_data(self, combo, data):
+        index = combo.findData(data)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+            return True
+        return False
+
+    def _populate_editable_combo(self, combo, values, current_text=""):
+        if not hasattr(combo, "clear"):
+            return
+        seen = set()
+        combo.blockSignals(True)
+        combo.clear()
+        for value in values:
+            text = "" if value is None else str(value)
+            if not text or text in seen:
+                continue
+            combo.addItem(text)
+            seen.add(text)
+        if current_text and current_text not in seen:
+            combo.addItem(current_text)
+        if combo.isEditable():
+            combo.setEditText(current_text or "")
+        elif current_text:
+            index = combo.findText(current_text)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+    def _collect_model_path_options(self):
+        options = []
+        for mode in getattr(self, "track_modes", []) or []:
+            for model in mode.get("models", []) or []:
+                path = model.get("modelPath")
+                if path:
+                    options.append(path)
+        options.extend(getattr(self, "available_device_models", []) or [])
+        return options
+
+    def _collect_model_field_options(self, field):
+        options = []
+        for mode in getattr(self, "track_modes", []) or []:
+            for model in mode.get("models", []) or []:
+                if field in model:
+                    value = model.get(field)
+                    if isinstance(value, (list, dict)):
+                        options.append(self._as_json_text(value))
+                    elif value is not None:
+                        options.append(str(value))
+        return options
+
+    def _refresh_tracking_model_path_options(self):
+        if not hasattr(self, "tracking_model_path_combo"):
+            return
+        current_text = self.tracking_model_path_combo.currentText().strip()
+        self._populate_editable_combo(
+            self.tracking_model_path_combo,
+            self._collect_model_path_options(),
+            current_text,
+        )
+
+    def _describe_track_mode(self, mode):
+        if not mode:
+            return "请选择追踪模式"
+        models = mode.get("models", []) or []
+        if not models:
+            return "该模式未配置模型"
+        items = []
+        items.append(
+            f"motFrameRate={mode.get('motFrameRate', 'N/A')}, "
+            f"pitchInitialAngle={mode.get('pitchInitialAngle', 'N/A')}"
+        )
+        for index, model in enumerate(models):
+            name = model.get("modelPath") or model.get("modelName") or "未知模型"
+            source = model.get("videoSrcType", "未知视频源")
+            size = model.get("modelSize") or {}
+            size_text = f"{size.get('width', '?')}x{size.get('height', '?')}" if isinstance(size, dict) else "未知尺寸"
+            items.append(f"模型{index}: {name} / {source} / {size_text}")
+        return "；".join(items)
+
+    def on_track_mode_changed(self, *args):
+        mode_id = self._get_selected_track_mode_id()
+        mode = self._get_mode_by_id(mode_id)
+        if hasattr(self, "track_mode_detail_label"):
+            self.track_mode_detail_label.setText(self._describe_track_mode(mode))
+
+        if not mode:
+            return
+
+        if hasattr(self, "mot_frame_rate_spin"):
+            self.mot_frame_rate_spin.setValue(int(mode.get("motFrameRate", 20) or 20))
+        if hasattr(self, "pitch_initial_angle_spin"):
+            self.pitch_initial_angle_spin.setValue(float(mode.get("pitchInitialAngle", 0) or 0))
+
+        if hasattr(self, "tracking_model_entry_combo"):
+            previous_index = self.tracking_model_entry_combo.currentData()
+            models = mode.get("models", []) or []
+            self.tracking_model_entry_combo.blockSignals(True)
+            self.tracking_model_entry_combo.clear()
+            for index, model in enumerate(models):
+                path = model.get("modelPath") or "未配置模型"
+                model_type = model.get("modelType") or "未知类型"
+                self.tracking_model_entry_combo.addItem(f"[{index}] {path} / {model_type}", index)
+                if previous_index is not None and int(previous_index) == index:
+                    self.tracking_model_entry_combo.setCurrentIndex(self.tracking_model_entry_combo.count() - 1)
+            if not models:
+                self.tracking_model_entry_combo.addItem("该模式暂无模型条目", None)
+            self.tracking_model_entry_combo.blockSignals(False)
+            self.on_tracking_model_entry_changed()
+
+    def _get_selected_model_index(self):
+        if not hasattr(self, "tracking_model_entry_combo"):
+            return 0
+        index = self.tracking_model_entry_combo.currentData()
+        return int(index) if index is not None else 0
+
+    def on_tracking_model_entry_changed(self, *args):
+        mode = self._get_mode_by_id(self._get_selected_track_mode_id())
+        if not mode:
+            return
+        models = mode.get("models", []) or []
+        model_index = self._get_selected_model_index()
+        if model_index < 0 or model_index >= len(models):
+            return
+
+        model = models[model_index]
+        if hasattr(self, "tracking_model_path_combo"):
+            self._populate_editable_combo(
+                self.tracking_model_path_combo,
+                self._collect_model_path_options(),
+                model.get("modelPath", ""),
+            )
+
+        model_size = model.get("modelSize") if isinstance(model.get("modelSize"), dict) else {}
+        if hasattr(self, "model_width_spin"):
+            self.model_width_spin.setValue(int(model_size.get("width", 1) or 1))
+        if hasattr(self, "model_height_spin"):
+            self.model_height_spin.setValue(int(model_size.get("height", 1) or 1))
+
+        if hasattr(self, "labels_combo"):
+            self._populate_editable_combo(
+                self.labels_combo,
+                self._collect_model_field_options("labels"),
+                self._as_json_text(model.get("labels", [])),
+            )
+
+        if hasattr(self, "anchor_info_combo"):
+            self._populate_editable_combo(
+                self.anchor_info_combo,
+                self._collect_model_field_options("anchorInfo"),
+                self._as_json_text(model.get("anchorInfo", [])),
+            )
+
+        source = model.get("videoSrcType") or "ANA_CAMERA"
+        if hasattr(self, "tracking_video_source_combo"):
+            self._set_combo_by_data(self.tracking_video_source_combo, source)
+            self.on_tracking_video_source_changed()
+
+    def on_tracking_video_source_changed(self, *args):
+        video_src_type = self._get_tracking_video_src_type()
+        is_file_source = video_src_type == "FILE_H264"
+        if hasattr(self, "tracking_video_combo"):
+            self.tracking_video_combo.setEnabled(is_file_source)
+
+    def _get_selected_track_mode_id(self):
+        if not hasattr(self, "track_mode_combo"):
+            return None
+        return self.track_mode_combo.currentData()
+
+    def _get_tracking_video_src_type(self):
+        if hasattr(self, "tracking_video_source_combo"):
+            data = self.tracking_video_source_combo.currentData()
+            if data:
+                return data
+        if hasattr(self, "file_source_radio") and self.file_source_radio.isChecked():
+            return "FILE_H264"
+        return "ANA_CAMERA"
+
+    def _get_tracking_video_selection(self):
+        if hasattr(self, "tracking_video_combo"):
+            data = self.tracking_video_combo.currentData()
+            if isinstance(data, dict):
+                return data
+        return self._get_selected_device_video()
+
+    def _get_tracking_source_selection(self):
+        video_src_type = self._get_tracking_video_src_type()
+        if video_src_type == "FILE_H264":
+            return "file", self._get_tracking_video_selection()
+        if video_src_type in ("ANA_CAMERA", "CAP_CAMERA"):
+            return "camera", None
+        if hasattr(self, "camera_source_radio") and hasattr(self, "file_source_radio"):
+            source_type = "camera" if self.camera_source_radio.isChecked() else "file"
+            return source_type, self._get_selected_device_video()
+        return "camera", None
+
+    def _parse_labels_value(self, text):
+        text = (text or "").strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            value = json.loads(text)
+            if not isinstance(value, list):
+                raise ValueError("labels 必须是 JSON 数组")
+            return value
+        return [part.strip() for part in text.replace("，", ",").split(",") if part.strip()]
+
+    def _parse_json_array_value(self, field_name, text):
+        text = (text or "").strip()
+        if not text:
+            return []
+        value = json.loads(text)
+        if not isinstance(value, list):
+            raise ValueError(f"{field_name} 必须是 JSON 数组")
+        return value
+
+    def _normalize_number(self, value):
+        value = float(value)
+        return int(value) if value.is_integer() else value
+
+    def _collect_tracking_config_updates(self):
+        mode_id = self._get_selected_track_mode_id()
+        mode = self._get_mode_by_id(mode_id)
+        if not mode:
+            QMessageBox.warning(self, "错误", "请选择追踪模式")
+            return None
+
+        models = mode.get("models", []) or []
+        model_index = self._get_selected_model_index()
+        if model_index < 0 or model_index >= len(models):
+            QMessageBox.warning(self, "错误", "请选择有效的模型条目")
+            return None
+
+        model_path = self.tracking_model_path_combo.currentText().strip() if hasattr(self, "tracking_model_path_combo") else ""
+        if not model_path:
+            QMessageBox.warning(self, "错误", "models/modelPath 不能为空")
+            return None
+
+        try:
+            labels = self._parse_labels_value(self.labels_combo.currentText() if hasattr(self, "labels_combo") else "")
+            anchor_info = self._parse_json_array_value(
+                "anchorInfo",
+                self.anchor_info_combo.currentText() if hasattr(self, "anchor_info_combo") else "",
+            )
+        except (json.JSONDecodeError, ValueError) as e:
+            QMessageBox.warning(self, "配置格式错误", str(e))
+            return None
+
+        return {
+            "mode_fields": {
+                "motFrameRate": int(self.mot_frame_rate_spin.value()) if hasattr(self, "mot_frame_rate_spin") else mode.get("motFrameRate", 20),
+                "pitchInitialAngle": self._normalize_number(
+                    self.pitch_initial_angle_spin.value() if hasattr(self, "pitch_initial_angle_spin") else mode.get("pitchInitialAngle", 0)
+                ),
+            },
+            "model_index": model_index,
+            "model_fields": {
+                "modelPath": model_path,
+                "modelSize": {
+                    "width": int(self.model_width_spin.value()) if hasattr(self, "model_width_spin") else 1,
+                    "height": int(self.model_height_spin.value()) if hasattr(self, "model_height_spin") else 1,
+                },
+                "labels": labels,
+                "anchorInfo": anchor_info,
+            },
+        }
+
     def load_track_modes(self):
         """从设备加载追踪模式配置"""
         # 检查设备是否已连接
@@ -2948,13 +3345,11 @@ class AlgorithmValidationPlatform(QMainWindow):
                         return
                     
                     modes = config.get('modes', [])
-                    self.track_mode_combo.clear()
+                    self.track_modes_config = config
+                    self.track_modes = modes
+                    self._populate_track_mode_controls(modes)
                     
                     if modes:
-                        # 移除"停止追踪"选项，因为已有单独的停止按钮
-                        for mode in modes:
-                            self.track_mode_combo.addItem(f"[{mode['id']}] {mode['desc']}", mode['id'])
-                        
                         log_manager.info(f"[CONFIG] 成功加载 {len(modes)} 个追踪模式")
                         self.statusBar().showMessage(f"已加载 {len(modes)} 个追踪模式", 2000)
                     else:
@@ -3015,10 +3410,11 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.track_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px;")
             log_manager.info("[TRACK] 已停止追踪")
             self.statusBar().showMessage("追踪已停止", 3000)
+            source_type, selected_video = self._get_tracking_source_selection()
             if (
-                hasattr(self, "file_source_radio")
-                and self.file_source_radio.isChecked()
-                and self._get_selected_device_video()
+                source_type == "file"
+                and selected_video
+                and hasattr(self, "merge_status_label")
             ):
                 self.merge_status_label.setText("追踪已停止，正在自动拉取JSON并合成带框视频...")
                 self.merge_tracking_video()
