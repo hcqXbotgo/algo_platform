@@ -17,6 +17,7 @@ import sys
 import numpy as np
 
 MODEL_W, MODEL_H = 2560, 1440
+DRAW_BOX_MODEL_W, DRAW_BOX_MODEL_H = 1920, 1080
 
 NAME_COLORS_RGB = {
     "person": (0, 255, 0),
@@ -67,6 +68,8 @@ def get_label(cls, conf, labels):
 def load_detections(json_path, total_frames=None):
     detections = {}
     max_frame = 0
+    box_frames = 0
+    draw_box_frames = 0
     with open(json_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -74,21 +77,33 @@ def load_detections(json_path, total_frames=None):
                 continue
             obj = json.loads(line)
             boxes = obj.get("boxes", [])
-            if not boxes:
+            draw_boxes = obj.get("draw_boxes", [])
+            if not boxes and not draw_boxes:
                 continue
             frame = int(obj["frame"])
             max_frame = max(max_frame, frame)
-            detections[frame] = boxes
+            if boxes:
+                box_frames += 1
+            if draw_boxes:
+                draw_box_frames += 1
+            detections[frame] = {
+                "boxes": boxes,
+                "draw_boxes": draw_boxes,
+            }
 
     if total_frames and max_frame >= total_frames:
         merged = {}
-        for frame, boxes in detections.items():
+        for frame, record in detections.items():
             mapped = frame % total_frames
-            merged.setdefault(mapped, boxes)
-        print(f"Loaded {len(detections)} detection frames, mapped to {len(merged)} source frames")
+            merged.setdefault(mapped, record)
+        print(
+            f"Loaded {len(detections)} detection frames "
+            f"({box_frames} boxes, {draw_box_frames} draw_boxes), "
+            f"mapped to {len(merged)} source frames"
+        )
         return merged
 
-    print(f"Loaded {len(detections)} frames with detections")
+    print(f"Loaded {len(detections)} frames with detections ({box_frames} boxes, {draw_box_frames} draw_boxes)")
     return detections
 
 
@@ -123,11 +138,48 @@ def smooth_boxes(prev_boxes, new_boxes, alpha=0.35):
     return result
 
 
-def draw_boxes_cv2(frame_bgr, boxes, src_w, src_h, labels):
-    sx, sy = src_w / MODEL_W, src_h / MODEL_H
+def draw_dashed_line_cv2(frame_bgr, pt1, pt2, color, thickness=2, dash=12, gap=8):
+    x1, y1 = pt1
+    x2, y2 = pt2
+    length = int(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
+    if length <= 0:
+        return
+    dx = (x2 - x1) / length
+    dy = (y2 - y1) / length
+    pos = 0
+    while pos < length:
+        end = min(pos + dash, length)
+        start_pt = (int(x1 + dx * pos), int(y1 + dy * pos))
+        end_pt = (int(x1 + dx * end), int(y1 + dy * end))
+        cv2.line(frame_bgr, start_pt, end_pt, color, thickness, lineType=cv2.LINE_8)
+        pos += dash + gap
+
+
+def draw_dashed_rectangle_cv2(frame_bgr, pt1, pt2, color, thickness=2):
+    x1, y1 = pt1
+    x2, y2 = pt2
+    draw_dashed_line_cv2(frame_bgr, (x1, y1), (x2, y1), color, thickness)
+    draw_dashed_line_cv2(frame_bgr, (x2, y1), (x2, y2), color, thickness)
+    draw_dashed_line_cv2(frame_bgr, (x2, y2), (x1, y2), color, thickness)
+    draw_dashed_line_cv2(frame_bgr, (x1, y2), (x1, y1), color, thickness)
+
+
+def draw_boxes_cv2(
+    frame_bgr,
+    boxes,
+    src_w,
+    src_h,
+    labels,
+    dashed=False,
+    show_label=True,
+    color_override=None,
+    coord_w=MODEL_W,
+    coord_h=MODEL_H,
+):
+    sx, sy = src_w / coord_w, src_h / coord_h
     for box in boxes:
         cls = int(box.get("cls", -1))
-        color = get_color_bgr(cls, labels)
+        color = color_override or get_color_bgr(cls, labels)
 
         x = int(box["x"] * sx)
         y = int(box["y"] * sy)
@@ -139,8 +191,13 @@ def draw_boxes_cv2(frame_bgr, boxes, src_w, src_h, labels):
             continue
 
         x2, y2 = x + w - 1, y + h - 1
-        cv2.rectangle(frame_bgr, (x, y), (x2, y2), color, 2, lineType=cv2.LINE_8)
+        if dashed:
+            draw_dashed_rectangle_cv2(frame_bgr, (x, y), (x2, y2), color, 2)
+        else:
+            cv2.rectangle(frame_bgr, (x, y), (x2, y2), color, 2, lineType=cv2.LINE_8)
 
+        if not show_label or cls < 0:
+            continue
         label = get_label(cls, float(box.get("conf", 0)), labels)
         font_scale = max(0.5, min(src_w, src_h) / 1200.0)
         thickness = 2
@@ -247,8 +304,11 @@ def merge_with_opencv(args, labels):
     frame_idx = 0
     frames_with_boxes = 0
     display_boxes = None
-    last_raw = None
-    held_count = 999
+    display_draw_boxes = None
+    last_raw_boxes = None
+    last_raw_draw_boxes = None
+    boxes_held_count = 999
+    draw_boxes_held_count = 999
 
     try:
         while True:
@@ -257,15 +317,47 @@ def merge_with_opencv(args, labels):
                 break
 
             if frame_idx in detections:
-                raw_boxes = detections[frame_idx]
-                display_boxes = smooth_boxes(last_raw, raw_boxes)
-                last_raw = raw_boxes
-                held_count = 0
+                record = detections[frame_idx]
+                raw_boxes = record.get("boxes", [])
+                raw_draw_boxes = record.get("draw_boxes", [])
+                if raw_boxes:
+                    display_boxes = smooth_boxes(last_raw_boxes, raw_boxes)
+                    last_raw_boxes = raw_boxes
+                    boxes_held_count = 0
+                else:
+                    display_boxes = None
+                    boxes_held_count = 999
 
-            if display_boxes is not None and held_count <= args.hold:
-                draw_boxes_cv2(frame, display_boxes, src_w, src_h, labels)
+                if raw_draw_boxes:
+                    display_draw_boxes = smooth_boxes(last_raw_draw_boxes, raw_draw_boxes)
+                    last_raw_draw_boxes = raw_draw_boxes
+                    draw_boxes_held_count = 0
+                else:
+                    display_draw_boxes = None
+                    draw_boxes_held_count = 999
+
+            drew_overlay = False
+            if display_boxes is not None and boxes_held_count <= args.hold:
+                draw_boxes_cv2(frame, display_boxes, src_w, src_h, labels, dashed=True, show_label=True)
+                boxes_held_count += 1
+                drew_overlay = True
+            if display_draw_boxes is not None and draw_boxes_held_count <= args.hold:
+                draw_boxes_cv2(
+                    frame,
+                    display_draw_boxes,
+                    src_w,
+                    src_h,
+                    labels,
+                    dashed=False,
+                    show_label=False,
+                    color_override=(0, 255, 255),
+                    coord_w=DRAW_BOX_MODEL_W,
+                    coord_h=DRAW_BOX_MODEL_H,
+                )
+                draw_boxes_held_count += 1
+                drew_overlay = True
+            if drew_overlay:
                 frames_with_boxes += 1
-                held_count += 1
 
             writer.write(frame)
             frame_idx += 1
@@ -338,8 +430,11 @@ def merge_with_opencv_decode_ffmpeg_encode(args, labels):
     frame_idx = 0
     frames_with_boxes = 0
     display_boxes = None
-    last_raw = None
-    held_count = 999
+    display_draw_boxes = None
+    last_raw_boxes = None
+    last_raw_draw_boxes = None
+    boxes_held_count = 999
+    draw_boxes_held_count = 999
 
     try:
         while True:
@@ -347,14 +442,47 @@ def merge_with_opencv_decode_ffmpeg_encode(args, labels):
             if not ok:
                 break
             if frame_idx in detections:
-                raw_boxes = detections[frame_idx]
-                display_boxes = smooth_boxes(last_raw, raw_boxes)
-                last_raw = raw_boxes
-                held_count = 0
-            if display_boxes is not None and held_count <= args.hold:
-                draw_boxes_cv2(frame, display_boxes, src_w, src_h, labels)
+                record = detections[frame_idx]
+                raw_boxes = record.get("boxes", [])
+                raw_draw_boxes = record.get("draw_boxes", [])
+                if raw_boxes:
+                    display_boxes = smooth_boxes(last_raw_boxes, raw_boxes)
+                    last_raw_boxes = raw_boxes
+                    boxes_held_count = 0
+                else:
+                    display_boxes = None
+                    boxes_held_count = 999
+
+                if raw_draw_boxes:
+                    display_draw_boxes = smooth_boxes(last_raw_draw_boxes, raw_draw_boxes)
+                    last_raw_draw_boxes = raw_draw_boxes
+                    draw_boxes_held_count = 0
+                else:
+                    display_draw_boxes = None
+                    draw_boxes_held_count = 999
+
+            drew_overlay = False
+            if display_boxes is not None and boxes_held_count <= args.hold:
+                draw_boxes_cv2(frame, display_boxes, src_w, src_h, labels, dashed=True, show_label=True)
+                boxes_held_count += 1
+                drew_overlay = True
+            if display_draw_boxes is not None and draw_boxes_held_count <= args.hold:
+                draw_boxes_cv2(
+                    frame,
+                    display_draw_boxes,
+                    src_w,
+                    src_h,
+                    labels,
+                    dashed=False,
+                    show_label=False,
+                    color_override=(0, 255, 255),
+                    coord_w=DRAW_BOX_MODEL_W,
+                    coord_h=DRAW_BOX_MODEL_H,
+                )
+                draw_boxes_held_count += 1
+                drew_overlay = True
+            if drew_overlay:
                 frames_with_boxes += 1
-                held_count += 1
             try:
                 process.stdin.write(frame.tobytes())
             except BrokenPipeError:

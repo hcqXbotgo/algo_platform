@@ -97,6 +97,8 @@ class DeviceManager:
     def __init__(self):
         self.ssh_client = None
         self.current_device_ip = None  # 保存当前连接的设备IP
+        self.current_adb_device_id = None
+        self.connection_mode = None
         
     def connect_ssh(
         self,
@@ -148,12 +150,14 @@ class DeviceManager:
                         )
                         if success:
                             self.current_device_ip = hostname
+                            self.connection_mode = "ssh"
                             return True, "SSH连接成功"
                         self.ssh_client = None
                         return False, f"{retry_msg}；已尝试ADB启动SSH服务: {adb_msg}"
                     return False, f"{msg}；ADB启动SSH服务失败: {adb_msg}"
                 return False, msg
             self.current_device_ip = hostname  # 保存设备IP
+            self.connection_mode = "ssh"
             return True, "SSH连接成功"
         except Exception as e:
             return False, f"SSH连接失败: {str(e)}"
@@ -181,6 +185,22 @@ class DeviceManager:
 
         return None, "未检测到可用ADB设备"
 
+    def connect_adb(self):
+        """Connect by USB ADB only; SSH is not required for wired mode."""
+        device_id, msg = self.get_adb_device_id()
+        if not device_id:
+            self.current_adb_device_id = None
+            self.connection_mode = None
+            return False, msg, None
+
+        self.current_adb_device_id = device_id
+        self.connection_mode = "adb"
+        device_ip = self.get_current_device_ip_via_adb()
+        if device_ip:
+            self.current_device_ip = device_ip
+        log_manager.info(f"[ADB] USB ADB connected: {device_id}, ip={device_ip or 'N/A'}")
+        return True, f"ADB连接成功: {device_id}", device_ip
+
     def run_adb_shell_command(self, command, device_id=None, timeout=15):
         """通过ADB执行shell命令。"""
         if not device_id:
@@ -204,6 +224,50 @@ class DeviceManager:
             return False, "ADB未安装或未添加到PATH"
         except Exception as e:
             return False, f"ADB命令异常: {str(e)}"
+
+    def _get_adb_file_size(self, device_id, remote_path):
+        """Return remote file size over ADB without relying on stat(1)."""
+        quoted = shlex.quote(remote_path)
+        commands = [
+            f"wc -c < {quoted}",
+            f"ls -ln {quoted} 2>/dev/null | awk '{{print $5}}'",
+            f"busybox stat -c %s {quoted} 2>/dev/null",
+            f"toybox stat -c %s {quoted} 2>/dev/null",
+        ]
+        last_output = ""
+        for command in commands:
+            success, output = self.run_adb_shell_command(command, device_id=device_id, timeout=10)
+            last_output = output
+            if not success or not output:
+                continue
+            match = re.search(r"\d+", str(output).strip().splitlines()[-1])
+            if match:
+                try:
+                    return int(match.group(0)), output
+                except ValueError:
+                    pass
+        return None, last_output or "无法获取远端文件大小"
+
+    def _adb_process_running(self, device_id, process_name):
+        safe_name = shlex.quote(process_name)
+        success, output = self.run_adb_shell_command(
+            f"pidof {safe_name} 2>/dev/null",
+            device_id=device_id,
+            timeout=5,
+        )
+        if success and output.strip():
+            return True, output
+
+        ps_command = (
+            "ps 2>/dev/null | awk "
+            + shlex.quote(
+                "NR>1 && $0 !~ /awk/ && $0 !~ /grep/ && "
+                "$0 !~ /sh -c/ && $0 !~ /bash -c/ && "
+                f"$0 ~ /(^|[\\/ ]){process_name}([ ]|$)/ {{print}}"
+            )
+        )
+        success, output = self.run_adb_shell_command(ps_command, device_id=device_id, timeout=5)
+        return bool(success and output.strip()), output
 
     def ensure_ssh_service_via_adb(self):
         """通过ADB挂载分区、启动sshd，并清除root密码。"""
@@ -248,7 +312,7 @@ class DeviceManager:
         ]
 
         for command in ip_commands:
-            success, output = self.run_adb_shell_command(command, device_id=device_id, timeout=5)
+            success, output = self.run_adb_shell_command(command, device_id=device_id, timeout=2)
             if not success or not output:
                 continue
             ip = output.splitlines()[-1].strip()
@@ -259,8 +323,31 @@ class DeviceManager:
         log_manager.warning("[ADB] 未能获取到有效的IP地址")
         return None
             
-    def execute_ssh_command(self, command):
-        """执行SSH命令（自动重连）"""
+    def _usb_adb_available(self):
+        device_id, msg = self.get_adb_device_id()
+        if device_id:
+            return device_id
+        return None
+
+    def execute_ssh_command(self, command, timeout=30):
+        """执行设备 shell 命令：USB ADB 优先，失败后按需回退 SSH。"""
+        device_id, adb_msg = self.get_adb_device_id()
+        if device_id:
+            success, output = self.run_adb_shell_command(
+                command,
+                device_id=device_id,
+                timeout=timeout,
+            )
+            if success:
+                self.current_adb_device_id = device_id
+                self.connection_mode = "adb"
+                return True, output
+            log_manager.warning(f"[ADB] shell command failed, command={command}, output={output}")
+            if self.connection_mode == "adb":
+                return False, f"ADB命令执行失败: {output}"
+        else:
+            log_manager.info(f"[ADB] shell command skipped: {adb_msg}")
+
         # 如果没有SSH连接，尝试自动重连到上次连接的设备
         if not self.ssh_client and self.current_device_ip:
             log_manager.info(f"[DEVICE] SSH连接已关闭，正在自动重连到 {self.current_device_ip}...")
@@ -274,7 +361,7 @@ class DeviceManager:
             return False, "未建立SSH连接"
         
         try:
-            stdin, stdout, stderr = self.ssh_client.exec_command(command)
+            stdin, stdout, stderr = self.ssh_client.exec_command(command, timeout=timeout)
             exit_status = stdout.channel.recv_exit_status()
             output = stdout.read().decode('utf-8')
             error = stderr.read().decode('utf-8')
@@ -319,12 +406,13 @@ class DeviceManager:
         """推送模型文件到设备"""
         try:
             remote_path = "/oem/usr/models/"
-            
-            if connection_type == 'SSH':
-                # 使用SCP推送
+
+            # Always try wired USB ADB first. If the cable is not connected or
+            # adb fails, fall back to the existing SSH/SFTP path.
+            success, msg = self._push_via_adb(model_file, device_ip, remote_path)
+            if not success:
+                log_manager.warning(f"[ADB] model push unavailable, fallback to SSH: {msg}")
                 success, msg = self._push_via_scp(model_file, device_ip, remote_path)
-            else:  # ADB
-                success, msg = self._push_via_adb(model_file, device_ip, remote_path)
                 
             if success:
                 # 推送成功后，可能需要更新配置文件
@@ -405,28 +493,109 @@ class DeviceManager:
     def _push_via_adb(self, local_file, device_ip, remote_path):
         """通过ADB推送文件"""
         try:
-            # 首先连接到设备
-            subprocess.run(['adb', 'connect', device_ip], check=True, capture_output=True)
-            
+            device_id, msg = self.get_adb_device_id()
+            if not device_id:
+                return False, msg
+
+            remote_path = remote_path.replace("\\", "/")
+            if not remote_path.endswith("/"):
+                remote_path += "/"
             remote_full_path = f"{remote_path}{os.path.basename(local_file)}"
-            result = subprocess.run(
-                ['adb', 'push', local_file, remote_full_path],
-                check=True,
-                capture_output=True,
-                text=True
+            file_size = os.path.getsize(local_file)
+
+            if remote_path.startswith("/oem"):
+                self.run_adb_shell_command("mount -o remount,rw /oem 2>/dev/null || true", device_id=device_id, timeout=10)
+            mkdir_ok, mkdir_msg = self.run_adb_shell_command(
+                f"mkdir -p {shlex.quote(remote_path.rstrip('/'))}",
+                device_id=device_id,
+                timeout=10,
             )
-            
-            subprocess.run(['adb', 'disconnect', device_ip], capture_output=True)
-            
-            return True, f"文件已通过ADB上传: {remote_full_path}"
+            if not mkdir_ok:
+                return False, f"ADB创建远端目录失败: {mkdir_msg}"
+
+            result = _run_subprocess_text(
+                ['adb', '-s', device_id, 'push', local_file, remote_full_path],
+                timeout=300,
+            )
+            output = (result.stdout or "").strip()
+            error = (result.stderr or "").strip()
+            if result.returncode != 0:
+                return False, error or output or f"adb push返回码 {result.returncode}"
+
+            uploaded_size, stat_output = self._get_adb_file_size(device_id, remote_full_path)
+            if uploaded_size is not None and uploaded_size != file_size:
+                return False, f"ADB上传校验失败: 本地={file_size}, 远端={uploaded_size}"
+            if uploaded_size is None:
+                log_manager.warning(f"[ADB] file size check skipped: {stat_output}")
+
+            self.current_adb_device_id = device_id
+            self.connection_mode = "adb"
+            return True, f"文件已通过USB ADB上传: {remote_full_path}"
         except Exception as e:
             return False, f"ADB上传失败: {str(e)}"
+
+    def _pull_via_adb(self, remote_path, local_path, progress_callback=None):
+        """Pull a device file by USB ADB. Returns (success, message)."""
+        try:
+            device_id, msg = self.get_adb_device_id()
+            if not device_id:
+                return False, msg
+
+            total = 0
+            remote_size, stat_output = self._get_adb_file_size(device_id, remote_path)
+            if remote_size is not None:
+                total = remote_size
+            else:
+                log_manager.warning(f"[ADB] remote file size unavailable: {stat_output}")
+
+            local_dir = os.path.dirname(os.path.abspath(local_path))
+            if local_dir:
+                os.makedirs(local_dir, exist_ok=True)
+            if progress_callback:
+                progress_callback(0, total)
+
+            result = _run_subprocess_text(
+                ['adb', '-s', device_id, 'pull', remote_path, local_path],
+                timeout=600,
+            )
+            output = (result.stdout or "").strip()
+            error = (result.stderr or "").strip()
+            if result.returncode != 0:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                return False, error or output or f"adb pull返回码 {result.returncode}"
+
+            if not os.path.exists(local_path):
+                return False, "ADB下载失败: 本地文件不存在"
+            local_size = os.path.getsize(local_path)
+            if total and local_size != total:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                return False, f"ADB下载校验失败: 本地={local_size}, 远端={total}"
+
+            if progress_callback:
+                progress_callback(local_size, total or local_size)
+            self.current_adb_device_id = device_id
+            self.connection_mode = "adb"
+            return True, local_path
+        except Exception as e:
+            try:
+                if local_path and os.path.exists(local_path):
+                    os.remove(local_path)
+            except OSError:
+                pass
+            return False, f"ADB下载失败: {str(e)}"
             
     def push_config(self, config_file, device_ip):
         """推送配置文件到设备"""
         try:
             remote_path = "/oem/usr/models/"
             remote_full_path = os.path.join(remote_path, os.path.basename(config_file))
+
+            adb_success, adb_msg = self._push_via_adb(config_file, device_ip, remote_path)
+            if adb_success:
+                return True, f"配置已通过USB ADB推送到 {remote_full_path}"
+            log_manager.warning(f"[ADB] config push unavailable, fallback to SSH: {adb_msg}")
             
             # 使用SSHClient推送
             ssh_client = paramiko.SSHClient()
@@ -442,6 +611,247 @@ class DeviceManager:
             return True, f"配置已推送到 {remote_full_path}"
         except Exception as e:
             return False, f"配置推送失败: {str(e)}"
+
+    def _restart_media_process_via_adb(self, device_id, extra_env=None):
+        log_dir = "/userdata/logs"
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        log_file = f"{log_dir}/multi_media-{timestamp}-redir.log"
+
+        commands = [
+            "killall multi_media 2>/dev/null || true",
+            "for pid in $(pidof multi_media 2>/dev/null); do kill -TERM \"$pid\" 2>/dev/null || true; done",
+            "sleep 2",
+            "for pid in $(pidof multi_media 2>/dev/null); do kill -KILL \"$pid\" 2>/dev/null || true; done",
+            f"mkdir -p {log_dir}",
+            "mkdir -p /userdata/coredump",
+            "rm -f /tmp/multi_media.pid",
+        ]
+        for command in commands:
+            self.run_adb_shell_command(command, device_id=device_id, timeout=10)
+
+        env_parts = [
+            "export TARGET_DIR=/oem",
+            "export LD_LIBRARY_PATH=/oem/usr/lib:/lib:${LD_LIBRARY_PATH:-}",
+            "export PATH=/oem/usr/bin:/bin:${PATH:-}",
+            "ulimit -c unlimited",
+            "echo '/userdata/coredump/core-%e-%p-%t' > /proc/sys/kernel/core_pattern 2>/dev/null || true",
+        ]
+        for key, value in (extra_env or {}).items():
+            env_parts.append(f"export {key}={shlex.quote(str(value))}")
+        start_command = (
+            "; ".join(env_parts) + "; "
+            f"cd /oem/usr/bin || exit 1; "
+            "start-stop-daemon -S -b -m -p /tmp/multi_media.pid "
+            f"-x /oem/usr/bin/multi_media > {shlex.quote(log_file)} 2>&1"
+        )
+        ok, output = self.run_adb_shell_command(start_command, device_id=device_id, timeout=10)
+        if not ok:
+            return False, f"ADB启动multi_media失败: {output}"
+
+        last_output = ""
+        for _ in range(24):
+            time.sleep(0.5)
+            running, output = self._adb_process_running(device_id, "multi_media")
+            last_output = output
+            if running:
+                return True, f"multi_media已通过ADB重启，日志: {log_file}"
+
+        debug_command = (
+            f"echo '--- redir: {log_file} ---'; "
+            f"tail -n 80 {shlex.quote(log_file)} 2>/dev/null || true; "
+            "latest=$(ls -1t /userdata/logs/multi_media*.log /userdata/logs/multi_media*-redir.log 2>/dev/null | head -1); "
+            "if [ -n \"$latest\" ]; then echo \"--- latest: $latest ---\"; tail -n 120 \"$latest\" 2>/dev/null || true; fi; "
+            "echo '--- ps ---'; ps 2>/dev/null | grep multi_media | grep -v grep || true; "
+            "echo '--- coredump ---'; ls -lt /userdata/coredump 2>/dev/null | head -5 || true"
+        )
+        debug_ok, debug_output = self.run_adb_shell_command(
+            debug_command,
+            device_id=device_id,
+            timeout=10,
+        )
+        detail = debug_output.strip() if debug_ok and debug_output.strip() else last_output
+        return False, f"ADB启动后未检测到multi_media进程。日志尾部: {detail}"
+
+    def _replace_runtime_component_via_adb(self, local_file, remote_dir, remote_name, label):
+        device_id, msg = self.get_adb_device_id()
+        if not device_id:
+            return False, msg
+
+        remote_full_path = f"{remote_dir}/{remote_name}"
+        local_size = os.path.getsize(local_file)
+        pre_commands = [
+            "mount -o remount,rw /oem 2>/dev/null || true",
+            f"mkdir -p {shlex.quote(remote_dir)}",
+            "killall multi_media 2>/dev/null || true",
+            "for pid in $(pidof multi_media 2>/dev/null); do kill -TERM \"$pid\" 2>/dev/null || true; done",
+            "sleep 2",
+            "for pid in $(pidof multi_media 2>/dev/null); do kill -KILL \"$pid\" 2>/dev/null || true; done",
+        ]
+        for command in pre_commands:
+            ok, output = self.run_adb_shell_command(command, device_id=device_id, timeout=15)
+            if not ok and command.startswith("mkdir"):
+                return False, f"ADB创建远端目录失败: {output}"
+
+        result = _run_subprocess_text(
+            ['adb', '-s', device_id, 'push', local_file, remote_full_path],
+            timeout=300,
+        )
+        output = (result.stdout or "").strip()
+        error = (result.stderr or "").strip()
+        if result.returncode != 0:
+            return False, error or output or f"adb push返回码 {result.returncode}"
+
+        remote_size, stat_output = self._get_adb_file_size(device_id, remote_full_path)
+        if remote_size is not None and remote_size != local_size:
+            return False, f"ADB上传校验失败: 本地={local_size}, 远端={remote_size}"
+        if remote_size is None:
+            log_manager.warning(f"[ADB] runtime file size check skipped: {stat_output}")
+
+        ok, chmod_output = self.run_adb_shell_command(
+            f"chmod 755 {shlex.quote(remote_full_path)} && sync",
+            device_id=device_id,
+            timeout=20,
+        )
+        if not ok:
+            return False, f"ADB chmod失败: {chmod_output}"
+
+        restart_success, restart_msg = self._restart_media_process_via_adb(device_id)
+        if not restart_success:
+            return False, f"{label}已通过ADB替换到 {remote_full_path}，但multi_media重启失败: {restart_msg}"
+
+        self.current_adb_device_id = device_id
+        self.connection_mode = "adb"
+        return True, f"{label}已通过USB ADB替换到 {remote_full_path}，chmod 755完成，{restart_msg}"
+
+    def publish_track_command_via_adb(self, track_id):
+        """Publish the one-byte track command from inside the device via ADB."""
+        try:
+            track_id = int(track_id)
+            if track_id < 0 or track_id > 255:
+                return False, f"追踪ID超出1字节范围: {track_id}"
+
+            device_id, msg = self.get_adb_device_id()
+            if not device_id:
+                return False, msg
+
+            tool_ok, tool_output = self.run_adb_shell_command(
+                "command -v mosquitto_pub || which mosquitto_pub",
+                device_id=device_id,
+                timeout=5,
+            )
+            if not tool_ok or not tool_output.strip():
+                return False, "设备端未找到 mosquitto_pub，无法通过ADB本机发布MQTT"
+
+            temp_file = f"/tmp/track_cmd_{int(time.time() * 1000)}.bin"
+            payload = f"\\{track_id:03o}"
+            command = (
+                f"printf '{payload}' > {shlex.quote(temp_file)} && "
+                f"mosquitto_pub -h 127.0.0.1 -t track -f {shlex.quote(temp_file)}; "
+                "rc=$?; "
+                f"rm -f {shlex.quote(temp_file)}; "
+                "exit $rc"
+            )
+            success, output = self.run_adb_shell_command(
+                command,
+                device_id=device_id,
+                timeout=10,
+            )
+            if success:
+                self.current_adb_device_id = device_id
+                self.connection_mode = "adb"
+                return True, f"已通过ADB在设备本机发送追踪指令，ID: {track_id}"
+            return False, f"ADB本机MQTT发送失败: {output}"
+        except Exception as e:
+            return False, f"ADB本机MQTT发送异常: {str(e)}"
+
+    def replace_runtime_component(self, local_file, device_ip, component_type):
+        """替换设备运行时组件，chmod 后重启 multi_media。"""
+        if not local_file or not os.path.isfile(local_file):
+            return False, "请选择有效的本地文件"
+
+        if component_type == "multi_media":
+            remote_dir = "/oem/usr/bin"
+            remote_name = "multi_media"
+            label = "multi_media程序"
+        elif component_type == "sdk":
+            remote_dir = "/oem/usr/lib"
+            remote_name = os.path.basename(local_file)
+            label = "算法库SDK"
+        else:
+            return False, f"未知组件类型: {component_type}"
+
+        remote_full_path = f"{remote_dir}/{remote_name}"
+
+        adb_success, adb_msg = self._replace_runtime_component_via_adb(
+            local_file,
+            remote_dir,
+            remote_name,
+            label,
+        )
+        if adb_success:
+            return True, adb_msg
+        if self._usb_adb_available():
+            return False, adb_msg
+        log_manager.warning(f"[ADB] runtime component replace unavailable, fallback to SSH: {adb_msg}")
+
+        ssh_client = None
+        sftp = None
+        try:
+            ssh_client = paramiko.SSHClient()
+            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh_client.connect(device_ip, port=22, username='root', password='', timeout=15)
+
+            def run(command):
+                stdin, stdout, stderr = ssh_client.exec_command(command, timeout=30)
+                rc = stdout.channel.recv_exit_status()
+                output = (stdout.read().decode(errors="ignore") + stderr.read().decode(errors="ignore")).strip()
+                return rc == 0, output
+
+            run("mount -o remount,rw /oem 2>/dev/null || true")
+            ok, output = run(f"mkdir -p {shlex.quote(remote_dir)}")
+            if not ok:
+                return False, f"创建远端目录失败: {output}"
+
+            run("killall multi_media 2>/dev/null || true")
+            time.sleep(1)
+            still_running, process_info = run("ps aux | grep multi_media | grep -v grep")
+            if still_running and process_info.strip():
+                run("kill -9 $(ps aux | grep multi_media | grep -v grep | awk '{print $2}') 2>/dev/null || true")
+                time.sleep(1)
+
+            sftp = ssh_client.open_sftp()
+            sftp.put(local_file, remote_full_path)
+            uploaded_size = sftp.stat(remote_full_path).st_size
+            local_size = os.path.getsize(local_file)
+            if uploaded_size != local_size:
+                return False, f"上传校验失败: 本地={local_size}, 远端={uploaded_size}"
+
+            chmod_cmd = f"chmod 755 {shlex.quote(remote_full_path)} && sync"
+            ok, output = run(chmod_cmd)
+            if not ok:
+                return False, f"chmod失败: {output}"
+
+            sftp.close()
+            sftp = None
+            ssh_client.close()
+            ssh_client = None
+
+            restart_success, restart_msg = self.restart_media_process(device_ip)
+            if not restart_success:
+                return False, f"{label}已替换到 {remote_full_path}，但 multi_media 重启失败: {restart_msg}"
+
+            return True, f"{label}已替换到 {remote_full_path}，chmod 755 已完成，multi_media 已重启"
+        except Exception as e:
+            log_manager.error(f"[RUNTIME] 替换{component_type}失败: {str(e)}", exc_info=True)
+            return False, f"替换运行时组件失败: {str(e)}"
+        finally:
+            try:
+                if sftp:
+                    sftp.close()
+                if ssh_client:
+                    ssh_client.close()
+            except Exception:
+                pass
     
     def pull_config(self, config_filename, device_ip, local_path=None):
         """从设备下载配置文件
@@ -459,6 +869,11 @@ class DeviceManager:
         
         try:
             remote_path = f"/oem/usr/models/{config_filename}"
+
+            adb_success, adb_result = self._pull_via_adb(remote_path, local_path)
+            if adb_success:
+                return True, local_path
+            log_manager.warning(f"[ADB] config pull unavailable, fallback to SSH: {adb_result}")
             
             # 使用SSHClient下载
             ssh_client = paramiko.SSHClient()
@@ -565,18 +980,11 @@ class DeviceManager:
             if result.returncode != 0:
                 return False, error or output or f"adb push返回码: {result.returncode}"
 
-            stat_success, stat_output = self.run_adb_shell_command(
-                f"stat -c %s {shlex.quote(remote_full_path)}",
-                device_id=device_id,
-                timeout=10,
-            )
-            if stat_success:
-                try:
-                    uploaded_size = int(str(stat_output).strip().splitlines()[-1])
-                    if uploaded_size != file_size:
-                        return False, f"ADB上传验证失败: 本地={file_size}, 远程={uploaded_size}"
-                except (ValueError, IndexError):
-                    log_manager.warning(f"[VIDEO] ADB文件大小解析失败: {stat_output}")
+            uploaded_size, stat_output = self._get_adb_file_size(device_id, remote_full_path)
+            if uploaded_size is not None and uploaded_size != file_size:
+                return False, f"ADB上传验证失败: 本地={file_size}, 远程={uploaded_size}"
+            if uploaded_size is None:
+                log_manager.warning(f"[VIDEO] ADB文件大小校验跳过: {stat_output}")
 
             if progress_callback:
                 progress_callback(file_size, file_size)
@@ -588,7 +996,36 @@ class DeviceManager:
     def list_device_videos(self, device_ip):
         """列出设备 /userdata 目录下的视频文件。"""
         try:
-            if not self.ssh_client:
+            device_id, adb_msg = self.get_adb_device_id()
+            if device_id:
+                command = (
+                    "find /userdata -maxdepth 1 -type f 2>/dev/null | "
+                    "grep -Ei '\\.(h264|264|h265|265|hevc|mp4|ts|mkv|avi|mov)$' | "
+                    "while read f; do ls -lh \"$f\"; done"
+                )
+                adb_success, adb_output = self.run_adb_shell_command(command, device_id=device_id, timeout=20)
+                if adb_success:
+                    videos = []
+                    for line in adb_output.strip().splitlines():
+                        parts = line.split()
+                        if len(parts) < 9:
+                            continue
+                        remote_path = parts[-1]
+                        videos.append(
+                            {
+                                "name": os.path.basename(remote_path),
+                                "path": remote_path,
+                                "size": parts[4],
+                                "mtime": " ".join(parts[5:8]),
+                                "raw": line,
+                            }
+                        )
+                    return True, f"找到 {len(videos)} 个视频文件", videos
+                log_manager.warning(f"[ADB] list videos failed, fallback to SSH: {adb_output}")
+            else:
+                log_manager.info(f"[ADB] list videos skipped: {adb_msg}")
+
+            if not self._usb_adb_available() and not self.ssh_client:
                 self.connect_ssh(device_ip)
 
             command = (
@@ -620,10 +1057,73 @@ class DeviceManager:
             log_manager.error(f"[VIDEO] 获取设备视频列表失败: {str(e)}", exc_info=True)
             return False, f"获取设备视频列表失败: {str(e)}", []
 
+    def list_device_tracking_jsons(self, device_ip):
+        """列出设备 /userdata 目录下的追踪 JSON 文件，按修改时间倒序。"""
+        try:
+            device_id, adb_msg = self.get_adb_device_id()
+            if device_id:
+                adb_success, adb_output = self.run_adb_shell_command(
+                    "ls -lt /userdata/*.json 2>/dev/null || true",
+                    device_id=device_id,
+                    timeout=20,
+                )
+                if adb_success:
+                    json_files = []
+                    for line in adb_output.strip().splitlines():
+                        parts = line.split()
+                        if len(parts) < 9:
+                            continue
+                        remote_path = parts[-1]
+                        json_files.append(
+                            {
+                                "name": os.path.basename(remote_path),
+                                "path": remote_path,
+                                "size": parts[4],
+                                "mtime": " ".join(parts[5:8]),
+                                "raw": line,
+                            }
+                        )
+                    return True, f"找到 {len(json_files)} 个追踪JSON文件", json_files
+                log_manager.warning(f"[ADB] list tracking json failed, fallback to SSH: {adb_output}")
+            else:
+                log_manager.info(f"[ADB] list tracking json skipped: {adb_msg}")
+
+            if not self._usb_adb_available() and not self.ssh_client:
+                self.connect_ssh(device_ip)
+
+            command = "ls -lt /userdata/*.json 2>/dev/null || true"
+            success, output = self.execute_ssh_command(command)
+            if not success:
+                return False, f"获取追踪JSON列表失败: {output}", []
+
+            json_files = []
+            for line in output.strip().splitlines():
+                parts = line.split()
+                if len(parts) < 9:
+                    continue
+                remote_path = parts[-1]
+                json_files.append(
+                    {
+                        "name": os.path.basename(remote_path),
+                        "path": remote_path,
+                        "size": parts[4],
+                        "mtime": " ".join(parts[5:8]),
+                        "raw": line,
+                    }
+                )
+            return True, f"找到 {len(json_files)} 个追踪JSON文件", json_files
+        except Exception as e:
+            log_manager.error(f"[VIDEO] 获取追踪JSON列表失败: {str(e)}", exc_info=True)
+            return False, f"获取追踪JSON列表失败: {str(e)}", []
+
     def download_remote_file(self, device_ip, remote_path, local_path, progress_callback=None):
         """通过 SFTP 下载设备文件。"""
         ssh_client = None
         sftp = None
+        adb_success, adb_result = self._pull_via_adb(remote_path, local_path, progress_callback)
+        if adb_success:
+            return True, local_path
+        log_manager.warning(f"[ADB] file pull unavailable, fallback to SSH: {adb_result}")
         try:
             ssh_client = paramiko.SSHClient()
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -782,10 +1282,12 @@ class DeviceManager:
     def list_models(self, device_ip, connection_type='SSH'):
         """列出设备上的模型文件"""
         try:
-            if connection_type == 'SSH':
-                return self._list_models_ssh(device_ip)
-            else:  # ADB
-                return self._list_models_adb(device_ip)
+            models = self._list_models_adb(device_ip)
+            if models:
+                return models
+            if connection_type != 'SSH':
+                return models
+            return self._list_models_ssh(device_ip)
         except Exception as e:
             print(f"获取模型列表失败: {e}")
             return []
@@ -793,7 +1295,7 @@ class DeviceManager:
     def _list_models_ssh(self, device_ip):
         """通过SSH列出模型"""
         try:
-            if not self.ssh_client:
+            if not self._usb_adb_available() and not self.ssh_client:
                 self.connect_ssh(device_ip)
                 
             command = "ls -lh /oem/usr/models/*.rknn"
@@ -821,27 +1323,16 @@ class DeviceManager:
     def _list_models_adb(self, device_ip):
         """通过ADB列出模型"""
         try:
-            import subprocess
-            
-            # 连接到设备
-            result = subprocess.run(
-                ['adb', 'connect', device_ip],
-                capture_output=True,
-                text=True,
-                timeout=10
+            device_id, msg = self.get_adb_device_id()
+            if not device_id:
+                log_manager.info(f"[ADB] list models skipped: {msg}")
+                return []
+
+            result = _run_subprocess_text(
+                ['adb', '-s', device_id, 'shell', 'ls', '-lh', '/oem/usr/models/*.rknn'],
+                timeout=10,
             )
-            
-            # 列出模型文件
-            result = subprocess.run(
-                ['adb', '-s', device_ip, 'shell', 'ls', '-lh', '/oem/usr/models/*.rknn'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            
-            # 断开连接
-            subprocess.run(['adb', 'disconnect', device_ip], capture_output=True, timeout=5)
-            
+
             if result.returncode == 0 and result.stdout.strip():
                 models = []
                 for line in result.stdout.strip().split('\n'):
@@ -869,7 +1360,7 @@ class DeviceManager:
     def delete_model(self, model_name, device_ip):
         """从设备删除模型文件"""
         try:
-            if not self.ssh_client:
+            if not self._usb_adb_available() and not self.ssh_client:
                 self.connect_ssh(device_ip)
             
             remote_path = f"/oem/usr/models/{model_name}"
@@ -889,7 +1380,7 @@ class DeviceManager:
     def check_disk_space(self, device_ip, path='/oem'):
         """检查设备磁盘空间"""
         try:
-            if not self.ssh_client:
+            if not self._usb_adb_available() and not self.ssh_client:
                 self.connect_ssh(device_ip)
             
             # 执行df命令检查磁盘空间
@@ -932,7 +1423,7 @@ class DeviceManager:
     def get_model_sizes(self, device_ip):
         """获取所有模型文件的大小信息"""
         try:
-            if not self.ssh_client:
+            if not self._usb_adb_available() and not self.ssh_client:
                 self.connect_ssh(device_ip)
             
             # 列出所有模型文件及其大小
@@ -963,8 +1454,23 @@ class DeviceManager:
 
     def restart_media_process(self, device_ip, extra_env=None):
         """重启multi_media进程"""
+        device_id, adb_msg = self.get_adb_device_id()
+        if device_id:
+            adb_success, adb_restart_msg = self._restart_media_process_via_adb(
+                device_id,
+                extra_env=extra_env,
+            )
+            if adb_success:
+                self.current_adb_device_id = device_id
+                self.connection_mode = "adb"
+                return True, adb_restart_msg
+            log_manager.error(f"[ADB] restart multi_media failed: {adb_restart_msg}")
+            return False, adb_restart_msg
+        else:
+            log_manager.info(f"[ADB] restart multi_media skipped: {adb_msg}")
+
         try:
-            if not self.ssh_client:
+            if not self._usb_adb_available() and not self.ssh_client:
                 self.connect_ssh(device_ip)
             
             log_manager.info(f"[进程] 正在重启设备 {device_ip} 上的multi_media进程...")
@@ -994,14 +1500,20 @@ class DeviceManager:
             # 确保日志目录存在
             self.execute_ssh_command(f"mkdir -p {log_dir}")
             
-            env_parts = ["export LD_LIBRARY_PATH=/oem/usr/lib:/lib"]
+            env_parts = [
+                "export TARGET_DIR=/oem",
+                "export LD_LIBRARY_PATH=/oem/usr/lib:/lib:${LD_LIBRARY_PATH:-}",
+                "export PATH=/oem/usr/bin:/bin:${PATH:-}",
+            ]
             for key, value in (extra_env or {}).items():
                 env_parts.append(f"export {key}={shlex.quote(str(value))}")
 
             start_command = (
-                " && ".join(env_parts) + " && "
-                f"exec setsid /oem/usr/bin/multi_media "
-                f"> {log_file} 2>&1 < /dev/null &"
+                "; ".join(env_parts) + "; "
+                "rm -f /tmp/multi_media.pid; "
+                "cd /oem/usr/bin || exit 1; "
+                "start-stop-daemon -S -b -m -p /tmp/multi_media.pid "
+                f"-x /oem/usr/bin/multi_media > {shlex.quote(log_file)} 2>&1"
             )
             log_manager.info(f"[进程] 执行启动命令: {start_command}")
             log_manager.info(f"[进程] 日志文件: {log_file}")
@@ -1031,7 +1543,7 @@ class DeviceManager:
     def kill_media_process(self, device_ip):
         """停止multi_media进程"""
         try:
-            if not self.ssh_client:
+            if not self._usb_adb_available() and not self.ssh_client:
                 self.connect_ssh(device_ip)
                 
             command = "killall multi_media"
@@ -1050,7 +1562,7 @@ class DeviceManager:
         info = {}
         
         try:
-            if not self.ssh_client:
+            if not self._usb_adb_available() and not self.ssh_client:
                 self.connect_ssh(device_ip)
                 
             # 获取CPU信息

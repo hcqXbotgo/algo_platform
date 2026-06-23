@@ -154,6 +154,10 @@ class ModelConfigTab:
         action_layout.addWidget(parent.track_btn)
         task_layout.addRow(action_layout)
 
+        parent.tracking_runtime_label = QLabel("追踪未启动")
+        parent.tracking_runtime_label.setStyleSheet("color: #2c3e50; padding: 4px; font-weight: bold;")
+        task_layout.addRow("运行时间:", parent.tracking_runtime_label)
+
         parent.is_tracking = False
         task_group.setLayout(task_layout)
         layout.addWidget(task_group)
@@ -285,6 +289,38 @@ class PerformanceTab:
         
         process_group.setLayout(process_layout)
         layout.addWidget(process_group)
+
+        runtime_group = QGroupBox("运行时组件更新")
+        runtime_layout = QFormLayout()
+
+        media_layout = QHBoxLayout()
+        parent.multi_media_file_edit = QLineEdit()
+        parent.multi_media_file_edit.setReadOnly(True)
+        browse_media_btn = QPushButton("浏览...")
+        browse_media_btn.clicked.connect(parent.browse_multi_media_file)
+        replace_media_btn = QPushButton("替换multi_media")
+        replace_media_btn.clicked.connect(parent.replace_multi_media_on_device)
+        replace_media_btn.setStyleSheet("background-color: #FF9800; color: white;")
+        media_layout.addWidget(parent.multi_media_file_edit, 1)
+        media_layout.addWidget(browse_media_btn)
+        media_layout.addWidget(replace_media_btn)
+        runtime_layout.addRow("multi_media:", media_layout)
+
+        sdk_layout = QHBoxLayout()
+        parent.sdk_library_file_edit = QLineEdit()
+        parent.sdk_library_file_edit.setReadOnly(True)
+        browse_sdk_btn = QPushButton("浏览...")
+        browse_sdk_btn.clicked.connect(parent.browse_sdk_library_file)
+        replace_sdk_btn = QPushButton("替换算法库SDK")
+        replace_sdk_btn.clicked.connect(parent.replace_sdk_library_on_device)
+        replace_sdk_btn.setStyleSheet("background-color: #2196F3; color: white;")
+        sdk_layout.addWidget(parent.sdk_library_file_edit, 1)
+        sdk_layout.addWidget(browse_sdk_btn)
+        sdk_layout.addWidget(replace_sdk_btn)
+        runtime_layout.addRow("算法库SDK:", sdk_layout)
+
+        runtime_group.setLayout(runtime_layout)
+        layout.addWidget(runtime_group)
         
         # 实时数据显示
         data_group = QGroupBox("实时数据")
@@ -521,8 +557,33 @@ class VideoTab:
         # 追踪结果合成
         merge_group = QGroupBox("追踪结果合成与播放")
         merge_layout = QVBoxLayout()
+        json_form = QFormLayout()
+
+        local_json_layout = QHBoxLayout()
+        parent.tracking_json_file_edit = QLineEdit()
+        parent.tracking_json_file_edit.setReadOnly(True)
+        browse_json_btn = QPushButton("浏览...")
+        browse_json_btn.clicked.connect(parent.browse_tracking_json_file)
+        clear_json_btn = QPushButton("清除")
+        clear_json_btn.clicked.connect(parent.clear_tracking_json_file)
+        local_json_layout.addWidget(parent.tracking_json_file_edit, 1)
+        local_json_layout.addWidget(browse_json_btn)
+        local_json_layout.addWidget(clear_json_btn)
+        json_form.addRow("本地JSON:", local_json_layout)
+
+        remote_json_layout = QHBoxLayout()
+        parent.tracking_json_combo = QComboBox()
+        parent.tracking_json_combo.setEditable(True)
+        parent.tracking_json_combo.addItem("自动推断: 与视频同名 _detections.json", None)
+        refresh_json_btn = QPushButton("刷新JSON")
+        refresh_json_btn.clicked.connect(parent.refresh_device_tracking_jsons)
+        remote_json_layout.addWidget(parent.tracking_json_combo, 1)
+        remote_json_layout.addWidget(refresh_json_btn)
+        json_form.addRow("设备JSON:", remote_json_layout)
+        merge_layout.addLayout(json_form)
+
         merge_btn_layout = QHBoxLayout()
-        pull_merge_btn = QPushButton("拉取追踪JSON并合成带框视频")
+        pull_merge_btn = QPushButton("合成带框视频")
         pull_merge_btn.clicked.connect(parent.merge_tracking_video)
         parent.open_merged_video_btn = QPushButton("播放合成视频")
         parent.open_merged_video_btn.clicked.connect(parent.play_merged_video)

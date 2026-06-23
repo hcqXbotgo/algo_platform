@@ -7,6 +7,8 @@
 
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -42,6 +44,8 @@ class FileTransferWorker(QObject):
                 self._push_model()
             elif self.operation_type == "push_config":
                 self._push_config()
+            elif self.operation_type == "replace_runtime_component":
+                self._replace_runtime_component()
             elif self.operation_type == "delete_model":
                 self._delete_model()
             else:
@@ -98,6 +102,21 @@ class FileTransferWorker(QObject):
                     os.remove(config_file)
                 except OSError:
                     log_manager.warning(f"[WORKER] 临时配置文件清理失败: {config_file}")
+
+    def _replace_runtime_component(self):
+        local_file = self.kwargs.get("local_file")
+        device_ip = self.kwargs.get("device_ip")
+        component_type = self.kwargs.get("component_type")
+
+        self.progress.emit(10, "正在连接设备...")
+        self.progress.emit(35, "正在上传运行时组件...")
+        success, msg = self.device_manager.replace_runtime_component(
+            local_file,
+            device_ip,
+            component_type,
+        )
+        self.progress.emit(100, "完成" if success else "失败")
+        self.finished.emit(success, msg)
 
     def _delete_model(self):
         model_name = self.kwargs.get("model_name")
@@ -218,19 +237,50 @@ class DeviceVideoListWorker(QObject):
             self.finished.emit(False, str(e), [])
 
 
+class DeviceTrackingJsonListWorker(QObject):
+    """后台读取设备 /userdata 追踪 JSON 文件。"""
+
+    finished = pyqtSignal(bool, str, list)
+
+    def __init__(self, device_manager, device_ip):
+        super().__init__()
+        self.device_manager = device_manager
+        self.device_ip = device_ip
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            success, msg, json_files = self.device_manager.list_device_tracking_jsons(self.device_ip)
+            self.finished.emit(success, msg, json_files)
+        except Exception as e:
+            log_manager.error(f"[VIDEO] 刷新追踪JSON列表失败: {str(e)}", exc_info=True)
+            self.finished.emit(False, str(e), [])
+
+
 class DetectionMergeWorker(QObject):
     """拉取追踪结果并调用 merge_detections.py 合成带框视频。"""
 
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str, str)
 
-    def __init__(self, device_manager, device_ip, remote_video_path, workspace_dir, local_video_path=None):
+    def __init__(
+        self,
+        device_manager,
+        device_ip,
+        remote_video_path,
+        workspace_dir,
+        local_video_path=None,
+        remote_json_path=None,
+        local_json_path=None,
+    ):
         super().__init__()
         self.device_manager = device_manager
         self.device_ip = device_ip
         self.remote_video_path = remote_video_path
         self.workspace_dir = workspace_dir
         self.local_video_path = local_video_path
+        self.remote_json_path = remote_json_path
+        self.local_json_path = local_json_path
         self.cancelled = False
 
     def cancel(self):
@@ -391,6 +441,61 @@ class DetectionMergeWorker(QObject):
             return False, f"合成脚本退出码 {rc}\n命令: {cmd_text}\n脚本输出:\n{detail}"
         return True, output_path
 
+    def _select_tracking_logs(self, remote_logs, stem, remote_json):
+        tokens = []
+        for value in (
+            stem,
+            os.path.splitext(os.path.basename(remote_json or ""))[0],
+            os.path.splitext(os.path.basename(self.remote_video_path or ""))[0],
+        ):
+            value = (value or "").lower()
+            if not value:
+                continue
+            tokens.append(value)
+            if value.endswith("_detections"):
+                tokens.append(value[: -len("_detections")])
+
+        matched = []
+        for path in remote_logs:
+            base = os.path.basename(path).lower()
+            if any(token and token in base for token in tokens):
+                matched.append(path)
+        return matched[:5] if matched else remote_logs[:3]
+
+    def _download_tracking_logs(self, local_dir, stem, remote_json):
+        try:
+            success, output = self.device_manager.execute_ssh_command(
+                "ls -1t /userdata/logs/tracking/* 2>/dev/null | head -20 || true",
+                timeout=20,
+            )
+            if not success:
+                log_manager.warning(f"[VIDEO] list tracking logs failed: {output}")
+                return 0
+
+            remote_logs = [line.strip() for line in output.splitlines() if line.strip().startswith("/")]
+            selected_logs = self._select_tracking_logs(remote_logs, stem, remote_json)
+            if not selected_logs:
+                self.progress.emit(52, "未找到可拉取的追踪算法日志")
+                return 0
+
+            log_dir = os.path.join(local_dir, "tracking_logs")
+            os.makedirs(log_dir, exist_ok=True)
+            downloaded = 0
+            for index, remote_log in enumerate(selected_logs, start=1):
+                local_log = os.path.join(log_dir, os.path.basename(remote_log))
+                self.progress.emit(51 + min(index, 3), f"正在拉取追踪算法日志: {os.path.basename(remote_log)}")
+                success, msg = self._download(remote_log, local_log, 51, 54)
+                if success:
+                    downloaded += 1
+                else:
+                    log_manager.warning(f"[VIDEO] download tracking log failed: {remote_log}, {msg}")
+            if downloaded:
+                self.progress.emit(54, f"已保存 {downloaded} 个追踪算法日志")
+            return downloaded
+        except Exception as e:
+            log_manager.warning(f"[VIDEO] pull tracking logs failed: {e}")
+            return 0
+
     @pyqtSlot()
     def run(self):
         try:
@@ -405,7 +510,7 @@ class DetectionMergeWorker(QObject):
             os.makedirs(local_dir, exist_ok=True)
 
             local_video = self._find_existing_video(video_name)
-            remote_json = self._remote_detection_path()
+            remote_json = self.remote_json_path or self._remote_detection_path()
             local_json = os.path.join(local_dir, os.path.basename(remote_json))
             output_video = os.path.join(local_dir, f"{stem}_overlay.mp4")
 
@@ -419,12 +524,19 @@ class DetectionMergeWorker(QObject):
                     self.finished.emit(False, msg, "")
                     return
 
-            self.progress.emit(36, "正在拉取追踪JSON...")
-            success, msg = self._download(remote_json, local_json, 36, 50)
-            if not success:
-                self.finished.emit(False, f"追踪JSON下载失败: {remote_json}\n{msg}", "")
-                return
+            if self.local_json_path and os.path.isfile(self.local_json_path):
+                local_json = os.path.join(local_dir, os.path.basename(self.local_json_path))
+                if os.path.abspath(self.local_json_path) != os.path.abspath(local_json):
+                    shutil.copy2(self.local_json_path, local_json)
+                self.progress.emit(50, f"使用本地追踪JSON: {self.local_json_path}")
+            else:
+                self.progress.emit(36, f"正在拉取追踪JSON: {remote_json}")
+                success, msg = self._download(remote_json, local_json, 36, 50)
+                if not success:
+                    self.finished.emit(False, f"追踪JSON下载失败: {remote_json}\n{msg}", "")
+                    return
 
+            log_count = self._download_tracking_logs(local_dir, stem, remote_json)
             total_frames = self._probe_total_frames(local_video)
             success, msg = self._run_merge(local_json, local_video, output_video, total_frames)
             if not success:
@@ -432,7 +544,10 @@ class DetectionMergeWorker(QObject):
                 return
 
             self.progress.emit(100, "合成完成")
-            self.finished.emit(True, "合成完成", output_video)
+            done_msg = "合成完成"
+            if log_count:
+                done_msg += f"，已拉取 {log_count} 个追踪算法日志"
+            self.finished.emit(True, done_msg, output_video)
         except Exception as e:
             log_manager.error(f"[VIDEO] 合成带框视频失败: {str(e)}", exc_info=True)
             self.finished.emit(False, str(e), "")
@@ -453,9 +568,15 @@ class LogDownloadWorker(QObject):
         self._ssh = None
         self._sftp = None
         self._remote_file = None
+        self._process = None
 
     def cancel(self):
         self.cancelled = True
+        try:
+            if self._process and self._process.poll() is None:
+                self._process.terminate()
+        except Exception:
+            pass
         for handle in (self._remote_file, self._sftp, self._ssh):
             try:
                 if handle:
@@ -467,6 +588,13 @@ class LogDownloadWorker(QObject):
     def run(self):
         success = False
         try:
+            adb_success, adb_msg = self._run_adb_pull()
+            if adb_success:
+                success = True
+                self.finished.emit(True, "下载完成", self.local_path)
+                return
+            log_manager.warning(f"[LOG] ADB下载不可用，回退SSH: {adb_msg}")
+
             import paramiko
 
             self._ssh = paramiko.SSHClient()
@@ -475,7 +603,9 @@ class LogDownloadWorker(QObject):
             self._sftp = self._ssh.open_sftp()
 
             total = self._sftp.stat(self.remote_path).st_size
-            os.makedirs(os.path.dirname(self.local_path), exist_ok=True)
+            local_dir = os.path.dirname(os.path.abspath(self.local_path))
+            if local_dir:
+                os.makedirs(local_dir, exist_ok=True)
 
             transferred = 0
             start_time = time.monotonic()
@@ -528,9 +658,126 @@ class LogDownloadWorker(QObject):
                     pass
             self._sftp = None
             self._ssh = None
+            self._process = None
 
             if not success and not self.cancelled:
                 self._cleanup_partial()
+
+    def _get_usb_adb_device_id(self):
+        try:
+            result = subprocess.run(
+                ["adb", "devices"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=5,
+            )
+        except FileNotFoundError:
+            return None, "ADB未安装或未加入PATH"
+        except subprocess.TimeoutExpired:
+            return None, "ADB设备检测超时"
+        except Exception as e:
+            return None, f"ADB设备检测失败: {e}"
+
+        if result.returncode != 0:
+            return None, (result.stderr or result.stdout or "").strip()
+        for line in result.stdout.strip().splitlines()[1:]:
+            if "\tdevice" in line:
+                device_id = line.split("\t", 1)[0].strip()
+                if device_id:
+                    return device_id, "OK"
+        return None, "未检测到USB ADB设备"
+
+    def _adb_shell(self, device_id, command, timeout=10):
+        return subprocess.run(
+            ["adb", "-s", device_id, "shell", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=timeout,
+        )
+
+    def _run_adb_pull(self):
+        device_id, msg = self._get_usb_adb_device_id()
+        if not device_id:
+            return False, msg
+
+        try:
+            stat = self._adb_shell(
+                device_id,
+                f"wc -c < {shlex.quote(self.remote_path)}",
+                timeout=10,
+            )
+            if stat.returncode != 0:
+                return False, (stat.stderr or stat.stdout or "ADB获取文件大小失败").strip()
+            try:
+                total = int((stat.stdout or "").strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                total = 0
+
+            local_dir = os.path.dirname(os.path.abspath(self.local_path))
+            if local_dir:
+                os.makedirs(local_dir, exist_ok=True)
+            if os.path.exists(self.local_path):
+                os.remove(self.local_path)
+
+            self.progress.emit(0, 0.0, total / 1024 / 1024 if total else 0.0, 0.0)
+            self._process = subprocess.Popen(
+                ["adb", "-s", device_id, "pull", self.remote_path, self.local_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+            )
+
+            start_time = time.monotonic()
+            last_emit = start_time
+            last_bytes = 0
+            while self._process.poll() is None:
+                if self.cancelled:
+                    self._process.terminate()
+                    raise InterruptedError("下载已取消")
+
+                now = time.monotonic()
+                if now - last_emit >= 0.2:
+                    transferred = os.path.getsize(self.local_path) if os.path.exists(self.local_path) else 0
+                    elapsed = max(now - last_emit, 0.001)
+                    speed = (transferred - last_bytes) / elapsed
+                    percent = int(transferred / total * 100) if total else 0
+                    self.progress.emit(
+                        min(percent, 99),
+                        transferred / 1024 / 1024,
+                        total / 1024 / 1024 if total else 0.0,
+                        max(speed, 0.0) / 1024 / 1024,
+                    )
+                    last_emit = now
+                    last_bytes = transferred
+                time.sleep(0.05)
+
+            stdout, stderr = self._process.communicate(timeout=5)
+            if self._process.returncode != 0:
+                return False, (stderr or stdout or f"adb pull返回码 {self._process.returncode}").strip()
+
+            transferred = os.path.getsize(self.local_path) if os.path.exists(self.local_path) else 0
+            if total and transferred != total:
+                return False, f"ADB下载校验失败: 本地={transferred}, 远端={total}"
+
+            avg_speed = transferred / max(time.monotonic() - start_time, 0.001)
+            self.progress.emit(
+                100,
+                transferred / 1024 / 1024,
+                (total or transferred) / 1024 / 1024,
+                avg_speed / 1024 / 1024,
+            )
+            return True, self.local_path
+        except InterruptedError:
+            self._cleanup_partial()
+            raise
+        except Exception as e:
+            return False, f"ADB下载失败: {e}"
 
     def _cleanup_partial(self):
         try:

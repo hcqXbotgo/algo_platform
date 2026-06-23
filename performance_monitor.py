@@ -9,6 +9,7 @@ import threading
 import time
 import os
 import re
+import subprocess
 from datetime import datetime
 
 from device_manager import DeviceManager, connect_ssh_with_retry
@@ -16,10 +17,12 @@ from device_manager import DeviceManager, connect_ssh_with_retry
 
 class PerformanceMonitor:
     """性能监控器"""
-    
+
     def __init__(self):
         self.monitoring = False
         self.ssh_client = None
+        self.adb_device_id = None
+        self.connection_mode = None
         self.device_ip = None
         self.ddr_freq = 1848
         self.history_data = {
@@ -57,7 +60,7 @@ class PerformanceMonitor:
         )
         if os.path.exists(bundled_tool):
             self.local_tool_path = bundled_tool
-        
+
         # DDR监控相关
         self.ddr_process = None  # 阻塞命令的SSH通道
         self.ddr_reader_thread = None  # 读取输出的线程
@@ -65,10 +68,10 @@ class PerformanceMonitor:
         self.ddr_status = "未启动"
         self.ddr_last_error = ""
         self.ddr_output_tail = []
-        
+
         # NPU监控相关
         self.latest_npu_data = {'core0': 0.0, 'core1': 0.0, 'avg': 0.0}
-        
+
     def set_tool_path(self, local_path):
         """设置本地工具文件路径"""
         if os.path.exists(local_path):
@@ -98,10 +101,52 @@ class PerformanceMonitor:
             return fallback_tool
 
         return None
-        
+
+    def _get_usb_adb_device_id(self):
+        try:
+            result = subprocess.run(
+                ["adb", "devices"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=5,
+            )
+        except Exception as e:
+            return None, str(e)
+
+        if result.returncode != 0:
+            return None, (result.stderr or result.stdout or "").strip()
+        for line in result.stdout.strip().splitlines()[1:]:
+            if "\tdevice" in line:
+                device_id = line.split("\t", 1)[0].strip()
+                if device_id:
+                    return device_id, "OK"
+        return None, "未检测到USB ADB设备"
+
+    def _run_adb_shell_command(self, command, timeout=15):
+        if not self.adb_device_id:
+            return False, "ADB未连接"
+        try:
+            result = subprocess.run(
+                ["adb", "-s", self.adb_device_id, "shell", command],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=timeout,
+            )
+            output = (result.stdout or "").strip()
+            error = (result.stderr or "").strip()
+            if result.returncode == 0:
+                return True, output
+            return False, error or output or f"返回码 {result.returncode}"
+        except Exception as e:
+            return False, str(e)
+
     def start_monitoring(self, device_ip, ddr_freq=1848, interval=2, progress_callback=None):
         """开始监控
-        
+
         Args:
             device_ip: 设备IP地址
             ddr_freq: DDR频率(MHz)
@@ -115,30 +160,37 @@ class PerformanceMonitor:
         self.ddr_status = "初始化中"
         self.ddr_last_error = ""
         self.ddr_output_tail = []
-        
-        # 建立SSH连接
+
+        # 建立连接：USB ADB 优先，ADB 不可用再回退 SSH。
         try:
-            if progress_callback:
-                progress_callback(20, "正在建立SSH连接...")
-            print(f"[性能监控] 正在连接设备 {device_ip}...")
-            
-            self.ssh_client, ssh_success, ssh_msg = connect_ssh_with_retry(device_ip)
-            if not ssh_success:
-                print(f"[性能监控] SSH直连失败，尝试通过ADB启动SSH服务: {ssh_msg}")
-                adb_success, adb_msg = DeviceManager().ensure_ssh_service_via_adb()
-                if adb_success:
-                    self.ssh_client, ssh_success, ssh_msg = connect_ssh_with_retry(device_ip, retries=3)
+            self.adb_device_id, adb_msg = self._get_usb_adb_device_id()
+            if self.adb_device_id:
+                self.connection_mode = "adb"
+                self.ssh_client = None
+                if progress_callback:
+                    progress_callback(40, f"ADB连接成功: {self.adb_device_id}")
+                print(f"[性能监控] ADB连接成功: {self.adb_device_id}")
+            else:
+                self.connection_mode = "ssh"
+                if progress_callback:
+                    progress_callback(20, "正在建立SSH连接...")
+                print(f"[性能监控] ADB不可用({adb_msg})，正在连接设备 {device_ip} 的SSH...")
+
+                self.ssh_client, ssh_success, ssh_msg = connect_ssh_with_retry(device_ip)
                 if not ssh_success:
-                    raise Exception(f"{ssh_msg}; ADB启动SSH服务: {adb_msg}")
-            
-            if progress_callback:
-                progress_callback(40, "SSH连接成功")
-            print(f"[性能监控] SSH连接成功")
-            
+                    print(f"[性能监控] SSH直连失败，尝试通过ADB启动SSH服务: {ssh_msg}")
+                    adb_success, adb_start_msg = DeviceManager().ensure_ssh_service_via_adb()
+                    if adb_success:
+                        self.ssh_client, ssh_success, ssh_msg = connect_ssh_with_retry(device_ip, retries=3)
+                    if not ssh_success:
+                        raise Exception(f"{ssh_msg}; ADB启动SSH服务: {adb_start_msg}")
+
+                if progress_callback:
+                    progress_callback(40, "SSH连接成功")
+                print(f"[性能监控] SSH连接成功")
         except Exception as e:
             self.monitoring = False
-            raise Exception(f"SSH连接失败: {str(e)}")
-            
+            raise Exception(f"设备连接失败: {str(e)}")
         # 清空历史数据
         self.history_data = {
             'timestamps': [],
@@ -152,7 +204,7 @@ class PerformanceMonitor:
             'ddr_total': [],       # DDR总带宽
             'ddr_modules': []      # 各模块带宽: {'cpu': x, 'isp': y, 'npu': z, ...}
         }
-        
+
         # 清空完整历史数据
         self.full_history_data = {
             'timestamps': [],
@@ -166,7 +218,7 @@ class PerformanceMonitor:
             'ddr_total': [],
             'ddr_modules': []
         }
-        
+
         # 检查DDR工具并启动DDR监控。当前函数运行在后台 worker 中，可以同步等待结果。
         if progress_callback:
             progress_callback(50, "检查DDR测试工具...")
@@ -195,18 +247,18 @@ class PerformanceMonitor:
             print("[性能监控] 警告: DDR工具不可用，将跳过DDR监控")
             if progress_callback:
                 progress_callback(90, "DDR工具不可用，跳过DDR监控")
-        
+
         # 启动监控线程
         if progress_callback:
             progress_callback(92, "启动主监控线程...")
-        
+
         self.monitor_thread = threading.Thread(target=self._monitor_loop, args=(interval,))
         self.monitor_thread.daemon = True
         self.monitor_thread.start()
-        
+
         if progress_callback:
             progress_callback(100, "监控已启动！")
-        
+
         print(f"[性能监控] 监控线程已启动")
 
     def _wait_for_ddr_initial_state(self, timeout=2.0):
@@ -219,38 +271,44 @@ class PerformanceMonitor:
                 return False
             time.sleep(0.1)
         return True
-        
+
     def stop_monitoring(self):
         """停止监控"""
         self.monitoring = False
-        
+
         # 停止DDR监控进程
         if self.ddr_process:
             try:
-                self.ddr_process.close()
+                if self.connection_mode == "adb" and hasattr(self.ddr_process, "terminate"):
+                    self.ddr_process.terminate()
+                    try:
+                        self.ddr_process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self.ddr_process.kill()
+                else:
+                    self.ddr_process.close()
                 print("[DDR] 已停止DDR监控进程")
             except:
                 pass
             self.ddr_process = None
 
-        if self.ssh_client:
-            self._execute_command("pkill -f '[r]k-msch-probe-for-user-64bit-1' >/dev/null 2>&1 || true")
+        self._execute_command("pkill -f '[r]k-msch-probe-for-user-64bit-1' >/dev/null 2>&1 || true")
         self.ddr_status = "已停止"
-        
+
         # 等待读取线程结束
         if self.ddr_reader_thread:
             self.ddr_reader_thread.join(timeout=3)
             self.ddr_reader_thread = None
-        
+
         # 停止主监控线程
         if self.monitor_thread:
             self.monitor_thread.join(timeout=5)
-        
+
         # 关闭SSH连接
         if self.ssh_client:
             self.ssh_client.close()
             self.ssh_client = None
-            
+
     def _set_ddr_error(self, message):
         self.ddr_status = "异常"
         self.ddr_last_error = message
@@ -272,28 +330,41 @@ class PerformanceMonitor:
             self._execute_command("pkill -f '[r]k-msch-probe-for-user-64bit-1' >/dev/null 2>&1 || true")
             command = self._build_ddr_command()
             print(f"[DDR] 启动阻塞监控命令: {command}")
-            
-            # 使用exec_command启动阻塞命令
-            # 注意：这里直接使用 ssh_client.exec_command 可能会因为缓冲问题导致读取不及时
-            # 使用 get_transport().open_session() 更底层一些，便于控制
-            self.ddr_process = self.ssh_client.get_transport().open_session()
-            self.ddr_process.get_pty(width=180, height=40)
-            self.ddr_process.exec_command(command)
+
+            if self.connection_mode == "adb":
+                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+                self.ddr_process = subprocess.Popen(
+                    ["adb", "-s", self.adb_device_id, "shell", command],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    bufsize=1,
+                    creationflags=creationflags,
+                )
+            else:
+                # 使用exec_command启动阻塞命令
+                # 注意：这里直接使用 ssh_client.exec_command 可能会因为缓冲问题导致读取不及时
+                # 使用 get_transport().open_session() 更底层一些，便于控制
+                self.ddr_process = self.ssh_client.get_transport().open_session()
+                self.ddr_process.get_pty(width=180, height=40)
+                self.ddr_process.exec_command(command)
             self.ddr_status = "已启动，等待数据"
-            
+
             # 启动读取线程
             self.ddr_reader_thread = threading.Thread(target=self._read_ddr_output)
             self.ddr_reader_thread.daemon = True
             self.ddr_reader_thread.start()
-            
+
             print("[DDR] DDR监控进程已启动")
             return True
-            
+
         except Exception as e:
             self._set_ddr_error(str(e))
             print(f"[DDR] 启动监控失败: {e}")
             return False
-            
+
     def _read_ddr_output(self):
         """持续读取DDR监控输出"""
         buffer = ""
@@ -307,8 +378,27 @@ class PerformanceMonitor:
                 line, buffer = buffer.split('\n', 1)
                 if line.strip():
                     self._record_ddr_line(line.strip())
-        
+
         try:
+            if self.connection_mode == "adb":
+                while self.monitoring and self.ddr_process:
+                    line = self.ddr_process.stdout.readline() if self.ddr_process.stdout else ""
+                    if line:
+                        self._record_ddr_line(line.strip())
+                        continue
+                    if self.ddr_process.poll() is not None:
+                        tail = "; ".join(self.ddr_output_tail[-5:])
+                        if self.monitoring:
+                            rc = self.ddr_process.returncode
+                            if rc == 0:
+                                self.ddr_status = "已退出"
+                            else:
+                                self._set_ddr_error(f"进程退出码 {rc}: {tail}")
+                            print(f"[DDR] ADB监控进程退出: code={rc}, tail={tail}")
+                        break
+                    time.sleep(0.05)
+                return
+
             while self.monitoring and self.ddr_process:
                 has_data = False
                 if self.ddr_process.recv_ready():
@@ -342,7 +432,7 @@ class PerformanceMonitor:
 
                 if not has_data:
                     time.sleep(0.1)  # 短暂休眠避免CPU占用过高
-                    
+
         except Exception as e:
             self._set_ddr_error(str(e))
             print(f"[DDR读取] 异常: {e}")
@@ -352,7 +442,7 @@ class PerformanceMonitor:
         self.ddr_output_tail = self.ddr_output_tail[-20:]
         print(f"[DDR输出] {line}")
         self._parse_ddr_line(line)
-            
+
     def _parse_ddr_line(self, line):
         """解析DDR输出行"""
         try:
@@ -367,18 +457,18 @@ class PerformanceMonitor:
                 self._parse_ddr_total_line(line)
         except Exception as e:
             print(f"[DDR解析] 失败: {e}, 行: {line[:100]}")
-            
+
     def _parse_ddr_bandwidth_line(self, line):
         """解析带宽行，提取各模块数据"""
         try:
             # 提取所有数字（带宽值）
             values = re.findall(r'[\d.]+', line)
-            
+
             if values:
                 # 根据表头顺序: cpu, cci_m1, cci_m2, gmac, isp, vicap, npu, crypto, rga, vpss, gpu, hdcp, vop, ufshc, others, total
-                modules = ['cpu', 'cci_m1', 'cci_m2', 'gmac', 'isp', 'vicap', 'npu', 
+                modules = ['cpu', 'cci_m1', 'cci_m2', 'gmac', 'isp', 'vicap', 'npu',
                           'crypto', 'rga', 'vpss', 'gpu', 'hdcp', 'vop', 'ufshc', 'others', 'total']
-                
+
                 ddr_data = {}
                 for i, module in enumerate(modules):
                     if i < len(values):
@@ -386,15 +476,15 @@ class PerformanceMonitor:
 
                 if 'total' not in ddr_data:
                     ddr_data['total'] = float(values[-1])
-                
+
                 # 保存最新数据
                 self.latest_ddr_data = ddr_data
                 self.ddr_status = "运行中"
                 self.ddr_last_error = ""
-                
+
                 print(f"[DDR] 解析成功 - Total: {ddr_data.get('total', 0):.2f} MB/s, "
                       f"NPU: {ddr_data.get('npu', 0):.2f}, ISP: {ddr_data.get('isp', 0):.2f}")
-                
+
         except Exception as e:
             print(f"[DDR解析] 带宽行解析失败: {e}")
 
@@ -424,13 +514,13 @@ class PerformanceMonitor:
                 npu_load = self._get_npu_load()
                 cpu_usage = self._get_cpu_usage()
                 memory_usage, memory_used_mb, memory_total_mb = self._get_memory_usage()
-                
+
                 # 从DDR实时数据中获取
                 ddr_total = self.latest_ddr_data.get('total', 0.0)
                 ddr_modules = self.latest_ddr_data.copy()
-                
+
                 timestamp = datetime.now().strftime("%H:%M:%S")
-                
+
                 # 详细日志
                 print(f"[性能监控] {timestamp} | "
                       f"NPU(Core0:{self.latest_npu_data['core0']:.1f}%, "
@@ -439,7 +529,7 @@ class PerformanceMonitor:
                       f"CPU: {cpu_usage:.1f}% | "
                       f"MEM: {memory_used_mb:.0f}/{memory_total_mb:.0f} MB ({memory_usage:.1f}%) | "
                       f"DDR总: {ddr_total:.2f} MB/s")
-                
+
                 # 更新历史数据
                 self.history_data['timestamps'].append(timestamp)
                 self.history_data['npu_core0'].append(self.latest_npu_data['core0'])
@@ -451,13 +541,13 @@ class PerformanceMonitor:
                 self.history_data['memory_usage'].append(memory_usage)
                 self.history_data['ddr_total'].append(ddr_total)
                 self.history_data['ddr_modules'].append(ddr_modules)
-                
+
                 # 限制历史数据长度（最多保留100个点）
                 max_len = 100
                 for key in self.history_data:
                     if len(self.history_data[key]) > max_len:
                         self.history_data[key] = self.history_data[key][-max_len:]
-                
+
                 # 更新完整历史数据
                 self.full_history_data['timestamps'].append(timestamp)
                 self.full_history_data['npu_core0'].append(self.latest_npu_data['core0'])
@@ -469,7 +559,7 @@ class PerformanceMonitor:
                 self.full_history_data['memory_usage'].append(memory_usage)
                 self.full_history_data['ddr_total'].append(ddr_total)
                 self.full_history_data['ddr_modules'].append(ddr_modules)
-                
+
                 # 更新最新数据
                 self.latest_data = {
                     'timestamp': timestamp,
@@ -485,23 +575,30 @@ class PerformanceMonitor:
                     'ddr_status': self.ddr_status,
                     'ddr_error': self.ddr_last_error
                 }
-                
+
             except Exception as e:
                 print(f"[性能监控] 数据采集失败: {e}")
                 import traceback
                 traceback.print_exc()
-                
+
             time.sleep(interval)
-            
+
     def get_ddr_module_data(self):
         """获取DDR各模块最新数据"""
         return self.latest_ddr_data.copy()
-        
+
     def _execute_command(self, command):
-        """执行SSH命令"""
+        """执行设备命令，ADB模式走adb shell，SSH模式走exec_command。"""
+        if self.connection_mode == "adb":
+            success, output = self._run_adb_shell_command(command, timeout=15)
+            if success:
+                return output
+            print(f"ADB命令执行失败 [{command}]: {output}")
+            return ""
+
         if not self.ssh_client:
             return ""
-        
+
         try:
             stdin, stdout, stderr = self.ssh_client.exec_command(command)
             exit_status = stdout.channel.recv_exit_status()
@@ -514,16 +611,16 @@ class PerformanceMonitor:
         except Exception as e:
             print(f"命令执行异常 [{command}]: {e}")
             return ""
-            
+
     def _check_tool_exists(self):
         """检查设备上是否存在DDR带宽测试工具"""
         command = f"test -x {self.tool_path} && echo 'exists' || echo 'not_exists'"
         output = self._execute_command(command)
         return output == 'exists'
-        
+
     def _push_tool_to_device(self, progress_callback=None):
         """推送DDR带宽测试工具到设备
-        
+
         Args:
             progress_callback: 进度回调函数，接收(百分比, 消息)参数
         """
@@ -533,70 +630,96 @@ class PerformanceMonitor:
 
         if not os.path.exists(local_tool_path):
             return False, f"本地工具文件不存在: {local_tool_path}"
-        
+
         try:
             print(f"[DDR工具] 开始推送DDR带宽测试工具到设备...")
             if progress_callback:
                 progress_callback(10, "正在建立连接...")
-            
+
             # 获取文件大小
             file_size = os.path.getsize(local_tool_path)
             file_size_mb = file_size / (1024 * 1024)
             print(f"[DDR工具] 文件大小: {file_size_mb:.2f} MB")
-            
+
             if progress_callback:
                 progress_callback(20, f"正在上传工具 ({file_size_mb:.2f} MB)...")
-            
+
+            if self.connection_mode == "adb":
+                success, msg = self._run_adb_shell_command("mkdir -p /userdata", timeout=10)
+                if not success:
+                    return False, f"创建/userdata失败: {msg}"
+
+                result = subprocess.run(
+                    ["adb", "-s", self.adb_device_id, "push", local_tool_path, self.tool_path],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=120,
+                )
+                if result.returncode != 0:
+                    return False, (result.stderr or result.stdout or "adb push失败").strip()
+                if progress_callback:
+                    progress_callback(90, "设置文件权限...")
+                success, msg = self._run_adb_shell_command(f"chmod 755 {self.tool_path} && sync", timeout=10)
+                if not success:
+                    return False, f"chmod失败: {msg}"
+                if progress_callback:
+                    progress_callback(100, "验证文件...")
+                if self._check_tool_exists():
+                    return True, f"工具已通过ADB推送到 {self.tool_path}"
+                return False, "工具推送后验证失败"
+
             if not self.ssh_client:
                 return False, "SSH未连接，无法推送DDR工具"
 
             self._execute_command("mkdir -p /userdata")
             sftp = self.ssh_client.open_sftp()
-            
+
             # 确保目标目录存在
             if progress_callback:
                 progress_callback(30, "检查目标目录...")
-            
+
             try:
                 sftp.stat('/userdata')
             except FileNotFoundError:
                 print("[DDR工具] 错误: /userdata 目录不存在")
                 sftp.close()
                 return False, "/userdata 目录不存在"
-            
+
             # 上传文件（带进度）
             remote_path = self.tool_path
-            
+
             def upload_progress(transferred, total):
                 if progress_callback:
                     percent = 30 + int((transferred / total) * 60)  # 30-90%
                     msg = f"正在上传... {transferred/(1024*1024):.1f}/{total/(1024*1024):.1f} MB"
                     progress_callback(percent, msg)
-            
+
             sftp.put(local_tool_path, remote_path, callback=upload_progress)
-            
+
             if progress_callback:
                 progress_callback(95, "设置文件权限...")
-            
+
             # 设置可执行权限
             sftp.chmod(remote_path, 0o755)
-            
+
             sftp.close()
-            
+
             if progress_callback:
                 progress_callback(100, "验证文件...")
-            
+
             # 验证文件是否成功推送
             if self._check_tool_exists():
                 print(f"[DDR工具] DDR带宽测试工具已成功推送到 {remote_path}")
                 return True, f"工具已推送到 {remote_path}"
             else:
                 return False, "工具推送后验证失败"
-                
+
         except Exception as e:
             print(f"[DDR工具] 推送失败: {str(e)}")
             return False, f"工具推送失败: {str(e)}"
-            
+
     def _ensure_tool_available(self, progress_callback=None):
         """确保DDR带宽测试工具可用"""
         if self._check_tool_exists():
@@ -613,7 +736,7 @@ class PerformanceMonitor:
             print(f"工具推送失败: {msg}")
             return False
         return True
-            
+
     def _get_npu_load(self):
         """获取NPU占用率（分别统计Core0和Core1）"""
         output = self._execute_command("cat /sys/kernel/debug/rknpu/load")
@@ -625,53 +748,53 @@ class PerformanceMonitor:
                 # 提取Core0和Core1的百分比
                 core0_match = re.search(r'Core0:\s*([\d.]+)%', output)
                 core1_match = re.search(r'Core1:\s*([\d.]+)%', output)
-                
+
                 if core0_match and core1_match:
                     core0 = float(core0_match.group(1))
                     core1 = float(core1_match.group(1))
                     avg = (core0 + core1) / 2.0
-                    
+
                     # 保存最新数据
                     self.latest_npu_data = {
                         'core0': core0,
                         'core1': core1,
                         'avg': avg
                     }
-                    
+
                     print(f"[NPU] Core0: {core0:.1f}%, Core1: {core1:.1f}%, 平均: {avg:.1f}%")
                     return avg
             except Exception as e:
                 print(f"[NPU] 解析失败: {e}, 原始输出: {output}")
         return 0.0
-        
+
     def _get_cpu_usage(self):
         """获取CPU占用率"""
         # 使用更可靠的命令 - 直接从 /proc/stat 计算
         output1 = self._execute_command("cat /proc/stat | grep '^cpu '")
         time.sleep(0.5)
         output2 = self._execute_command("cat /proc/stat | grep '^cpu '")
-        
+
         print(f"[CPU] 第一次采样: {output1}")
         print(f"[CPU] 第二次采样: {output2}")
-        
+
         if output1 and output2:
             try:
                 # 解析 /proc/stat 格式: cpu  user nice system idle iowait irq softirq steal
                 vals1 = list(map(int, output1.split()[1:]))
                 vals2 = list(map(int, output2.split()[1:]))
-                
+
                 # 计算差值
                 diffs = [vals2[i] - vals1[i] for i in range(len(vals1))]
                 total = sum(diffs)
                 idle = diffs[3]  # idle是第4个值（索引3）
-                
+
                 if total > 0:
                     cpu_usage = (1 - idle / total) * 100.0
                     print(f"[CPU] 计算结果: {cpu_usage:.1f}%")
                     return cpu_usage
             except Exception as e:
                 print(f"[CPU] 解析失败: {e}")
-        
+
         # 备用方案：使用top命令
         output = self._execute_command("top -bn1 | head -5")
         print(f"[CPU备用] 命令输出: {output[:200]}")
@@ -686,7 +809,7 @@ class PerformanceMonitor:
             except Exception as e:
                 print(f"[CPU备用] 解析失败: {e}")
         return 0.0
-        
+
     def _get_memory_usage(self):
         """获取内存占用率和实际使用量"""
         output = self._execute_command("free -m | grep Mem")
@@ -705,15 +828,15 @@ class PerformanceMonitor:
             except Exception as e:
                 print(f"[内存] 解析失败: {e}, 原始输出: {output}")
         return 0.0, 0.0, 0.0
-        
-        
+
+
     def get_latest_data(self):
         """获取最新的监控数据"""
         return self.latest_data.copy()
-        
+
     def get_history_data(self, use_full_history=False):
         """获取历史数据
-        
+
         Args:
             use_full_history: 是否使用完整历史数据（不限制100个点）
                              默认为False保持向后兼容
@@ -721,16 +844,16 @@ class PerformanceMonitor:
         if use_full_history:
             return self.full_history_data.copy()
         return self.history_data.copy()
-        
+
     def export_data(self, filename="performance_data.csv"):
         """导出历史数据到CSV"""
         import csv
-        
+
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(['时间戳', 'NPU占用(%)', 'CPU占用(%)', '内存占用(%)', 'DDR带宽(MB/s)'])
-                
+
                 for i in range(len(self.full_history_data['timestamps'])):
                     writer.writerow([
                         self.full_history_data['timestamps'][i],
@@ -739,7 +862,7 @@ class PerformanceMonitor:
                         self.full_history_data['memory_usage'][i],
                         self.full_history_data['ddr_total'][i]
                     ])
-                    
+
             return True, f"数据已导出到 {filename}"
         except Exception as e:
             return False, f"导出失败: {str(e)}"

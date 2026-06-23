@@ -54,6 +54,7 @@ from ui_components import (
 from workers import (
     AutoConnectWorker,
     DetectionMergeWorker,
+    DeviceTrackingJsonListWorker,
     DeviceVideoListWorker,
     FileTransferWorker,
     LogDownloadWorker,
@@ -97,11 +98,19 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.ssh_available = False
         self.adb_available = False
         self.current_device_ip = None
+        self.connection_mode = None
+        self.current_adb_device_id = None
         self.local_video_cache = {}
         self.track_modes_config = None
         self.track_modes = []
         self.device_videos = []
         self.available_device_models = []
+        self.device_tracking_jsons = []
+        self.tracking_start_time = None
+        self.tracking_expected_duration = None
+        self.tracking_duration_hint = ""
+        self.tracking_timer = QTimer(self)
+        self.tracking_timer.timeout.connect(self._update_tracking_runtime_label)
         
         # 创建工具栏
         self.create_toolbar()
@@ -143,6 +152,16 @@ class AlgorithmValidationPlatform(QMainWindow):
         setup_action.setToolTip("自动完成：USB连接 → WiFi配置 → SSH设置")
         setup_action.triggered.connect(self.open_device_setup)
         toolbar.addAction(setup_action)
+
+        wired_adb_action = QAction("有线ADB连接", self)
+        wired_adb_action.setToolTip("USB ADB连接设备，不要求设备SSH服务已启动")
+        wired_adb_action.triggered.connect(self.connect_wired_adb)
+        toolbar.addAction(wired_adb_action)
+
+        wireless_ssh_action = QAction("无线SSH连接", self)
+        wireless_ssh_action.setToolTip("通过设备IP连接SSH，适用于无线网络")
+        wireless_ssh_action.triggered.connect(self.connect_wireless_ssh)
+        toolbar.addAction(wireless_ssh_action)
         
         toolbar.addSeparator()
         
@@ -177,6 +196,9 @@ class AlgorithmValidationPlatform(QMainWindow):
                 self.current_device_ip = device_ip
                 self.device_connected = True
                 self.ssh_available = True
+                self.connection_mode = "ssh"
+                self.device_manager.current_device_ip = device_ip
+                self.device_manager.connection_mode = "ssh"
                 
                 # 更新状态显示
                 self.status_label.setText(f"✅ {device_ip}")
@@ -211,6 +233,84 @@ class AlgorithmValidationPlatform(QMainWindow):
                 
                 # 加载追踪模式
                 self.load_track_modes()
+
+    def _set_device_connection_state(self, endpoint, mode, adb_device_id=None):
+        self.current_device_ip = endpoint
+        self.device_connected = True
+        self.connection_mode = mode
+        self.adb_available = mode == "adb" or bool(adb_device_id)
+        self.ssh_available = mode == "ssh"
+        self.current_adb_device_id = adb_device_id
+        self.device_manager.current_device_ip = endpoint
+        self.device_manager.current_adb_device_id = adb_device_id
+        self.device_manager.connection_mode = mode
+
+        mode_text = "USB ADB" if mode == "adb" else "WiFi SSH"
+        self.status_label.setText(f"OK {mode_text}: {endpoint}")
+        self.status_label.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
+
+        if hasattr(self, "rtsp_device_ip_label"):
+            self.rtsp_device_ip_label.setText(str(endpoint))
+            self.rtsp_device_ip_label.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
+        if hasattr(self, "wifi_device_ip_label"):
+            self.wifi_device_ip_label.setText(str(endpoint))
+            self.wifi_device_ip_label.setStyleSheet("color: green; font-weight: bold;")
+
+    def connect_wired_adb(self):
+        """Connect to the device through USB ADB only."""
+        success, msg, device_ip = self.device_manager.connect_adb()
+        if not success:
+            QMessageBox.warning(self, "ADB连接失败", msg)
+            self.statusBar().showMessage(f"ADB连接失败: {msg}", 5000)
+            return
+
+        device_id = self.device_manager.current_adb_device_id
+        endpoint = device_ip or device_id
+        self._set_device_connection_state(endpoint, "adb", adb_device_id=device_id)
+        self.statusBar().showMessage(f"ADB已连接: {device_id}", 3000)
+        log_manager.info(f"[ADB] wired connection ready: device_id={device_id}, ip={device_ip or 'N/A'}")
+
+        if device_ip:
+            self._auto_connect_mqtt(device_ip)
+        self.load_track_modes()
+        self.refresh_device_videos()
+        self.refresh_device_tracking_jsons()
+        QMessageBox.information(self, "ADB连接成功", f"USB ADB已连接\n设备: {device_id}\nIP: {device_ip or '未获取到'}")
+
+    def _get_saved_device_ip(self):
+        try:
+            if os.path.exists(self.device_config_file):
+                with open(self.device_config_file, "r", encoding="utf-8") as f:
+                    return (json.load(f).get("device_ip") or "").strip()
+        except Exception as e:
+            log_manager.warning(f"[CONFIG] failed to read saved device ip: {e}")
+        return ""
+
+    def connect_wireless_ssh(self):
+        """Connect to the device through WiFi SSH."""
+        default_ip = self.current_device_ip if self.current_device_ip and "." in str(self.current_device_ip) else self._get_saved_device_ip()
+        device_ip, ok = QInputDialog.getText(self, "无线SSH连接", "设备IP:", text=default_ip)
+        if not ok:
+            return
+        device_ip = device_ip.strip()
+        if not device_ip:
+            QMessageBox.warning(self, "错误", "请输入设备IP")
+            return
+
+        self.statusBar().showMessage(f"正在连接SSH: {device_ip}...", 5000)
+        success, msg = self.device_manager.connect_ssh(device_ip)
+        if not success:
+            QMessageBox.critical(self, "SSH连接失败", msg)
+            self.statusBar().showMessage(f"SSH连接失败: {msg}", 5000)
+            return
+
+        self._set_device_connection_state(device_ip, "ssh", adb_device_id=self.device_manager.current_adb_device_id)
+        self.statusBar().showMessage(f"SSH已连接: {device_ip}", 3000)
+        self._auto_connect_mqtt(device_ip)
+        self.refresh_device_videos()
+        self.refresh_device_tracking_jsons()
+        self.load_track_modes()
+        QMessageBox.information(self, "SSH连接成功", f"已通过无线SSH连接设备: {device_ip}")
 
     def _auto_connect_mqtt(self, device_ip):
         """自动连接MQTT（用户无感知）"""
@@ -883,6 +983,117 @@ class AlgorithmValidationPlatform(QMainWindow):
         if file_name:
             self.model_file_edit.setText(file_name)
             log_manager.info(f"[OPERATION] 选择模型文件: {file_name}")
+
+    def browse_multi_media_file(self):
+        """选择本地 multi_media 程序。"""
+        file_name, _ = QFileDialog.getOpenFileName(self, "选择multi_media程序", "", "All Files (*)")
+        if file_name:
+            self.multi_media_file_edit.setText(file_name)
+            log_manager.info(f"[RUNTIME] 选择multi_media程序: {file_name}")
+
+    def browse_sdk_library_file(self):
+        """选择本地算法库 SDK so 文件。"""
+        file_name, _ = QFileDialog.getOpenFileName(self, "选择算法库SDK", "", "Shared Libraries (*.so);;All Files (*)")
+        if file_name:
+            self.sdk_library_file_edit.setText(file_name)
+            log_manager.info(f"[RUNTIME] 选择算法库SDK: {file_name}")
+
+    def replace_multi_media_on_device(self):
+        """替换设备 /oem/usr/bin/multi_media。"""
+        path = self.multi_media_file_edit.text() if hasattr(self, "multi_media_file_edit") else ""
+        self._replace_runtime_component_on_device(path, "multi_media", "/oem/usr/bin/multi_media")
+
+    def replace_sdk_library_on_device(self):
+        """替换设备 /oem/usr/lib 下的算法库 SDK。"""
+        path = self.sdk_library_file_edit.text() if hasattr(self, "sdk_library_file_edit") else ""
+        remote_path = f"/oem/usr/lib/{os.path.basename(path)}" if path else "/oem/usr/lib/"
+        self._replace_runtime_component_on_device(path, "sdk", remote_path)
+
+    def _replace_runtime_component_on_device(self, local_file, component_type, remote_path):
+        """后台替换运行时组件，避免阻塞界面。"""
+        if not self.current_device_ip:
+            QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
+            return
+
+        if not local_file or not os.path.isfile(local_file):
+            QMessageBox.warning(self, "错误", "请选择有效的本地文件")
+            return
+
+        if self._transfer_in_progress():
+            QMessageBox.information(self, "提示", "已有文件传输任务正在进行，请稍后再试")
+            return
+
+        component_name = "multi_media程序" if component_type == "multi_media" else "算法库SDK"
+        reply = QMessageBox.question(
+            self,
+            "确认替换",
+            f"确定要替换设备上的{component_name}吗？\n\n"
+            f"本地文件: {local_file}\n"
+            f"设备路径: {remote_path}\n\n"
+            "将先停止旧multi_media，推送文件，chmod后重启multi_media。",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.No:
+            return
+
+        progress_dialog = QDialog(self)
+        progress_dialog.setWindowTitle(f"替换{component_name}")
+        progress_dialog.setModal(True)
+        progress_dialog.setFixedSize(430, 150)
+
+        progress_layout = QVBoxLayout(progress_dialog)
+        status_label = QLabel("正在准备替换...")
+        status_label.setStyleSheet("font-size: 12px; padding: 10px;")
+        progress_layout.addWidget(status_label)
+
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 100)
+        progress_bar.setValue(0)
+        progress_layout.addWidget(progress_bar)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setEnabled(False)
+        progress_layout.addWidget(cancel_btn)
+
+        self.transfer_worker = FileTransferWorker(
+            self.device_manager,
+            "replace_runtime_component",
+            local_file=local_file,
+            device_ip=self.current_device_ip,
+            component_type=component_type,
+        )
+        self.transfer_thread = QThread()
+        self.transfer_worker.moveToThread(self.transfer_thread)
+        self.transfer_thread.started.connect(self.transfer_worker.run)
+        self.transfer_worker.progress.connect(
+            lambda percent, msg: self._update_progress(progress_bar, status_label, percent, msg),
+            Qt.QueuedConnection,
+        )
+        self.transfer_worker.finished.connect(
+            lambda success, msg: self._on_runtime_replace_finished(success, msg, progress_dialog, self.transfer_thread),
+            Qt.QueuedConnection,
+        )
+
+        progress_dialog.show()
+        self.transfer_thread.start()
+
+    def _on_runtime_replace_finished(self, success, msg, progress_dialog, thread):
+        """运行时组件替换完成回调。"""
+        progress_dialog.close()
+        thread.quit()
+        thread.wait()
+
+        self.transfer_worker = None
+        self.transfer_thread = None
+
+        if success:
+            log_manager.info(f"[RUNTIME] 运行时组件替换成功: {msg}")
+            QMessageBox.information(self, "成功", msg)
+            self.statusBar().showMessage("运行时组件替换成功", 3000)
+        else:
+            log_manager.error(f"[RUNTIME] 运行时组件替换失败: {msg}")
+            QMessageBox.critical(self, "失败", msg)
+            self.statusBar().showMessage("运行时组件替换失败", 3000)
             
     def push_model_to_device(self):
         """推送模型到设备(使用后台线程)"""
@@ -1232,6 +1443,101 @@ class AlgorithmValidationPlatform(QMainWindow):
     def _clear_device_video_refs(self):
         self.device_video_worker = None
         self.device_video_thread = None
+
+    def browse_tracking_json_file(self):
+        """选择上位机本地追踪 JSON 文件。"""
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择追踪JSON文件",
+            "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if file_name and hasattr(self, "tracking_json_file_edit"):
+            self.tracking_json_file_edit.setText(file_name)
+
+    def clear_tracking_json_file(self):
+        """清除本地追踪 JSON 选择，回到设备端 JSON/默认推断。"""
+        if hasattr(self, "tracking_json_file_edit"):
+            self.tracking_json_file_edit.clear()
+
+    def refresh_device_tracking_jsons(self):
+        """刷新设备 /userdata 下的追踪 JSON 列表。"""
+        if not hasattr(self, "tracking_json_combo"):
+            return
+
+        current_text = self.tracking_json_combo.currentText().strip()
+        self.tracking_json_combo.clear()
+
+        if not self.current_device_ip:
+            self.tracking_json_combo.addItem("请先连接设备", None)
+            return
+
+        if getattr(self, "device_json_thread", None) and self.device_json_thread.isRunning():
+            self.tracking_json_combo.addItem("正在刷新追踪JSON列表...", None)
+            return
+
+        self.tracking_json_combo.addItem("正在刷新追踪JSON列表...", None)
+        self.statusBar().showMessage("正在刷新追踪JSON列表...", 3000)
+
+        self.device_json_thread = QThread()
+        self.device_json_worker = DeviceTrackingJsonListWorker(self.device_manager, self.current_device_ip)
+        self.device_json_worker.moveToThread(self.device_json_thread)
+
+        def finished(success, msg, json_files):
+            self.device_tracking_jsons = json_files if success else []
+            self._populate_tracking_json_combo(self.device_tracking_jsons, current_text)
+            self.statusBar().showMessage(msg, 3000 if success else 5000)
+
+        self.device_json_thread.started.connect(self.device_json_worker.run)
+        self.device_json_worker.finished.connect(finished, Qt.QueuedConnection)
+        self.device_json_worker.finished.connect(self.device_json_thread.quit)
+        self.device_json_worker.finished.connect(self.device_json_worker.deleteLater)
+        self.device_json_thread.finished.connect(self.device_json_thread.deleteLater)
+        self.device_json_thread.finished.connect(self._clear_device_json_refs)
+        self.device_json_thread.start()
+
+    def _populate_tracking_json_combo(self, json_files, selected_text=""):
+        if not hasattr(self, "tracking_json_combo"):
+            return
+        selected_text = selected_text or ""
+        self.tracking_json_combo.blockSignals(True)
+        self.tracking_json_combo.clear()
+        self.tracking_json_combo.addItem("自动推断: 与视频同名 _detections.json", None)
+        for json_file in json_files:
+            text = f"{json_file.get('name', '')}    {json_file.get('size', '')}    {json_file.get('mtime', '')}"
+            self.tracking_json_combo.addItem(text, json_file)
+            if selected_text and (
+                selected_text == json_file.get("path")
+                or selected_text == json_file.get("name")
+                or selected_text == text
+            ):
+                self.tracking_json_combo.setCurrentIndex(self.tracking_json_combo.count() - 1)
+        if selected_text and self.tracking_json_combo.findText(selected_text) < 0 and selected_text.startswith("/"):
+            self.tracking_json_combo.setEditText(selected_text)
+        self.tracking_json_combo.blockSignals(False)
+
+    def _clear_device_json_refs(self):
+        self.device_json_worker = None
+        self.device_json_thread = None
+
+    def _get_tracking_json_selection(self):
+        local_json = ""
+        if hasattr(self, "tracking_json_file_edit"):
+            local_json = self.tracking_json_file_edit.text().strip()
+        if local_json:
+            if os.path.isfile(local_json):
+                return "local", local_json
+            QMessageBox.warning(self, "错误", f"本地追踪JSON不存在:\n{local_json}")
+            return "invalid", None
+
+        if hasattr(self, "tracking_json_combo"):
+            data = self.tracking_json_combo.currentData()
+            if isinstance(data, dict):
+                return "remote", data.get("path")
+            text = self.tracking_json_combo.currentText().strip()
+            if text.startswith("/") and text.lower().endswith(".json"):
+                return "remote", text
+        return None, None
 
     def on_device_video_selected(self):
         """更新已选择的视频显示。"""
@@ -2742,6 +3048,10 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.information(self, "提示", "视频合成正在进行中")
             return
 
+        json_source, json_path = self._get_tracking_json_selection()
+        if json_source == "invalid":
+            return
+
         self.merge_progress_bar.setValue(0)
         self.merge_status_label.setText("准备合成...")
         self.open_merged_video_btn.setEnabled(False)
@@ -2764,6 +3074,8 @@ class AlgorithmValidationPlatform(QMainWindow):
             selected_video["path"],
             os.path.dirname(os.path.abspath(__file__)),
             local_video_path=local_video_path,
+            remote_json_path=json_path if json_source == "remote" else None,
+            local_json_path=json_path if json_source == "local" else None,
         )
         self.merge_worker.moveToThread(self.merge_thread)
 
@@ -2921,7 +3233,7 @@ class AlgorithmValidationPlatform(QMainWindow):
                 state["anchor_time"] = time.perf_counter()
                 state["anchor_frame"] = state["current_frame"]
                 play_btn.setText("暂停")
-                timer.start(8)
+                timer.start(max(1, int(round(1000.0 / fps))))
                 update_info()
 
             def toggle_playback():
@@ -2933,22 +3245,14 @@ class AlgorithmValidationPlatform(QMainWindow):
             def show_timed_frame():
                 if not state["playing"]:
                     return
-                elapsed_frames = int((time.perf_counter() - state["anchor_time"]) * fps)
-                target_frame = state["anchor_frame"] + elapsed_frames
-                if target_frame <= state["current_frame"]:
-                    return
-                if total_frames > 0 and target_frame >= total_frames:
-                    seek_frame(total_frames - 1)
-                    pause_playback()
-                    return
-                if target_frame > state["current_frame"] + 1:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                 ok, frame = cap.read()
                 if not ok:
                     pause_playback()
                     return
-                actual_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (target_frame + 1)) - 1
+                actual_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (state["current_frame"] + 2)) - 1
                 render_frame(frame, actual_pos)
+                if total_frames > 0 and actual_pos >= total_frames - 1:
+                    pause_playback()
 
             def step_frame(delta):
                 pause_playback()
@@ -3218,6 +3522,103 @@ class AlgorithmValidationPlatform(QMainWindow):
             return source_type, self._get_selected_device_video()
         return "camera", None
 
+    def _format_duration(self, seconds):
+        if seconds is None:
+            return "--:--"
+        try:
+            seconds = max(0, int(round(float(seconds))))
+        except (TypeError, ValueError):
+            return "--:--"
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _get_tracking_mot_frame_rate(self):
+        if hasattr(self, "mot_frame_rate_spin"):
+            value = int(self.mot_frame_rate_spin.value())
+            return value if value > 0 else None
+        mode = self._get_mode_by_id(self._get_selected_track_mode_id())
+        try:
+            value = int(mode.get("motFrameRate", 0)) if mode else 0
+            return value if value > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _get_local_video_for_tracking(self, selected_video):
+        if not selected_video:
+            return None
+        video_name = os.path.basename(selected_video.get("path", ""))
+        local_video = self.local_video_cache.get(video_name)
+        if local_video and os.path.isfile(local_video):
+            return local_video
+
+        current_local_video = self.video_file_edit.text() if hasattr(self, "video_file_edit") else ""
+        if (
+            current_local_video
+            and os.path.isfile(current_local_video)
+            and os.path.basename(current_local_video).lower() == video_name.lower()
+        ):
+            return current_local_video
+        return None
+
+    def _estimate_tracking_video_duration(self):
+        source_type, selected_video = self._get_tracking_source_selection()
+        if source_type != "file" or not selected_video:
+            return None, ""
+
+        mot_fps = self._get_tracking_mot_frame_rate()
+        if not mot_fps:
+            return None, "motFrameRate无效，无法估算视频总时长"
+
+        local_video = self._get_local_video_for_tracking(selected_video)
+        if not local_video:
+            return None, "本地没有同名视频缓存，无法估算视频总时长"
+
+        try:
+            import cv2
+
+            cap = cv2.VideoCapture(local_video)
+            if not cap.isOpened():
+                return None, "OpenCV无法打开本地视频，无法估算视频总时长"
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            cap.release()
+            if frame_count <= 0:
+                return None, "无法读取视频帧数，无法估算视频总时长"
+            return frame_count / float(mot_fps), f"{frame_count}帧 / motFrameRate {mot_fps}fps"
+        except Exception as e:
+            log_manager.warning(f"[TRACK] estimate video duration failed: {e}")
+            return None, f"估算视频总时长失败: {e}"
+
+    def _start_tracking_runtime_clock(self):
+        self.tracking_start_time = time.monotonic()
+        self.tracking_expected_duration, self.tracking_duration_hint = self._estimate_tracking_video_duration()
+        self._update_tracking_runtime_label()
+        self.tracking_timer.start(1000)
+
+    def _stop_tracking_runtime_clock(self):
+        if self.tracking_timer.isActive():
+            self.tracking_timer.stop()
+        self._update_tracking_runtime_label(final=True)
+
+    def _update_tracking_runtime_label(self, final=False):
+        if not hasattr(self, "tracking_runtime_label"):
+            return
+        if self.tracking_start_time is None:
+            self.tracking_runtime_label.setText("追踪未启动")
+            return
+
+        elapsed = time.monotonic() - self.tracking_start_time
+        prefix = "追踪已停止" if final or not getattr(self, "is_tracking", False) else "追踪运行中"
+        text = f"{prefix}: {self._format_duration(elapsed)}"
+        if self.tracking_expected_duration is not None:
+            percent = min(100.0, elapsed / self.tracking_expected_duration * 100.0) if self.tracking_expected_duration > 0 else 0.0
+            text += f" / 视频预计: {self._format_duration(self.tracking_expected_duration)} ({percent:.0f}%)"
+        elif getattr(self, "tracking_duration_hint", ""):
+            text += f" / 视频预计: 未知（{self.tracking_duration_hint}）"
+        self.tracking_runtime_label.setText(text)
+
     def _parse_labels_value(self, text):
         text = (text or "").strip()
         if not text:
@@ -3382,6 +3783,23 @@ class AlgorithmValidationPlatform(QMainWindow):
         else:
             # 当前未追踪，执行启动
             self.start_tracking_action()
+
+    def _publish_track_command(self, mode_id):
+        adb_available = bool(self.device_manager.get_adb_device_id()[0])
+        prefer_adb = adb_available or getattr(self, "connection_mode", None) == "adb"
+        if prefer_adb:
+            adb_success, adb_msg = self.device_manager.publish_track_command_via_adb(mode_id)
+            if adb_success:
+                return True, adb_msg
+            log_manager.warning(f"[TRACK] ADB publish failed, fallback to MQTT client: {adb_msg}")
+
+        mqtt_success, mqtt_msg = self.mqtt_controller.publish_track_command(mode_id)
+        if mqtt_success:
+            return True, mqtt_msg
+
+        if prefer_adb:
+            return False, f"ADB发送失败: {adb_msg}\nMQTT发送失败: {mqtt_msg}"
+        return False, mqtt_msg
     
     def start_tracking_action(self):
         """启动追踪"""
@@ -3391,11 +3809,12 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.warning(self, "错误", "请选择一个追踪模式")
             return
         
-        success, msg = self.mqtt_controller.publish_track_command(mode_id)
+        success, msg = self._publish_track_command(mode_id)
         if success:
             self.is_tracking = True
             self.track_btn.setText("停止追踪")
             self.track_btn.setStyleSheet("background-color: #f44336; color: white; padding: 10px;")
+            self._start_tracking_runtime_clock()
             log_manager.info(f"[TRACK] 已启动追踪: mode_id={mode_id}")
             self.statusBar().showMessage(f"追踪已启动: 模式ID {mode_id}", 3000)
         else:
@@ -3403,11 +3822,12 @@ class AlgorithmValidationPlatform(QMainWindow):
             
     def stop_tracking_action(self):
         """停止追踪"""
-        success, msg = self.mqtt_controller.publish_track_command(0)
+        success, msg = self._publish_track_command(0)
         if success:
             self.is_tracking = False
             self.track_btn.setText("启动追踪")
             self.track_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px;")
+            self._stop_tracking_runtime_clock()
             log_manager.info("[TRACK] 已停止追踪")
             self.statusBar().showMessage("追踪已停止", 3000)
             source_type, selected_video = self._get_tracking_source_selection()
@@ -3512,6 +3932,24 @@ class AlgorithmValidationPlatform(QMainWindow):
     def auto_connect_device(self):
         """启动时自动加载并连接上次配置的设备（智能IP校验+自动连接）"""
         try:
+            adb_device_id, adb_msg = self.device_manager.get_adb_device_id()
+            if adb_device_id:
+                success, msg, device_ip = self.device_manager.connect_adb()
+                if success:
+                    endpoint = device_ip or adb_device_id
+                    self._set_device_connection_state(endpoint, "adb", adb_device_id=adb_device_id)
+                    self.statusBar().showMessage(f"已通过USB ADB连接设备: {adb_device_id}", 3000)
+                    log_manager.info(f"[AUTO] USB ADB auto connection ready: {adb_device_id}, ip={device_ip or 'N/A'}")
+                    if device_ip:
+                        self._auto_connect_mqtt(device_ip)
+                    self.refresh_device_videos()
+                    self.refresh_device_tracking_jsons()
+                    self.load_track_modes()
+                    return
+                log_manager.warning(f"[AUTO] USB ADB auto connection failed: {msg}")
+            else:
+                log_manager.info(f"[AUTO] USB ADB auto connection skipped: {adb_msg}")
+
             if not os.path.exists(self.device_config_file):
                 log_manager.info("[AUTO] 未找到设备配置文件，跳过自动连接")
                 return
@@ -3636,6 +4074,9 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.current_device_ip = device_ip
         self.device_connected = True
         self.ssh_available = True
+        self.connection_mode = "ssh"
+        self.device_manager.current_device_ip = device_ip
+        self.device_manager.connection_mode = "ssh"
         
         # 更新UI显示
         self.status_label.setText(f"✅ {device_ip} (自动连接)")
