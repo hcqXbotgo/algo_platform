@@ -896,7 +896,7 @@ class DeviceManager:
         except Exception as e:
             return False, f"配置下载失败: {str(e)}"
             
-    def push_video(self, video_file, device_ip, progress_callback=None):
+    def push_video(self, video_file, device_ip, progress_callback=None, cancel_callback=None):
         """推送视频文件到设备/userdata目录
         
         Args:
@@ -912,9 +912,17 @@ class DeviceManager:
             log_manager.info(f"[VIDEO] 开始上传视频: {os.path.basename(video_file)}")
             log_manager.info(f"[VIDEO] 文件大小: {file_size / 1024 / 1024:.2f} MB")
 
-            adb_success, adb_msg = self._push_video_via_adb(video_file, remote_full_path, file_size, progress_callback)
+            adb_success, adb_msg = self._push_video_via_adb(
+                video_file,
+                remote_full_path,
+                file_size,
+                progress_callback,
+                cancel_callback=cancel_callback,
+            )
             if adb_success:
                 return True, adb_msg
+            if cancel_callback and cancel_callback():
+                return False, "上传已取消"
             log_manager.warning(f"[VIDEO] ADB上传不可用，回退SSH: {adb_msg}")
             
             # 创建SSH客户端并设置超时
@@ -926,6 +934,8 @@ class DeviceManager:
             
             # 定义进度回调
             def _progress_callback(transferred, total):
+                if cancel_callback and cancel_callback():
+                    raise InterruptedError("上传已取消")
                 if progress_callback:
                     progress_callback(transferred, total)
                 # 每10%记录一次日志
@@ -950,6 +960,20 @@ class DeviceManager:
                 log_manager.error(f"[VIDEO] 文件大小不匹配: 本地={file_size}, 远程={uploaded_size}")
                 return False, f"上传验证失败：文件大小不匹配"
                 
+        except InterruptedError:
+            try:
+                if 'sftp' in locals() and sftp:
+                    sftp.remove(remote_full_path)
+            except Exception:
+                pass
+            try:
+                if 'sftp' in locals() and sftp:
+                    sftp.close()
+                if 'ssh_client' in locals() and ssh_client:
+                    ssh_client.close()
+            except Exception:
+                pass
+            return False, "上传已取消"
         except paramiko.SSHException as e:
             log_manager.error(f"[VIDEO] SSH连接失败: {str(e)}")
             return False, f"SSH连接失败: {str(e)}"
@@ -960,37 +984,100 @@ class DeviceManager:
             log_manager.error(f"[VIDEO] 视频上传异常: {str(e)}", exc_info=True)
             return False, f"视频上传失败: {str(e)}"
 
-    def _push_video_via_adb(self, video_file, remote_full_path, file_size, progress_callback=None):
-        """优先通过USB ADB推送视频；失败时由调用方回退SSH。"""
+    def _push_video_via_adb(
+        self,
+        video_file,
+        remote_full_path,
+        file_size,
+        progress_callback=None,
+        cancel_callback=None,
+    ):
+        """Push video through USB ADB with live progress and cancellation."""
         device_id, msg = self.get_adb_device_id()
         if not device_id:
             return False, msg
 
+        process = None
         try:
             if progress_callback:
                 progress_callback(0, file_size)
 
-            result = subprocess.run(
-                ["adb", "-s", device_id, "push", video_file, remote_full_path],
-                capture_output=True,
-                text=True,
+            # Clear stale same-name file so remote-size polling starts at zero.
+            self.run_adb_shell_command(
+                f"rm -f {shlex.quote(remote_full_path)}",
+                device_id=device_id,
+                timeout=10,
             )
-            output = (result.stdout or "").strip()
-            error = (result.stderr or "").strip()
-            if result.returncode != 0:
-                return False, error or output or f"adb push返回码: {result.returncode}"
+
+            process = subprocess.Popen(
+                ["adb", "-s", device_id, "push", video_file, remote_full_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            last_emit = 0.0
+            last_transferred = -1
+            while process.poll() is None:
+                if cancel_callback and cancel_callback():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=3)
+                    self.run_adb_shell_command(
+                        f"rm -f {shlex.quote(remote_full_path)}",
+                        device_id=device_id,
+                        timeout=10,
+                    )
+                    if progress_callback:
+                        progress_callback(max(last_transferred, 0), file_size)
+                    return False, "上传已取消"
+
+                now = time.monotonic()
+                if now - last_emit >= 0.25:
+                    uploaded_size, _ = self._get_adb_file_size(device_id, remote_full_path)
+                    if uploaded_size is not None:
+                        uploaded_size = max(0, min(uploaded_size, file_size))
+                        if uploaded_size != last_transferred:
+                            last_transferred = uploaded_size
+                            if progress_callback:
+                                progress_callback(uploaded_size, file_size)
+                    last_emit = now
+                time.sleep(0.05)
+
+            process.wait(timeout=5)
+            if process.returncode != 0:
+                self.run_adb_shell_command(
+                    f"rm -f {shlex.quote(remote_full_path)}",
+                    device_id=device_id,
+                    timeout=10,
+                )
+                return False, f"adb push返回码 {process.returncode}"
 
             uploaded_size, stat_output = self._get_adb_file_size(device_id, remote_full_path)
             if uploaded_size is not None and uploaded_size != file_size:
                 return False, f"ADB上传验证失败: 本地={file_size}, 远程={uploaded_size}"
             if uploaded_size is None:
-                log_manager.warning(f"[VIDEO] ADB文件大小校验跳过: {stat_output}")
+                log_manager.warning(f"[VIDEO] ADB file size check skipped: {stat_output}")
 
             if progress_callback:
                 progress_callback(file_size, file_size)
-            log_manager.info(f"[VIDEO] ADB上传成功: {remote_full_path}")
+            log_manager.info(f"[VIDEO] ADB upload success: {remote_full_path}")
             return True, f"视频已通过ADB上传到 {remote_full_path} ({file_size / 1024 / 1024:.2f} MB)"
         except Exception as e:
+            if cancel_callback and cancel_callback():
+                try:
+                    if process and process.poll() is None:
+                        process.kill()
+                except Exception:
+                    pass
+                self.run_adb_shell_command(
+                    f"rm -f {shlex.quote(remote_full_path)}",
+                    device_id=device_id,
+                    timeout=10,
+                )
+                return False, "上传已取消"
             return False, f"ADB上传失败: {str(e)}"
 
     def list_device_videos(self, device_ip):

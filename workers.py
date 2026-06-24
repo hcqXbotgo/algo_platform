@@ -164,6 +164,7 @@ class VideoUploadWorker(QObject):
                 self.video_file,
                 self.device_ip,
                 progress_callback,
+                cancel_callback=lambda: self.cancelled,
             )
             if self.cancelled:
                 self.finished.emit(False, "上传已取消")
