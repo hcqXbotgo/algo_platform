@@ -17,9 +17,9 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QSlider
 )
 
-from PyQt5.QtCore import Qt, QTimer, QThread
+from PyQt5.QtCore import Qt, QTimer, QThread, QUrl
 
-from PyQt5.QtGui import QFont, QImage, QPixmap
+from PyQt5.QtGui import QDesktopServices, QFont, QImage, QPixmap
 import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.figure import Figure
@@ -3293,7 +3293,9 @@ class AlgorithmValidationPlatform(QMainWindow):
         except Exception as e:
             log_manager.warning(f"[VIDEO] OpenCV播放器不可用，使用系统播放器: {e}")
             try:
-                os.startfile(path)
+                opened = QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(path)))
+                if not opened:
+                    raise RuntimeError(f"无法打开视频文件: {path}")
             except Exception as open_error:
                 QMessageBox.critical(self, "播放失败", str(open_error))
 

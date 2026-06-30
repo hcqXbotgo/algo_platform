@@ -29,7 +29,7 @@ all_ok &= check_module('matplotlib', 'Matplotlib')
 all_ok &= check_module('numpy', 'NumPy')
 all_ok &= check_module('cv2', 'OpenCV')
 all_ok &= check_module('paramiko', 'Paramiko')
-all_ok &= check_module('mqtt', 'Paho-MQTT')
+all_ok &= check_module('paho.mqtt', 'Paho-MQTT')
 print()
 
 # 检查自定义模块

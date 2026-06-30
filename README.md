@@ -2,6 +2,20 @@
 
 一个功能完整的Python GUI应用程序，用于管理和验证嵌入式设备上的AI算法模型。
 
+## 跨平台启动
+
+本项目支持 Windows 和 macOS：
+
+- Windows：双击 `start.bat`，或运行 `python algorithm_platform.py`
+- macOS：首次运行先执行 `chmod +x start.command`，之后可双击 `start.command`，或运行 `bash start.sh`
+- 通用方式：`python -m pip install -r requirements.txt && python algorithm_platform.py`
+
+外部工具要求：
+
+- USB 调试/文件传输需要安装 `adb` 并加入 `PATH`
+- WiFi 性能测试需要 `iperf3`：Windows 可使用仓库内 `iperf3.exe`，macOS 建议 `brew install iperf3`
+- 带框视频合成默认使用 OpenCV；如果安装了 `ffmpeg`，Windows 会优先尝试 NVENC/QSV/AMF，macOS 会优先尝试 VideoToolbox
+
 ## 功能特性
 
 ### 1. 模型管理

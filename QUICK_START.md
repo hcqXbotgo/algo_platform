@@ -1,5 +1,11 @@
 # 快速入门指南
 
+## Windows / macOS
+
+- Windows：双击 `start.bat`
+- macOS：首次执行 `chmod +x start.command`，之后双击 `start.command`，或运行 `bash start.sh`
+- 通用命令：`python -m pip install -r requirements.txt && python algorithm_platform.py`
+
 ## 🚀 5分钟快速开始
 
 ### 第一步：安装依赖

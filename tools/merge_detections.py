@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Merge detection JSON with a source video and generate an annotated video.
 
-The script is Windows-first for the upper-computer app:
+The script is cross-platform for the upper-computer app:
 - It does not require a system ffmpeg executable.
 - It uses OpenCV VideoCapture/VideoWriter by default.
 - If ffmpeg is available later, it can still be used for hardware encoding.
@@ -391,7 +391,12 @@ def choose_ffmpeg_encoder(requested):
     encoders = get_ffmpeg_encoders()
     if requested and requested != "auto":
         return requested if requested in encoders or requested == "libx264" else "libx264"
-    candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "libx264"] if os.name == "nt" else ["h264_nvenc", "h264_qsv", "h264_vaapi", "libx264"]
+    if sys.platform == "darwin":
+        candidates = ["h264_videotoolbox", "libx264"]
+    elif os.name == "nt":
+        candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "libx264"]
+    else:
+        candidates = ["h264_nvenc", "h264_qsv", "h264_vaapi", "libx264"]
     for codec in candidates:
         if codec == "libx264" or codec in encoders:
             return codec
@@ -411,6 +416,8 @@ def build_ffmpeg_encode_cmd(codec, src_w, src_h, fps, output):
         return base + ["-c:v", "h264_qsv", "-global_quality", "23", "-pix_fmt", "yuv420p", output]
     if codec == "h264_amf":
         return base + ["-c:v", "h264_amf", "-quality", "speed", "-qp_i", "23", "-qp_p", "23", "-pix_fmt", "yuv420p", output]
+    if codec == "h264_videotoolbox":
+        return base + ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-pix_fmt", "yuv420p", output]
     return base + ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p", output]
 
 
@@ -512,7 +519,12 @@ def parse_args():
     parser.add_argument("--config", default=None, help="model_config.json with labels")
     parser.add_argument("--hold", type=int, default=10, help="Hold last boxes for N frames")
     parser.add_argument("--hwa", action="store_true", help="Use FFmpeg hardware encoder when ffmpeg is available")
-    parser.add_argument("--encoder", default="auto", choices=["auto", "libx264", "h264_nvenc", "h264_qsv", "h264_amf"], help="FFmpeg encoder")
+    parser.add_argument(
+        "--encoder",
+        default="auto",
+        choices=["auto", "libx264", "h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"],
+        help="FFmpeg encoder",
+    )
     parser.add_argument("--draw-backend", default="opencv", choices=["auto", "opencv"], help="Drawing backend")
     parser.add_argument("--hwdecode", default="auto", choices=["auto", "none"], help="Best-effort OpenCV hardware decode")
     return parser.parse_args()
@@ -521,7 +533,7 @@ def parse_args():
 def main():
     args = parse_args()
     if not HAS_CV2:
-        print("ERROR: 缺少 opencv-python，Windows 无 FFmpeg 环境必须依赖 OpenCV")
+        print("ERROR: 缺少 opencv-python；未安装系统 FFmpeg 时必须依赖 OpenCV")
         sys.exit(1)
 
     labels = load_labels(args.config)
