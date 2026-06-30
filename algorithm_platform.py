@@ -59,6 +59,7 @@ from workers import (
     FileTransferWorker,
     LogDownloadWorker,
     PerformanceStartWorker,
+    SshConnectWorker,
     VideoSourceApplyWorker,
     VideoUploadWorker,
     WiFiPerfTestWorker,
@@ -111,6 +112,11 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.tracking_duration_hint = ""
         self.tracking_timer = QTimer(self)
         self.tracking_timer.timeout.connect(self._update_tracking_runtime_label)
+        self.adb_monitor_timer = QTimer(self)
+        self.adb_monitor_timer.setInterval(3000)
+        self.adb_monitor_timer.timeout.connect(self._monitor_adb_connection)
+        self.ssh_connect_thread = None
+        self.ssh_connect_worker = None
         
         # 创建工具栏
         self.create_toolbar()
@@ -256,6 +262,187 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.wifi_device_ip_label.setText(str(endpoint))
             self.wifi_device_ip_label.setStyleSheet("color: green; font-weight: bold;")
 
+        if adb_device_id:
+            self._start_adb_monitor()
+        else:
+            self._stop_adb_monitor()
+
+    def _is_ip_address(self, value):
+        if not isinstance(value, str):
+            return False
+        parts = value.strip().split(".")
+        if len(parts) != 4:
+            return False
+        try:
+            return all(0 <= int(part) <= 255 for part in parts)
+        except ValueError:
+            return False
+
+    def _get_saved_device_config(self):
+        try:
+            if os.path.exists(self.device_config_file):
+                with open(self.device_config_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            log_manager.warning(f"[CONFIG] failed to read saved device config: {e}")
+        return {}
+
+    def _get_saved_ssh_candidate_ips(self, preferred_ip=None):
+        candidates = []
+
+        def add_candidate(ip):
+            ip = str(ip or "").strip()
+            if self._is_ip_address(ip) and ip not in candidates:
+                candidates.append(ip)
+
+        add_candidate(preferred_ip)
+        saved_config = self._get_saved_device_config()
+        add_candidate(saved_config.get("device_ip"))
+        add_candidate(self.current_device_ip)
+        add_candidate(getattr(self.device_manager, "current_device_ip", None))
+        return candidates
+
+    def _start_adb_monitor(self):
+        if not self.adb_monitor_timer.isActive():
+            self.adb_monitor_timer.start()
+
+    def _stop_adb_monitor(self):
+        if self.adb_monitor_timer.isActive():
+            self.adb_monitor_timer.stop()
+
+    def _start_background_ssh_connect(self, candidate_ips, reason="backup", auto_start_ssh=True):
+        candidates = []
+
+        def add_candidate(ip):
+            ip = str(ip or "").strip()
+            if self._is_ip_address(ip) and ip not in candidates:
+                candidates.append(ip)
+
+        for ip in candidate_ips or []:
+            add_candidate(ip)
+        for ip in self._get_saved_ssh_candidate_ips():
+            add_candidate(ip)
+
+        if not candidates:
+            log_manager.warning("[SSH] no saved WiFi IP available for background connection")
+            return False
+        if getattr(self, "ssh_connect_thread", None) and self.ssh_connect_thread.isRunning():
+            log_manager.info("[SSH] background connection task already running")
+            return False
+
+        self.ssh_connect_thread = QThread()
+        self.ssh_connect_worker = SshConnectWorker(
+            self.device_manager,
+            candidates,
+            auto_start_ssh=auto_start_ssh,
+        )
+        self.ssh_connect_worker.moveToThread(self.ssh_connect_thread)
+        self.ssh_connect_thread.started.connect(self.ssh_connect_worker.run)
+        self.ssh_connect_worker.finished.connect(
+            lambda success, ip, msg: self._on_background_ssh_connect_finished(success, ip, msg, reason),
+            Qt.QueuedConnection,
+        )
+        self.ssh_connect_worker.finished.connect(self.ssh_connect_thread.quit)
+        self.ssh_connect_worker.finished.connect(self.ssh_connect_worker.deleteLater)
+        self.ssh_connect_thread.finished.connect(self.ssh_connect_thread.deleteLater)
+        self.ssh_connect_thread.finished.connect(self._clear_ssh_connect_refs)
+        self.ssh_connect_thread.start()
+        log_manager.info(f"[SSH] started background {reason} connection: {', '.join(candidates)}")
+        return True
+
+    def _clear_ssh_connect_refs(self):
+        self.ssh_connect_worker = None
+        self.ssh_connect_thread = None
+
+    def _on_background_ssh_connect_finished(self, success, device_ip, message, reason):
+        if not success:
+            log_manager.warning(f"[SSH] background {reason} connection failed: {message}")
+            if reason == "fallback":
+                self.ssh_available = False
+                self.device_connected = False
+                self.connection_mode = None
+                self.status_label.setText("USB ADB已断开，WiFi SSH回退失败")
+                self.status_label.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
+                self.statusBar().showMessage(f"SSH回退失败: {message}", 5000)
+            return
+
+        adb_still_connected = False
+        adb_device_id = self.current_adb_device_id
+        if adb_device_id:
+            adb_still_connected, _ = self.device_manager.is_adb_device_connected(adb_device_id, timeout=1.0)
+
+        if reason == "backup" and adb_still_connected:
+            self._set_device_connection_state(device_ip, "adb", adb_device_id=adb_device_id)
+            self.ssh_available = True
+            self.status_label.setText(f"OK USB ADB+SSH: {device_ip}")
+            self.status_label.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
+            self.statusBar().showMessage(f"SSH备用连接已建立，当前仍优先使用ADB: {device_ip}", 4000)
+            log_manager.info(f"[SSH] backup connection ready while keeping ADB primary: {device_ip}, {message}")
+        else:
+            self._set_device_connection_state(device_ip, "ssh", adb_device_id=None)
+            self.adb_available = False
+            self.current_adb_device_id = None
+            self.device_manager.current_adb_device_id = None
+            self.statusBar().showMessage(f"已切换到WiFi SSH: {device_ip}", 5000)
+            log_manager.info(f"[SSH] fallback connection ready: {device_ip}, {message}")
+
+        self._auto_connect_mqtt(device_ip)
+        self.refresh_device_videos()
+        self.refresh_device_tracking_jsons()
+        self.load_track_modes()
+
+    def _try_connect_saved_ssh_after_adb(self, device_ip=None):
+        candidates = self._get_saved_ssh_candidate_ips(device_ip)
+        if not candidates:
+            log_manager.info("[SSH] no saved WiFi IP to connect after ADB")
+            return
+        self._start_background_ssh_connect(candidates, reason="backup", auto_start_ssh=True)
+
+    def _fallback_to_saved_ssh_after_adb_lost(self):
+        candidates = self._get_saved_ssh_candidate_ips(self.current_device_ip)
+        if self.device_manager.ssh_client and candidates:
+            self._set_device_connection_state(candidates[0], "ssh", adb_device_id=None)
+            self.adb_available = False
+            self.current_adb_device_id = None
+            self.device_manager.current_adb_device_id = None
+            self.statusBar().showMessage(f"USB ADB已断开，已切换到WiFi SSH: {candidates[0]}", 5000)
+            log_manager.warning(f"[ADB] USB disconnected, switched to existing SSH connection: {candidates[0]}")
+            return
+        if not candidates:
+            self.device_connected = False
+            self.adb_available = False
+            self.current_adb_device_id = None
+            self.device_manager.current_adb_device_id = None
+            self.status_label.setText("USB ADB已断开，未找到WiFi回退IP")
+            self.status_label.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
+            self.statusBar().showMessage("USB ADB已断开，未找到可回退的WiFi IP", 5000)
+            log_manager.warning("[ADB] USB disconnected and no saved WiFi IP is available")
+            return
+
+        self.statusBar().showMessage("USB ADB已断开，正在切换到WiFi SSH...", 5000)
+        self._start_background_ssh_connect(candidates, reason="fallback", auto_start_ssh=False)
+
+    def _monitor_adb_connection(self):
+        adb_device_id = self.current_adb_device_id
+        if not adb_device_id:
+            self._stop_adb_monitor()
+            return
+
+        connected, message = self.device_manager.is_adb_device_connected(adb_device_id, timeout=1.0)
+        if connected:
+            return
+
+        log_manager.warning(f"[ADB] monitored USB device disconnected: {message}")
+        self._stop_adb_monitor()
+        self.adb_available = False
+        self.current_adb_device_id = None
+        self.device_manager.current_adb_device_id = None
+        if self.connection_mode == "adb":
+            self.connection_mode = None
+        if self.device_manager.connection_mode == "adb":
+            self.device_manager.connection_mode = None
+        self._fallback_to_saved_ssh_after_adb_lost()
+
     def connect_wired_adb(self):
         """Connect to the device through USB ADB only."""
         success, msg, device_ip = self.device_manager.connect_adb()
@@ -268,14 +455,19 @@ class AlgorithmValidationPlatform(QMainWindow):
         endpoint = device_ip or device_id
         self._set_device_connection_state(endpoint, "adb", adb_device_id=device_id)
         self.statusBar().showMessage(f"ADB已连接: {device_id}", 3000)
-        log_manager.info(f"[ADB] wired connection ready: device_id={device_id}, ip={device_ip or 'N/A'}")
+        log_manager.info(f"[ADB] wired connection ready: device_id={device_id}, ip={device_ip or 'N/A'}, {msg}")
 
         if device_ip:
             self._auto_connect_mqtt(device_ip)
+        self._try_connect_saved_ssh_after_adb(device_ip)
         self.load_track_modes()
         self.refresh_device_videos()
         self.refresh_device_tracking_jsons()
-        QMessageBox.information(self, "ADB连接成功", f"USB ADB已连接\n设备: {device_id}\nIP: {device_ip or '未获取到'}")
+        QMessageBox.information(
+            self,
+            "ADB连接成功",
+            f"USB ADB已连接\n设备: {device_id}\nIP: {device_ip or '未获取到'}\n{msg}",
+        )
 
     def _get_saved_device_ip(self):
         try:
@@ -304,7 +496,16 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.statusBar().showMessage(f"SSH连接失败: {msg}", 5000)
             return
 
-        self._set_device_connection_state(device_ip, "ssh", adb_device_id=self.device_manager.current_adb_device_id)
+        adb_device_id = self.device_manager.current_adb_device_id
+        adb_connected = False
+        if adb_device_id:
+            adb_connected, _ = self.device_manager.is_adb_device_connected(adb_device_id, timeout=1.0)
+        if adb_connected:
+            self._set_device_connection_state(device_ip, "adb", adb_device_id=adb_device_id)
+            self.ssh_available = True
+            self.status_label.setText(f"OK USB ADB+SSH: {device_ip}")
+        else:
+            self._set_device_connection_state(device_ip, "ssh", adb_device_id=None)
         self.statusBar().showMessage(f"SSH已连接: {device_ip}", 3000)
         self._auto_connect_mqtt(device_ip)
         self.refresh_device_videos()
@@ -3941,9 +4142,10 @@ class AlgorithmValidationPlatform(QMainWindow):
                     endpoint = device_ip or adb_device_id
                     self._set_device_connection_state(endpoint, "adb", adb_device_id=adb_device_id)
                     self.statusBar().showMessage(f"已通过USB ADB连接设备: {adb_device_id}", 3000)
-                    log_manager.info(f"[AUTO] USB ADB auto connection ready: {adb_device_id}, ip={device_ip or 'N/A'}")
+                    log_manager.info(f"[AUTO] USB ADB auto connection ready: {adb_device_id}, ip={device_ip or 'N/A'}, {msg}")
                     if device_ip:
                         self._auto_connect_mqtt(device_ip)
+                    self._try_connect_saved_ssh_after_adb(device_ip)
                     self.refresh_device_videos()
                     self.refresh_device_tracking_jsons()
                     self.load_track_modes()

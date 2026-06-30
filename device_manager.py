@@ -185,6 +185,30 @@ class DeviceManager:
 
         return None, "未检测到可用ADB设备"
 
+    def is_adb_device_connected(self, device_id=None, timeout=1.5):
+        """Return whether the expected USB ADB device is still connected."""
+        expected_id = device_id or self.current_adb_device_id
+        if not expected_id:
+            return False, "未记录ADB设备ID"
+
+        try:
+            result = _run_subprocess_text(['adb', 'devices'], timeout=timeout)
+        except FileNotFoundError:
+            return False, "ADB未安装或未加入PATH"
+        except subprocess.TimeoutExpired:
+            return False, "ADB设备检测超时"
+        except Exception as e:
+            return False, f"ADB设备检测失败: {str(e)}"
+
+        if result.returncode != 0:
+            return False, (result.stderr or result.stdout or "ADB命令执行失败").strip()
+
+        for line in result.stdout.strip().splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == expected_id and parts[1] == "device":
+                return True, f"ADB设备在线: {expected_id}"
+        return False, f"ADB设备已断开: {expected_id}"
+
     def connect_adb(self):
         """Connect by USB ADB only; SSH is not required for wired mode."""
         device_id, msg = self.get_adb_device_id()
@@ -195,11 +219,15 @@ class DeviceManager:
 
         self.current_adb_device_id = device_id
         self.connection_mode = "adb"
+        remount_success, remount_msg = self.remount_partitions_via_adb(device_id)
         device_ip = self.get_current_device_ip_via_adb()
         if device_ip:
             self.current_device_ip = device_ip
-        log_manager.info(f"[ADB] USB ADB connected: {device_id}, ip={device_ip or 'N/A'}")
-        return True, f"ADB连接成功: {device_id}", device_ip
+        if remount_success:
+            log_manager.info(f"[ADB] USB ADB connected: {device_id}, ip={device_ip or 'N/A'}, {remount_msg}")
+        else:
+            log_manager.warning(f"[ADB] USB ADB connected but remount is incomplete: {remount_msg}")
+        return True, f"ADB连接成功: {device_id}\n{remount_msg}", device_ip
 
     def run_adb_shell_command(self, command, device_id=None, timeout=15):
         """通过ADB执行shell命令。"""
@@ -269,6 +297,44 @@ class DeviceManager:
         success, output = self.run_adb_shell_command(ps_command, device_id=device_id, timeout=5)
         return bool(success and output.strip()), output
 
+    def remount_partitions_via_adb(self, device_id=None):
+        """Remount known writable partitions after USB ADB connects."""
+        if not device_id:
+            device_id, msg = self.get_adb_device_id()
+            if not device_id:
+                return False, msg
+
+        partitions = ["/", "/oem", "/device_data"]
+        messages = []
+        all_ok = True
+
+        for partition in partitions:
+            quoted = shlex.quote(partition)
+            command = (
+                f"if [ ! -e {quoted} ]; then echo 'skip: {partition} not found'; exit 0; fi; "
+                f"if ! awk -v p={quoted} '$2==p {{found=1}} END {{exit found ? 0 : 1}}' /proc/mounts; "
+                f"then echo 'skip: {partition} not mounted'; exit 0; fi; "
+                f"mount -o remount,rw {quoted} 2>/dev/null || mount -o rw,remount {quoted} 2>/dev/null || true; "
+                f"opts=$(awk -v p={quoted} '$2==p {{print $4; exit}}' /proc/mounts); "
+                "if echo \"$opts\" | grep -qw rw; then echo \"$opts\"; exit 0; fi; "
+                "echo \"${opts:-unknown}\"; exit 1"
+            )
+            success, output = self.run_adb_shell_command(command, device_id=device_id, timeout=10)
+            output = (output or "").strip()
+            if success and output.startswith("skip:"):
+                messages.append(output)
+                log_manager.info(f"[ADB] remount skipped: {output}")
+            elif success:
+                messages.append(f"{partition}: rw")
+                log_manager.info(f"[ADB] remount rw ok: {partition} ({output})")
+            else:
+                all_ok = False
+                detail = output or "unknown error"
+                messages.append(f"{partition}: remount failed ({detail})")
+                log_manager.warning(f"[ADB] remount rw failed: {partition}, {detail}")
+
+        return all_ok, "分区读写挂载: " + "; ".join(messages)
+
     def ensure_ssh_service_via_adb(self):
         """通过ADB挂载分区、启动sshd，并清除root密码。"""
         device_id, msg = self.get_adb_device_id()
@@ -276,15 +342,13 @@ class DeviceManager:
             log_manager.warning(f"[ADB] 无法通过ADB启动SSH服务: {msg}")
             return False, msg
 
+        remount_success, remount_msg = self.remount_partitions_via_adb(device_id)
+        messages = [remount_msg]
+
         init_commands = [
-            ("挂载根文件系统", "mount -o remount,rw /"),
-            ("挂载OEM分区", "mount -o remount,rw /oem"),
-            ("挂载数据分区", "mount -o remount,rw /device_data"),
             ("启动SSH服务", "/etc/init.d/S50sshd start"),
             ("清除root密码", "passwd -d root"),
         ]
-
-        messages = []
         for desc, command in init_commands:
             log_manager.info(f"[ADB] {desc}: {command}")
             success, output = self.run_adb_shell_command(command, device_id=device_id, timeout=15)
@@ -296,7 +360,7 @@ class DeviceManager:
                 log_manager.warning(f"[ADB] {desc}返回: {output}")
 
         time.sleep(0.8)
-        return True, "；".join(messages)
+        return remount_success, "；".join(messages)
 
     def get_current_device_ip_via_adb(self):
         """通过ADB获取设备当前WiFi IP。"""
@@ -343,15 +407,15 @@ class DeviceManager:
                 self.connection_mode = "adb"
                 return True, output
             log_manager.warning(f"[ADB] shell command failed, command={command}, output={output}")
-            if self.connection_mode == "adb":
-                return False, f"ADB命令执行失败: {output}"
         else:
             log_manager.info(f"[ADB] shell command skipped: {adb_msg}")
 
-        # 如果没有SSH连接，尝试自动重连到上次连接的设备
-        if not self.ssh_client and self.current_device_ip:
-            log_manager.info(f"[DEVICE] SSH连接已关闭，正在自动重连到 {self.current_device_ip}...")
-            success, msg = self.connect_ssh(self.current_device_ip)
+        # Try SSH when ADB is unavailable or an ADB shell command fails.
+        current_ip = str(self.current_device_ip or "").strip()
+        can_try_ssh = bool(re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", current_ip))
+        if not self.ssh_client and can_try_ssh:
+            log_manager.info(f"[DEVICE] SSH连接已关闭，正在自动重连到 {current_ip}...")
+            success, msg = self.connect_ssh(current_ip)
             if not success:
                 log_manager.error(f"[DEVICE] 自动重连失败: {msg}")
                 return False, f"未建立SSH连接且自动重连失败: {msg}"

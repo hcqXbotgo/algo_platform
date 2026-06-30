@@ -258,6 +258,47 @@ class DeviceTrackingJsonListWorker(QObject):
             self.finished.emit(False, str(e), [])
 
 
+class SshConnectWorker(QObject):
+    """Background SSH connector used as ADB backup/fallback."""
+
+    finished = pyqtSignal(bool, str, str)
+
+    def __init__(self, device_manager, candidate_ips, auto_start_ssh=True):
+        super().__init__()
+        self.device_manager = device_manager
+        self.candidate_ips = [ip for ip in candidate_ips if ip]
+        self.auto_start_ssh = auto_start_ssh
+
+    @pyqtSlot()
+    def run(self):
+        errors = []
+        seen = set()
+        for ip in self.candidate_ips:
+            ip = str(ip).strip()
+            if not ip or ip in seen:
+                continue
+            seen.add(ip)
+            try:
+                log_manager.info(f"[SSH] background connect attempt: {ip}")
+                success, msg = self.device_manager.connect_ssh(
+                    ip,
+                    retries=2,
+                    timeout=1.5,
+                    banner_timeout=1.0,
+                    auth_timeout=2.0,
+                    channel_timeout=2.0,
+                    retry_delay=0.3,
+                    auto_start_ssh=self.auto_start_ssh,
+                )
+                if success:
+                    self.finished.emit(True, ip, msg)
+                    return
+                errors.append(f"{ip}: {msg}")
+            except Exception as e:
+                errors.append(f"{ip}: {e}")
+        self.finished.emit(False, "", "; ".join(errors) or "没有可用SSH候选IP")
+
+
 class DetectionMergeWorker(QObject):
     """拉取追踪结果并调用 merge_detections.py 合成带框视频。"""
 
