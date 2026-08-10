@@ -18,6 +18,8 @@ from device_manager import DeviceManager, connect_ssh_with_retry
 class PerformanceMonitor:
     """性能监控器"""
 
+    FALCON2_DDR_FREQ = 3733
+
     def __init__(self):
         self.monitoring = False
         self.ssh_client = None
@@ -25,11 +27,14 @@ class PerformanceMonitor:
         self.connection_mode = None
         self.device_ip = None
         self.ddr_freq = 1848
+        self.memory_source = None
+        self.npu_source = None
+        self.ddr_source = None
         self.history_data = {
             'timestamps': [],
             'npu_core0': [],  # NPU Core0占用率
             'npu_core1': [],  # NPU Core1占用率
-            'npu_load': [],   # NPU平均占用率
+            'npu_load': [],   # NPU综合占用率
             'cpu_usage': [],
             'memory_used_mb': [],  # 内存实际使用量(MB)
             'memory_total_mb': [], # 内存总量(MB)
@@ -53,6 +58,7 @@ class PerformanceMonitor:
         self.latest_data = {}
         self.monitor_thread = None
         self.tool_path = "/userdata/rk-msch-probe-for-user-64bit-1"
+        self.falcon2_ddr_tool_path = "/userdata/ddr_bandwidth.sh"
         self.local_tool_path = None  # 本地工具文件路径，需要外部设置
         bundled_tool = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -160,6 +166,9 @@ class PerformanceMonitor:
         self.ddr_status = "初始化中"
         self.ddr_last_error = ""
         self.ddr_output_tail = []
+        self.memory_source = None
+        self.npu_source = None
+        self.ddr_source = None
 
         # 建立连接：USB ADB 优先，ADB 不可用再回退 SSH。
         try:
@@ -196,7 +205,7 @@ class PerformanceMonitor:
             'timestamps': [],
             'npu_core0': [],  # NPU Core0占用率
             'npu_core1': [],  # NPU Core1占用率
-            'npu_load': [],   # NPU平均占用率
+            'npu_load': [],   # NPU综合占用率
             'cpu_usage': [],
             'memory_used_mb': [],  # 内存实际使用量(MB)
             'memory_total_mb': [], # 内存总量(MB)
@@ -243,10 +252,16 @@ class PerformanceMonitor:
                 if progress_callback:
                     progress_callback(90, f"DDR监控未启动: {msg}")
         else:
-            self.ddr_status = "工具不可用"
-            print("[性能监控] 警告: DDR工具不可用，将跳过DDR监控")
-            if progress_callback:
-                progress_callback(90, "DDR工具不可用，跳过DDR监控")
+            if self.ddr_source == "vssdk":
+                self.ddr_status = "已禁用"
+                print("[性能监控] Falcon2 DDR监控已禁用，跳过ddr_bandwidth.sh")
+                if progress_callback:
+                    progress_callback(90, "Falcon2 DDR监控已禁用")
+            else:
+                self.ddr_status = "工具不可用"
+                print("[性能监控] 警告: DDR工具不可用，将跳过DDR监控")
+                if progress_callback:
+                    progress_callback(90, "DDR工具不可用，跳过DDR监控")
 
         # 启动监控线程
         if progress_callback:
@@ -292,7 +307,7 @@ class PerformanceMonitor:
                 pass
             self.ddr_process = None
 
-        self._execute_command("pkill -f '[r]k-msch-probe-for-user-64bit-1' >/dev/null 2>&1 || true")
+        self._execute_command(self._build_ddr_stop_command())
         self.ddr_status = "已停止"
 
         # 等待读取线程结束
@@ -314,9 +329,27 @@ class PerformanceMonitor:
         self.ddr_last_error = message
 
     def _build_ddr_command(self):
+        if self.ddr_source == "vssdk":
+            return (
+                "cd /userdata && ./ddr_bandwidth.sh "
+                f"-p 100 -f {self.FALCON2_DDR_FREQ} "
+                "-w 32 -b 0x100000 -t 1 -d 0xf00000"
+            )
         tool_dir = os.path.dirname(self.tool_path) or "/userdata"
         tool_name = os.path.basename(self.tool_path)
         return f"cd {tool_dir} && ./{tool_name} -c rk3576 -f {self.ddr_freq} -l 2 2>&1"
+
+    def _build_ddr_stop_command(self):
+        if self.ddr_source == "vssdk":
+            return "pkill -f '[d]dr_bandwidth' >/dev/null 2>&1 || true"
+        return "pkill -f '[r]k-msch-probe-for-user-64bit-1' >/dev/null 2>&1 || true"
+
+    def _build_adb_ddr_args(self, command):
+        args = ["adb", "-s", self.adb_device_id, "shell"]
+        if self.ddr_source == "vssdk":
+            args.append("-tt")
+        args.append(command)
+        return args
 
     def _start_ddr_monitoring(self):
         """启动DDR阻塞监控命令"""
@@ -327,14 +360,14 @@ class PerformanceMonitor:
                 print("[DDR] 工具不存在，无法启动DDR监控")
                 return False
 
-            self._execute_command("pkill -f '[r]k-msch-probe-for-user-64bit-1' >/dev/null 2>&1 || true")
+            self._execute_command(self._build_ddr_stop_command())
             command = self._build_ddr_command()
             print(f"[DDR] 启动阻塞监控命令: {command}")
 
             if self.connection_mode == "adb":
                 creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0
                 self.ddr_process = subprocess.Popen(
-                    ["adb", "-s", self.adb_device_id, "shell", command],
+                    self._build_adb_ddr_args(command),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -440,12 +473,22 @@ class PerformanceMonitor:
     def _record_ddr_line(self, line):
         self.ddr_output_tail.append(line)
         self.ddr_output_tail = self.ddr_output_tail[-20:]
-        print(f"[DDR输出] {line}")
+        if self.ddr_source != "vssdk" or re.match(r"\s*total\s+avg\s+bw", line, re.IGNORECASE):
+            print(f"[DDR输出] {line}")
         self._parse_ddr_line(line)
 
     def _parse_ddr_line(self, line):
         """解析DDR输出行"""
         try:
+            falcon2_data = self._parse_falcon2_ddr_line(line)
+            if falcon2_data:
+                ddr_data = self.latest_ddr_data.copy()
+                ddr_data.update(falcon2_data)
+                self.latest_ddr_data = ddr_data
+                self.ddr_status = "运行中"
+                self.ddr_last_error = ""
+                return
+
             # 查找包含模块带宽的行
             # 格式: "master bw(MB/s)       158.05    82.30    75.75     0.00  2017.36   447.48 ..."
             if 'master bw(MB/s)' in line:
@@ -457,6 +500,25 @@ class PerformanceMonitor:
                 self._parse_ddr_total_line(line)
         except Exception as e:
             print(f"[DDR解析] 失败: {e}, 行: {line[:100]}")
+
+    @staticmethod
+    def _parse_falcon2_ddr_line(line):
+        """解析 Falcon2 DDR 总/写/读带宽及总线占用率。"""
+        match = re.match(
+            r"\s*(total(?:_wr|_rd)?)\s+avg\s+bw\s*=\s*"
+            r"([0-9]+(?:\.[0-9]+)?)\s*MB/s\s*,\s*"
+            r"avg\s+occupancy\s*=\s*([0-9]+(?:\.[0-9]+)?)%",
+            line,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+
+        metric = match.group(1).lower()
+        return {
+            metric: float(match.group(2)),
+            f"{metric}_occupancy": float(match.group(3)),
+        }
 
     def _parse_ddr_bandwidth_line(self, line):
         """解析带宽行，提取各模块数据"""
@@ -525,7 +587,7 @@ class PerformanceMonitor:
                 print(f"[性能监控] {timestamp} | "
                       f"NPU(Core0:{self.latest_npu_data['core0']:.1f}%, "
                       f"Core1:{self.latest_npu_data['core1']:.1f}%, "
-                      f"平均:{npu_load:.1f}%) | "
+                      f"综合:{npu_load:.1f}%) | "
                       f"CPU: {cpu_usage:.1f}% | "
                       f"MEM: {memory_used_mb:.0f}/{memory_total_mb:.0f} MB ({memory_usage:.1f}%) | "
                       f"DDR总: {ddr_total:.2f} MB/s")
@@ -572,6 +634,7 @@ class PerformanceMonitor:
                     'memory_usage': memory_usage,
                     'ddr_total': ddr_total,
                     'ddr_modules': ddr_modules,
+                    'ddr_source': self.ddr_source,
                     'ddr_status': self.ddr_status,
                     'ddr_error': self.ddr_last_error
                 }
@@ -614,7 +677,8 @@ class PerformanceMonitor:
 
     def _check_tool_exists(self):
         """检查设备上是否存在DDR带宽测试工具"""
-        command = f"test -x {self.tool_path} && echo 'exists' || echo 'not_exists'"
+        tool_path = self.falcon2_ddr_tool_path if self.ddr_source == "vssdk" else self.tool_path
+        command = f"test -x {tool_path} && echo 'exists' || echo 'not_exists'"
         output = self._execute_command(command)
         return output == 'exists'
 
@@ -722,8 +786,19 @@ class PerformanceMonitor:
 
     def _ensure_tool_available(self, progress_callback=None):
         """确保DDR带宽测试工具可用"""
+        if self.ddr_source is None:
+            self._detect_ddr_source()
+
+        # Falcon2 暂不执行 ddr_bandwidth.sh，避免运行脚本后 ADB 断开。
+        if self.ddr_source == "vssdk":
+            return False
+
         if self._check_tool_exists():
             return True
+
+        if self.ddr_source == "vssdk":
+            print(f"Falcon2 DDR工具不存在或不可执行: {self.falcon2_ddr_tool_path}")
+            return False
 
         local_tool_path = self._resolve_local_tool_path()
         if not local_tool_path:
@@ -737,34 +812,101 @@ class PerformanceMonitor:
             return False
         return True
 
+    def _detect_ddr_source(self):
+        """检测 DDR 统计接口；Falcon2 使用 ddr_bandwidth.sh。"""
+        output = self._execute_command(
+            "if [ -e /proc/vssdk/npu ] || [ -e /proc/vssdk/mmz ] || "
+            "[ -e /userdata/ddr_bandwidth.sh ]; then echo vssdk; else echo rknpu; fi"
+        )
+        self.ddr_source = "vssdk" if output.strip() == "vssdk" else "rknpu"
+        print(f"[DDR] 使用数据源: {self.ddr_source}")
+
+    def _detect_npu_source(self):
+        """检测设备 NPU 统计接口；Falcon2 使用 VSSDK，旧设备使用 RKNPU。"""
+        output = self._execute_command(
+            "if [ -r /proc/vssdk/npu ]; then echo vssdk; else echo rknpu; fi"
+        )
+        self.npu_source = "vssdk" if output.strip() == "vssdk" else "rknpu"
+        print(f"[NPU] 使用数据源: {self.npu_source}")
+
+    @staticmethod
+    def _parse_npu_load(output):
+        """解析 Falcon2 VSSDK 或旧设备 RKNPU 的负载输出。"""
+        if not output:
+            return None
+
+        core0_match = re.search(r"Core0:\s*([\d.]+)%", output, re.IGNORECASE)
+        core1_match = re.search(r"Core1:\s*([\d.]+)%", output, re.IGNORECASE)
+        if core0_match and core1_match:
+            core0 = float(core0_match.group(1))
+            core1 = float(core1_match.group(1))
+            return {"core0": core0, "core1": core1, "avg": (core0 + core1) / 2.0}
+
+        in_runtime_section = False
+        utilization_index = None
+        cluster_loads = {}
+        for line in output.splitlines():
+            stripped = line.strip()
+            if "npu runtime info" in stripped.lower():
+                in_runtime_section = True
+                continue
+            if not in_runtime_section:
+                continue
+            if stripped.startswith("-"):
+                break
+
+            parts = stripped.split()
+            if utilization_index is None:
+                lowered_parts = [part.lower() for part in parts]
+                if "clusterid" in lowered_parts and "hw_utilization" in lowered_parts:
+                    utilization_index = lowered_parts.index("hw_utilization")
+                continue
+
+            if not parts or not parts[0].isdigit() or len(parts) <= utilization_index:
+                continue
+            utilization = parts[utilization_index].rstrip("%")
+            cluster_loads[int(parts[0])] = float(utilization)
+
+        if cluster_loads:
+            core0 = cluster_loads.get(0, 0.0)
+            core1 = cluster_loads.get(1, 0.0)
+            weighted_load = (core0 * 4.0 + core1 * 2.0) / 6.0
+            return {"core0": core0, "core1": core1, "avg": weighted_load}
+        return None
+
     def _get_npu_load(self):
-        """获取NPU占用率（分别统计Core0和Core1）"""
-        output = self._execute_command("cat /sys/kernel/debug/rknpu/load")
-        print(f"[NPU] 命令输出: {output}")
-        if output:
-            try:
-                # 解析输出，例如: "NPU load:  Core0:  0%, Core1:  0%,"
-                import re
-                # 提取Core0和Core1的百分比
-                core0_match = re.search(r'Core0:\s*([\d.]+)%', output)
-                core1_match = re.search(r'Core1:\s*([\d.]+)%', output)
+        """获取 NPU 占用率（分别统计 Core0 和 Core1）。"""
+        if self.npu_source is None:
+            self._detect_npu_source()
 
-                if core0_match and core1_match:
-                    core0 = float(core0_match.group(1))
-                    core1 = float(core1_match.group(1))
-                    avg = (core0 + core1) / 2.0
+        command = (
+            "cat /proc/vssdk/npu"
+            if self.npu_source == "vssdk"
+            else "cat /sys/kernel/debug/rknpu/load"
+        )
+        output = self._execute_command(command)
+        if self.npu_source == "vssdk":
+            print(f"[NPU] 已读取 VSSDK 统计信息，共 {len(output)} 字符")
+        else:
+            print(f"[NPU] 命令输出: {output}")
 
-                    # 保存最新数据
-                    self.latest_npu_data = {
-                        'core0': core0,
-                        'core1': core1,
-                        'avg': avg
-                    }
+        try:
+            result = self._parse_npu_load(output)
+            if result is None and self.npu_source == "vssdk":
+                result = self._parse_npu_load(
+                    self._execute_command("cat /sys/kernel/debug/rknpu/load")
+                )
+            if result is not None:
+                self.latest_npu_data = result
+                print(
+                    f"[NPU] Core0: {result['core0']:.1f}%, "
+                    f"Core1: {result['core1']:.1f}%, 综合: {result['avg']:.1f}%"
+                )
+                return result["avg"]
+        except (TypeError, ValueError) as e:
+            print(f"[NPU] 解析失败: {e}, 原始输出: {output}")
 
-                    print(f"[NPU] Core0: {core0:.1f}%, Core1: {core1:.1f}%, 平均: {avg:.1f}%")
-                    return avg
-            except Exception as e:
-                print(f"[NPU] 解析失败: {e}, 原始输出: {output}")
+        self.latest_npu_data = {"core0": 0.0, "core1": 0.0, "avg": 0.0}
         return 0.0
 
     def _get_cpu_usage(self):
@@ -810,23 +952,63 @@ class PerformanceMonitor:
                 print(f"[CPU备用] 解析失败: {e}")
         return 0.0
 
+    def _detect_memory_source(self):
+        """检测设备内存统计接口；Falcon2 使用 MMZ，旧设备使用 free。"""
+        output = self._execute_command(
+            "if [ -r /proc/vssdk/mmz ]; then echo mmz; else echo free; fi"
+        )
+        self.memory_source = "mmz" if output.strip() == "mmz" else "free"
+        print(f"[内存] 使用数据源: {self.memory_source}")
+
+    @staticmethod
+    def _parse_memory_usage(output):
+        """解析 Falcon2 MMZ 或旧设备 free 输出。"""
+        if not output:
+            return None
+
+        mmz_match = re.search(
+            r"mmz\s+use\s+summary:\s*total=(\d+(?:\.\d+)?)KB\s+"
+            r"used=(\d+(?:\.\d+)?)KB\s+free=(\d+(?:\.\d+)?)KB",
+            output,
+            re.IGNORECASE,
+        )
+        if mmz_match:
+            total_mb = float(mmz_match.group(1)) / 1024.0
+            used_mb = float(mmz_match.group(2)) / 1024.0
+            usage_percent = (used_mb / total_mb) * 100.0 if total_mb > 0 else 0.0
+            return usage_percent, used_mb, total_mb
+
+        for line in output.splitlines():
+            parts = line.split()
+            if parts and parts[0].rstrip(":").lower() == "mem" and len(parts) >= 3:
+                total_mb = float(parts[1])
+                used_mb = float(parts[2])
+                usage_percent = (used_mb / total_mb) * 100.0 if total_mb > 0 else 0.0
+                return usage_percent, used_mb, total_mb
+
+        return None
+
     def _get_memory_usage(self):
-        """获取内存占用率和实际使用量"""
-        output = self._execute_command("free -m | grep Mem")
+        """获取内存占用率和实际使用量。"""
+        if self.memory_source is None:
+            self._detect_memory_source()
+
+        command = "cat /proc/vssdk/mmz" if self.memory_source == "mmz" else "free -m"
+        output = self._execute_command(command)
         print(f"[内存] 命令输出: {output}")
-        if output:
-            try:
-                parts = output.split()
-                print(f"[内存] 解析结果: {parts}")
-                if len(parts) >= 3:
-                    total_mb = float(parts[1])
-                    used_mb = float(parts[2])
-                    usage_percent = (used_mb / total_mb) * 100.0 if total_mb > 0 else 0.0
-                    print(f"[内存] 计算结果: {used_mb}/{total_mb} MB = {usage_percent:.1f}%")
-                    # 返回元组：(占用率%, 已使用MB, 总MB)
-                    return usage_percent, used_mb, total_mb
-            except Exception as e:
-                print(f"[内存] 解析失败: {e}, 原始输出: {output}")
+
+        try:
+            result = self._parse_memory_usage(output)
+            if result is None and self.memory_source == "mmz":
+                # MMZ 接口偶发不可读时，尽量保留 Linux 内存统计数据。
+                result = self._parse_memory_usage(self._execute_command("free -m"))
+            if result is not None:
+                usage_percent, used_mb, total_mb = result
+                print(f"[内存] 计算结果: {used_mb:.2f}/{total_mb:.2f} MB = {usage_percent:.1f}%")
+                return result
+        except (TypeError, ValueError) as e:
+            print(f"[内存] 解析失败: {e}, 原始输出: {output}")
+
         return 0.0, 0.0, 0.0
 
 

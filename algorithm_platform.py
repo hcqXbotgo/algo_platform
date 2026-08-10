@@ -101,6 +101,8 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.current_device_ip = None
         self.connection_mode = None
         self.current_adb_device_id = None
+        self.adb_auto_reconnect_enabled = False
+        self.adb_reconnect_in_progress = False
         self.local_video_cache = {}
         self.track_modes_config = None
         self.track_modes = []
@@ -263,6 +265,9 @@ class AlgorithmValidationPlatform(QMainWindow):
             self.wifi_device_ip_label.setStyleSheet("color: green; font-weight: bold;")
 
         if adb_device_id:
+            self.adb_auto_reconnect_enabled = True
+            self._start_adb_monitor()
+        elif getattr(self, "adb_auto_reconnect_enabled", False):
             self._start_adb_monitor()
         else:
             self._stop_adb_monitor()
@@ -396,7 +401,9 @@ class AlgorithmValidationPlatform(QMainWindow):
         if not candidates:
             log_manager.info("[SSH] no saved WiFi IP to connect after ADB")
             return
-        self._start_background_ssh_connect(candidates, reason="backup", auto_start_ssh=True)
+        # A persistent Falcon2 DDR shell may be active on this ADB transport.
+        # Do not concurrently remount partitions or start sshd through ADB.
+        self._start_background_ssh_connect(candidates, reason="backup", auto_start_ssh=False)
 
     def _fallback_to_saved_ssh_after_adb_lost(self):
         candidates = self._get_saved_ssh_candidate_ips(self.current_device_ip)
@@ -422,10 +429,46 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.statusBar().showMessage("USB ADB已断开，正在切换到WiFi SSH...", 5000)
         self._start_background_ssh_connect(candidates, reason="fallback", auto_start_ssh=False)
 
+    def _try_restore_adb_connection(self):
+        if not getattr(self, "adb_auto_reconnect_enabled", False):
+            self._stop_adb_monitor()
+            return
+        if self.adb_reconnect_in_progress:
+            return
+
+        self.adb_reconnect_in_progress = True
+        try:
+            adb_device_id, adb_msg = self.device_manager.get_adb_device_id()
+            if not adb_device_id:
+                log_manager.debug(f"[ADB] waiting for USB reconnect: {adb_msg}")
+                return
+
+            log_manager.info(f"[ADB] USB device reappeared, reconnecting: {adb_device_id}")
+            success, msg, device_ip = self.device_manager.connect_adb()
+            if not success:
+                log_manager.warning(f"[ADB] USB reconnect failed: {msg}")
+                self.statusBar().showMessage(f"检测到USB ADB，但重新连接失败: {msg}", 5000)
+                return
+
+            restored_id = self.device_manager.current_adb_device_id or adb_device_id
+            endpoint = device_ip or restored_id
+            self._set_device_connection_state(endpoint, "adb", adb_device_id=restored_id)
+            self.statusBar().showMessage(f"USB ADB已重新连接: {restored_id}", 5000)
+            log_manager.info(f"[ADB] USB reconnect ready: device_id={restored_id}, ip={device_ip or 'N/A'}, {msg}")
+
+            if device_ip:
+                self._auto_connect_mqtt(device_ip)
+            self._try_connect_saved_ssh_after_adb(device_ip)
+            self.refresh_device_videos()
+            self.refresh_device_tracking_jsons()
+            self.load_track_modes()
+        finally:
+            self.adb_reconnect_in_progress = False
+
     def _monitor_adb_connection(self):
         adb_device_id = self.current_adb_device_id
         if not adb_device_id:
-            self._stop_adb_monitor()
+            self._try_restore_adb_connection()
             return
 
         connected, message = self.device_manager.is_adb_device_connected(adb_device_id, timeout=1.0)
@@ -433,7 +476,6 @@ class AlgorithmValidationPlatform(QMainWindow):
             return
 
         log_manager.warning(f"[ADB] monitored USB device disconnected: {message}")
-        self._stop_adb_monitor()
         self.adb_available = False
         self.current_adb_device_id = None
         self.device_manager.current_adb_device_id = None
@@ -2603,28 +2645,39 @@ class AlgorithmValidationPlatform(QMainWindow):
         metrics = [
             ("NPU Core0占用率", f"{data.get('npu_core0', 0):.1f}%"),
             ("NPU Core1占用率", f"{data.get('npu_core1', 0):.1f}%"),
-            ("NPU平均占用率", f"{data.get('npu_load', 0):.1f}%"),
+            ("NPU综合占用率", f"{data.get('npu_load', 0):.1f}%"),
             ("CPU占用率", f"{data.get('cpu_usage', 0):.1f}%"),
             ("内存使用", f"{data.get('memory_used_mb', 0):.0f} / {data.get('memory_total_mb', 0):.0f} MB"),
             ("内存占用率", f"{data.get('memory_usage', 0):.1f}%"),
             ("DDR状态", ddr_status),
             ("DDR总带宽", f"{data.get('ddr_total', 0):.2f} MB/s"),
-            ("DDR-CPU", f"{ddr_modules.get('cpu', 0):.2f} MB/s"),
-            ("DDR-CCI_M1", f"{ddr_modules.get('cci_m1', 0):.2f} MB/s"),
-            ("DDR-CCI_M2", f"{ddr_modules.get('cci_m2', 0):.2f} MB/s"),
-            ("DDR-GMAC", f"{ddr_modules.get('gmac', 0):.2f} MB/s"),
-            ("DDR-ISP", f"{ddr_modules.get('isp', 0):.2f} MB/s"),
-            ("DDR-VICAP", f"{ddr_modules.get('vicap', 0):.2f} MB/s"),
-            ("DDR-NPU", f"{ddr_modules.get('npu', 0):.2f} MB/s"),
-            ("DDR-CRYPTO", f"{ddr_modules.get('crypto', 0):.2f} MB/s"),
-            ("DDR-RGA", f"{ddr_modules.get('rga', 0):.2f} MB/s"),
-            ("DDR-VPSS", f"{ddr_modules.get('vpss', 0):.2f} MB/s"),
-            ("DDR-GPU", f"{ddr_modules.get('gpu', 0):.2f} MB/s"),
-            ("DDR-HDCP", f"{ddr_modules.get('hdcp', 0):.2f} MB/s"),
-            ("DDR-VOP", f"{ddr_modules.get('vop', 0):.2f} MB/s"),
-            ("DDR-UFSHC", f"{ddr_modules.get('ufshc', 0):.2f} MB/s"),
-            ("DDR-Others", f"{ddr_modules.get('others', 0):.2f} MB/s"),
         ]
+        if data.get('ddr_source') == 'vssdk':
+            metrics.extend([
+                ("DDR写带宽", f"{ddr_modules.get('total_wr', 0):.2f} MB/s"),
+                ("DDR读带宽", f"{ddr_modules.get('total_rd', 0):.2f} MB/s"),
+                ("DDR总占用率", f"{ddr_modules.get('total_occupancy', 0):.3f}%"),
+                ("DDR写占用率", f"{ddr_modules.get('total_wr_occupancy', 0):.3f}%"),
+                ("DDR读占用率", f"{ddr_modules.get('total_rd_occupancy', 0):.3f}%"),
+            ])
+        else:
+            metrics.extend([
+                ("DDR-CPU", f"{ddr_modules.get('cpu', 0):.2f} MB/s"),
+                ("DDR-CCI_M1", f"{ddr_modules.get('cci_m1', 0):.2f} MB/s"),
+                ("DDR-CCI_M2", f"{ddr_modules.get('cci_m2', 0):.2f} MB/s"),
+                ("DDR-GMAC", f"{ddr_modules.get('gmac', 0):.2f} MB/s"),
+                ("DDR-ISP", f"{ddr_modules.get('isp', 0):.2f} MB/s"),
+                ("DDR-VICAP", f"{ddr_modules.get('vicap', 0):.2f} MB/s"),
+                ("DDR-NPU", f"{ddr_modules.get('npu', 0):.2f} MB/s"),
+                ("DDR-CRYPTO", f"{ddr_modules.get('crypto', 0):.2f} MB/s"),
+                ("DDR-RGA", f"{ddr_modules.get('rga', 0):.2f} MB/s"),
+                ("DDR-VPSS", f"{ddr_modules.get('vpss', 0):.2f} MB/s"),
+                ("DDR-GPU", f"{ddr_modules.get('gpu', 0):.2f} MB/s"),
+                ("DDR-HDCP", f"{ddr_modules.get('hdcp', 0):.2f} MB/s"),
+                ("DDR-VOP", f"{ddr_modules.get('vop', 0):.2f} MB/s"),
+                ("DDR-UFSHC", f"{ddr_modules.get('ufshc', 0):.2f} MB/s"),
+                ("DDR-Others", f"{ddr_modules.get('others', 0):.2f} MB/s"),
+            ])
         self.perf_table.setRowCount(len(metrics))
         
         for i, (metric, value) in enumerate(metrics):
@@ -2656,7 +2709,7 @@ class AlgorithmValidationPlatform(QMainWindow):
                        linewidth=2, linestyle='-', color='#1f77b4')
             ax_npu.plot(timestamps, history['npu_core1'], label='Core1', marker='s', 
                        linewidth=2, linestyle='-', color='#ff7f0e')
-            ax_npu.plot(timestamps, history['npu_load'], label='平均', marker='^', 
+            ax_npu.plot(timestamps, history['npu_load'], label='综合', marker='^',
                        linewidth=2.5, linestyle='--', color='red')
             ax_npu.set_xlabel('采样点')
             ax_npu.set_ylabel('占用率 (%)')
@@ -2693,6 +2746,8 @@ class AlgorithmValidationPlatform(QMainWindow):
                 # 添加主要模块的带宽曲线
                 if history['ddr_modules']:
                     modules_to_show = {
+                        'total_wr': ('写带宽', '#17becf', '--'),
+                        'total_rd': ('读带宽', '#bcbd22', '--'),
                         'isp': ('ISP', '#1f77b4', '-'),
                         'npu': ('NPU', '#ff7f0e', '-'),
                         'vicap': ('VICAP', '#2ca02c', '-'),
@@ -2702,7 +2757,7 @@ class AlgorithmValidationPlatform(QMainWindow):
                     }
                     
                     for module, (label, color, style) in modules_to_show.items():
-                        if module in history['ddr_modules'][0]:
+                        if any(module in item for item in history['ddr_modules']):
                             module_data = [m.get(module, 0) for m in history['ddr_modules']]
                             ax_ddr.plot(timestamps, module_data, label=label, 
                                        linewidth=1.5, linestyle=style, color=color, alpha=0.7)
@@ -2765,7 +2820,7 @@ class AlgorithmValidationPlatform(QMainWindow):
                        linewidth=2, linestyle='-', color='#1f77b4')
             ax_npu.plot(timestamps, history['npu_core1'], label='Core1', marker='s', 
                        linewidth=2, linestyle='-', color='#ff7f0e')
-            ax_npu.plot(timestamps, history['npu_load'], label='平均', marker='^', 
+            ax_npu.plot(timestamps, history['npu_load'], label='综合', marker='^',
                        linewidth=2.5, linestyle='--', color='red')
             ax_npu.set_xlabel('采样点', fontsize=12)
             ax_npu.set_ylabel('占用率 (%)', fontsize=12)
@@ -2800,6 +2855,8 @@ class AlgorithmValidationPlatform(QMainWindow):
                 # 添加主要模块的带宽曲线
                 if history['ddr_modules']:
                     modules_to_show = {
+                        'total_wr': ('写带宽', '#17becf', '--'),
+                        'total_rd': ('读带宽', '#bcbd22', '--'),
                         'isp': ('ISP', '#1f77b4', '-'),
                         'npu': ('NPU', '#ff7f0e', '-'),
                         'vicap': ('VICAP', '#2ca02c', '-'),
@@ -2809,7 +2866,7 @@ class AlgorithmValidationPlatform(QMainWindow):
                     }
                     
                     for module, (label, color, style) in modules_to_show.items():
-                        if module in history['ddr_modules'][0]:
+                        if any(module in item for item in history['ddr_modules']):
                             module_data = [m.get(module, 0) for m in history['ddr_modules']]
                             ax_ddr.plot(timestamps, module_data, label=label, 
                                        linewidth=1.5, linestyle=style, color=color, alpha=0.7)

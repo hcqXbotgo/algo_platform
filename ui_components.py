@@ -240,7 +240,7 @@ class PerformanceTab:
         control_layout.addRow("采样间隔(秒):", parent.monitor_interval_spin)
         
         parent.ddr_freq_spin = QSpinBox()
-        parent.ddr_freq_spin.setRange(1000, 3000)
+        parent.ddr_freq_spin.setRange(1000, 5000)
         parent.ddr_freq_spin.setValue(1848)
         control_layout.addRow("DDR频率(MHz):", parent.ddr_freq_spin)
         
