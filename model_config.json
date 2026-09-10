@@ -1,0 +1,116 @@
+{
+  "model_dir": "/oem/usr/models/",
+  "modes": [
+    {
+      "id": 5,
+      "desc": "basketball_whole_over14",
+      "pitchInitialAngle": 0,
+      "models": [
+        {
+          "motFrameRate": 15,
+          "videoSrcType": "ANA_CAMERA",
+          "modelPath": "yolov8n_basketball_nv12_int8_xiaoyi.mgz",
+          "modelType": "YOLOV8_DETECTION",
+          "modelSize": {
+            "width": 3328,
+            "height": 1024
+          },
+          "labels": [
+            "person",
+            "ball",
+            "board",
+            "hoop"
+          ],
+          "anchorInfo": [],
+          "confidenceThreshold": 0.4,
+          "nmsThreshold": 0.3
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "desc": "basketball_whole_under14",
+      "pitchInitialAngle": 0,
+      "models": [
+        {
+          "motFrameRate": 15,
+          "videoSrcType": "ANA_CAMERA",
+          "modelPath": "yolov8n_basketball_nv12_int8_xiaoyi.mgz",
+          "modelType": "YOLOV8_DETECTION",
+          "modelSize": {
+            "width": 3328,
+            "height": 1024
+          },
+          "labels": [
+            "person",
+            "ball",
+            "board",
+            "hoop"
+          ],
+          "anchorInfo": [],
+          "confidenceThreshold": 0.4,
+          "nmsThreshold": 0.3
+        },
+        {
+          "motFrameRate": 30,
+          "videoSrcType": "ANA_CAMERA",
+          "modelPath": "yolov8n_960_960_nv12_int8_core1.mgz",
+          "modelType": "YOLOV8_DETECTION",
+          "modelSize": {
+            "width": 960,
+            "height": 960
+          },
+          "labels": [
+            "person",
+            "ball",
+            "board",
+            "hoop"
+          ],
+          "anchorInfo": [],
+          "confidenceThreshold": 0.4,
+          "nmsThreshold": 0.3
+        }
+      ]
+    },
+  {
+      "id": 7,
+      "desc": "basketball_half_over14",
+      "pitchInitialAngle": 0,
+      "models": [
+        {
+          "motFrameRate": 15,
+          "videoSrcType": "FILE_H264",
+          "videoFilePath": "/userdata/demo.mp4",
+          "modelPath": "yolov26n_basketball_int8_core0.mgz",
+          "modelType": "YOLOV26_DETECTION",
+          "modelSize": {
+            "width": 3328,
+            "height": 1024
+          },
+          "labels": ["person", "ball", "board", "hoop"],
+          "anchorInfo": []
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "desc": "basketball_half_under14",
+      "pitchInitialAngle": 0,
+      "models": [
+        {
+          "motFrameRate": 15,
+          "videoSrcType": "FILE_H264",
+          "videoFilePath": "/userdata/demo.mp4",
+          "modelPath": "yolov26n_basketball_E2E_int16_core0.mgz",
+          "modelType": "YOLOV26_E2E_DETECTION",
+          "modelSize": {
+            "width": 3328,
+            "height": 1024
+          },
+          "labels": ["person", "ball", "board", "hoop"],
+          "anchorInfo": []
+        }
+      ]
+    }
+  ]
+}

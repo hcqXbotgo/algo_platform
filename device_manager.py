@@ -96,6 +96,9 @@ class DeviceManager:
     
     def __init__(self):
         self.ssh_client = None
+        self.ssh_username = 'root'
+        self.ssh_password = ''
+        self.ssh_port = 22
         self.current_device_ip = None  # 保存当前连接的设备IP
         self.current_adb_device_id = None
         self.connection_mode = None
@@ -103,9 +106,9 @@ class DeviceManager:
     def connect_ssh(
         self,
         hostname,
-        username='root',
-        password='',
-        port=22,
+        username=None,
+        password=None,
+        port=None,
         retries=4,
         timeout=2.0,
         banner_timeout=1.5,
@@ -116,6 +119,12 @@ class DeviceManager:
     ):
         """建立SSH连接"""
         try:
+            username = self.ssh_username if username is None else username
+            password = self.ssh_password if password is None else password
+            port = self.ssh_port if port is None else port
+            self.ssh_username = username
+            self.ssh_password = password
+            self.ssh_port = port
             self.close_ssh()
             self.ssh_client, success, msg = connect_ssh_with_retry(
                 hostname,
@@ -497,7 +506,7 @@ class DeviceManager:
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             
             # 连接到设备
-            ssh_client.connect(hostname, port=22, username='root', password='')
+            ssh_client.connect(hostname, port=self.ssh_port, username=self.ssh_username, password=self.ssh_password)
             
             # 从SSH客户端获取SFTP客户端
             sftp = ssh_client.open_sftp()
@@ -664,7 +673,7 @@ class DeviceManager:
             # 使用SSHClient推送
             ssh_client = paramiko.SSHClient()
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh_client.connect(device_ip, port=22, username='root', password='')
+            ssh_client.connect(device_ip, port=self.ssh_port, username=self.ssh_username, password=self.ssh_password)
             
             sftp = ssh_client.open_sftp()
             sftp.put(config_file, remote_full_path)
@@ -863,7 +872,7 @@ class DeviceManager:
         try:
             ssh_client = paramiko.SSHClient()
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh_client.connect(device_ip, port=22, username='root', password='', timeout=15)
+            ssh_client.connect(device_ip, port=self.ssh_port, username=self.ssh_username, password=self.ssh_password, timeout=15)
 
             def run(command):
                 stdin, stdout, stderr = ssh_client.exec_command(command, timeout=30)
@@ -942,7 +951,7 @@ class DeviceManager:
             # 使用SSHClient下载
             ssh_client = paramiko.SSHClient()
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh_client.connect(device_ip, port=22, username='root', password='', timeout=10)
+            ssh_client.connect(device_ip, port=self.ssh_port, username=self.ssh_username, password=self.ssh_password, timeout=10)
             
             sftp = ssh_client.open_sftp()
             sftp.get(remote_path, local_path)
@@ -992,7 +1001,13 @@ class DeviceManager:
             # 创建SSH客户端并设置超时
             ssh_client = paramiko.SSHClient()
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh_client.connect(device_ip, port=22, username='root', password='', timeout=15)
+            ssh_client.connect(
+                device_ip,
+                port=self.ssh_port,
+                username=self.ssh_username,
+                password=self.ssh_password,
+                timeout=15,
+            )
             
             sftp = ssh_client.open_sftp()
             
@@ -1278,7 +1293,13 @@ class DeviceManager:
         try:
             ssh_client = paramiko.SSHClient()
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh_client.connect(device_ip, port=22, username='root', password='', timeout=15)
+            ssh_client.connect(
+                device_ip,
+                port=self.ssh_port,
+                username=self.ssh_username,
+                password=self.ssh_password,
+                timeout=15,
+            )
             sftp = ssh_client.open_sftp()
             total = sftp.stat(remote_path).st_size
             os.makedirs(os.path.dirname(local_path), exist_ok=True)

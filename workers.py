@@ -601,11 +601,14 @@ class LogDownloadWorker(QObject):
     progress = pyqtSignal(int, float, float, float)
     finished = pyqtSignal(bool, str, str)
 
-    def __init__(self, device_ip, remote_path, local_path):
+    def __init__(self, device_ip, remote_path, local_path, ssh_username="root", ssh_password="", ssh_port=22):
         super().__init__()
         self.device_ip = device_ip
         self.remote_path = remote_path
         self.local_path = local_path
+        self.ssh_username = ssh_username or "root"
+        self.ssh_password = ssh_password or ""
+        self.ssh_port = ssh_port or 22
         self.cancelled = False
         self._ssh = None
         self._sftp = None
@@ -641,7 +644,13 @@ class LogDownloadWorker(QObject):
 
             self._ssh = paramiko.SSHClient()
             self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self._ssh.connect(self.device_ip, port=22, username="root", password="", timeout=10)
+            self._ssh.connect(
+                self.device_ip,
+                port=self.ssh_port,
+                username=self.ssh_username,
+                password=self.ssh_password,
+                timeout=10,
+            )
             self._sftp = self._ssh.open_sftp()
 
             total = self._sftp.stat(self.remote_path).st_size

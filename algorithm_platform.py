@@ -6,6 +6,7 @@
 
 import sys
 import os
+import re
 import time
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
@@ -252,6 +253,10 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.device_manager.current_device_ip = endpoint
         self.device_manager.current_adb_device_id = adb_device_id
         self.device_manager.connection_mode = mode
+        self.performance_monitor.ssh_username = self.device_manager.ssh_username
+        self.performance_monitor.ssh_password = self.device_manager.ssh_password
+        self.performance_monitor.ssh_port = self.device_manager.ssh_port
+        self.performance_monitor.connection_mode = mode
 
         mode_text = "USB ADB" if mode == "adb" else "WiFi SSH"
         self.status_label.setText(f"OK {mode_text}: {endpoint}")
@@ -522,17 +527,56 @@ class AlgorithmValidationPlatform(QMainWindow):
 
     def connect_wireless_ssh(self):
         """Connect to the device through WiFi SSH."""
+        saved = self._get_saved_device_config()
         default_ip = self.current_device_ip if self.current_device_ip and "." in str(self.current_device_ip) else self._get_saved_device_ip()
-        device_ip, ok = QInputDialog.getText(self, "无线SSH连接", "设备IP:", text=default_ip)
-        if not ok:
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("无线SSH连接")
+        dialog.setMinimumWidth(380)
+        layout = QFormLayout(dialog)
+        ip_input = QLineEdit(default_ip)
+        port_input = QSpinBox()
+        port_input.setRange(1, 65535)
+        port_input.setValue(int(saved.get("ssh_port", 22) or 22))
+        username_input = QLineEdit(saved.get("ssh_username", "root"))
+        password_input = QLineEdit(saved.get("ssh_password", ""))
+        password_input.setEchoMode(QLineEdit.Password)
+        show_password = QCheckBox("显示密码")
+        show_password.toggled.connect(
+            lambda checked: password_input.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+        )
+        layout.addRow("设备IP:", ip_input)
+        layout.addRow("SSH端口:", port_input)
+        layout.addRow("用户名:", username_input)
+        layout.addRow("密码:", password_input)
+        layout.addRow("", show_password)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec_() != QDialog.Accepted:
             return
-        device_ip = device_ip.strip()
-        if not device_ip:
-            QMessageBox.warning(self, "错误", "请输入设备IP")
+        device_ip = ip_input.text().strip()
+        username = username_input.text().strip()
+        password = password_input.text()
+        port = port_input.value()
+        if not device_ip or not username:
+            QMessageBox.warning(self, "错误", "设备IP和用户名不能为空")
             return
 
+        self.device_manager.ssh_username = username
+        self.device_manager.ssh_password = password
+        self.device_manager.ssh_port = port
+
         self.statusBar().showMessage(f"正在连接SSH: {device_ip}...", 5000)
-        success, msg = self.device_manager.connect_ssh(device_ip)
+        success, msg = self.device_manager.connect_ssh(
+            device_ip,
+            username=username,
+            password=password,
+            port=port,
+            auto_start_ssh=False,
+        )
         if not success:
             QMessageBox.critical(self, "SSH连接失败", msg)
             self.statusBar().showMessage(f"SSH连接失败: {msg}", 5000)
@@ -553,6 +597,16 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.refresh_device_videos()
         self.refresh_device_tracking_jsons()
         self.load_track_modes()
+        self.save_device_config(
+            device_ip,
+            saved.get("rtsp_0", ""),
+            saved.get("rtsp_1", ""),
+            saved.get("wifi_ssid", ""),
+            saved.get("wifi_password", ""),
+            username,
+            password,
+            port,
+        )
         QMessageBox.information(self, "SSH连接成功", f"已通过无线SSH连接设备: {device_ip}")
 
     def _auto_connect_mqtt(self, device_ip):
@@ -2222,6 +2276,14 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.critical(self, "错误", f"推送配置失败：\n{str(e)}")
             self.statusBar().showMessage("推送配置失败")
             
+    @staticmethod
+    def _strip_ansi_sequences(text):
+        """移除设备命令输出中的 ANSI 终端控制序列。"""
+        if not text:
+            return ""
+        ansi_pattern = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
+        return ansi_pattern.sub("", text)
+
     def browse_device_log_file(self):
         """从设备浏览日志文件"""
         if not self.device_connected or not self.current_device_ip:
@@ -2251,6 +2313,7 @@ class AlgorithmValidationPlatform(QMainWindow):
 
             # 连接到设备
             success, output = self.device_manager.execute_ssh_command("ls /userdata/logs/*.log")
+            output = self._strip_ansi_sequences(output)
             
             if not success or not output:
                 progress_dialog.close()
@@ -2319,6 +2382,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         try:
             # 连接到设备，获取日志文件列表
             success, output = self.device_manager.execute_ssh_command("ls -lh /userdata/logs/*.log 2>/dev/null || echo 'NO_FILES'")
+            output = self._strip_ansi_sequences(output)
             
             if not success:
                 QMessageBox.warning(self, "错误", f"无法获取设备日志文件列表:\n{output}")
@@ -2641,17 +2705,27 @@ class AlgorithmValidationPlatform(QMainWindow):
                 ddr_error = ddr_error[:117] + "..."
             ddr_status = f"{ddr_status}: {ddr_error}"
 
-        # 更新表格 - 显示NPU各Core、CPU、内存(MB)、DDR状态、DDR总带宽和各模块
+        # 内存：所有设备统计 free(系统内存)；Falcon2 额外统计 MMZ 媒体内存
+        memory_rows = [
+            ("内存使用", f"{data.get('memory_used_mb', 0):.0f} / {data.get('memory_total_mb', 0):.0f} MB"),
+            ("内存占用率", f"{data.get('memory_usage', 0):.1f}%"),
+        ]
+        if data.get('memory_source') == 'mmz':
+            memory_rows.extend([
+                ("MMZ使用", f"{data.get('mmz_used_mb', 0):.0f} / {data.get('mmz_total_mb', 0):.0f} MB"),
+                ("MMZ占用率", f"{data.get('mmz_usage', 0):.1f}%"),
+            ])
         metrics = [
             ("NPU Core0占用率", f"{data.get('npu_core0', 0):.1f}%"),
             ("NPU Core1占用率", f"{data.get('npu_core1', 0):.1f}%"),
             ("NPU综合占用率", f"{data.get('npu_load', 0):.1f}%"),
             ("CPU占用率", f"{data.get('cpu_usage', 0):.1f}%"),
-            ("内存使用", f"{data.get('memory_used_mb', 0):.0f} / {data.get('memory_total_mb', 0):.0f} MB"),
-            ("内存占用率", f"{data.get('memory_usage', 0):.1f}%"),
+        ] + memory_rows + [
             ("DDR状态", ddr_status),
             ("DDR总带宽", f"{data.get('ddr_total', 0):.2f} MB/s"),
         ]
+        if data.get('npu_core_count', 2) <= 1:
+            metrics = [("NPU占用率", f"{data.get('npu_load', 0):.1f}%")] + metrics[3:]
         if data.get('ddr_source') == 'vssdk':
             metrics.extend([
                 ("DDR写带宽", f"{ddr_modules.get('total_wr', 0):.2f} MB/s"),
@@ -2705,11 +2779,13 @@ class AlgorithmValidationPlatform(QMainWindow):
             timestamps = range(len(history['timestamps']))
             
             # 1. NPU占用率图（左上）
-            ax_npu.plot(timestamps, history['npu_core0'], label='Core0', marker='o', 
-                       linewidth=2, linestyle='-', color='#1f77b4')
-            ax_npu.plot(timestamps, history['npu_core1'], label='Core1', marker='s', 
-                       linewidth=2, linestyle='-', color='#ff7f0e')
-            ax_npu.plot(timestamps, history['npu_load'], label='综合', marker='^',
+            single_npu_core = self.performance_monitor.get_latest_data().get('npu_core_count', 2) <= 1
+            if not single_npu_core:
+                ax_npu.plot(timestamps, history['npu_core0'], label='Core0', marker='o',
+                           linewidth=2, linestyle='-', color='#1f77b4')
+                ax_npu.plot(timestamps, history['npu_core1'], label='Core1', marker='s',
+                           linewidth=2, linestyle='-', color='#ff7f0e')
+            ax_npu.plot(timestamps, history['npu_load'], label='NPU' if single_npu_core else '综合', marker='^',
                        linewidth=2.5, linestyle='--', color='red')
             ax_npu.set_xlabel('采样点')
             ax_npu.set_ylabel('占用率 (%)')
@@ -2729,8 +2805,17 @@ class AlgorithmValidationPlatform(QMainWindow):
             ax_cpu.set_ylim(0, 100)
             
             # 3. 内存使用图（左下）- 使用实际MB数
-            ax_mem.plot(timestamps, history['memory_used_mb'], label='已使用', 
+            ax_mem.plot(timestamps, history['memory_used_mb'], label='Linux已使用',
                        marker='v', linewidth=2, linestyle='-', color='#9467bd')
+            # Falcon2 额外绘制 MMZ 媒体内存使用曲线
+            if history.get('mmz_used_mb') and any(v > 0 for v in history['mmz_used_mb']):
+                ax_mem.plot(timestamps, history['mmz_used_mb'], label='MMZ已使用',
+                           marker='^', linewidth=2, linestyle='--', color='#e377c2')
+                # 总使用量 = 系统内存(free) + MMZ 媒体内存
+                total_used = [f + m for f, m in
+                              zip(history['memory_used_mb'], history['mmz_used_mb'])]
+                ax_mem.plot(timestamps, total_used, label='总使用',
+                           marker='o', linewidth=2.5, linestyle='-', color='#17a2b8')
             ax_mem.set_xlabel('采样点')
             ax_mem.set_ylabel('内存 (MB)')
             ax_mem.set_title('内存使用')
@@ -2816,11 +2901,13 @@ class AlgorithmValidationPlatform(QMainWindow):
             timestamps = range(len(history['timestamps']))
             
             # 1. NPU占用率图（左上）
-            ax_npu.plot(timestamps, history['npu_core0'], label='Core0', marker='o', 
-                       linewidth=2, linestyle='-', color='#1f77b4')
-            ax_npu.plot(timestamps, history['npu_core1'], label='Core1', marker='s', 
-                       linewidth=2, linestyle='-', color='#ff7f0e')
-            ax_npu.plot(timestamps, history['npu_load'], label='综合', marker='^',
+            single_npu_core = self.performance_monitor.get_latest_data().get('npu_core_count', 2) <= 1
+            if not single_npu_core:
+                ax_npu.plot(timestamps, history['npu_core0'], label='Core0', marker='o',
+                           linewidth=2, linestyle='-', color='#1f77b4')
+                ax_npu.plot(timestamps, history['npu_core1'], label='Core1', marker='s',
+                           linewidth=2, linestyle='-', color='#ff7f0e')
+            ax_npu.plot(timestamps, history['npu_load'], label='NPU' if single_npu_core else '综合', marker='^',
                        linewidth=2.5, linestyle='--', color='red')
             ax_npu.set_xlabel('采样点', fontsize=12)
             ax_npu.set_ylabel('占用率 (%)', fontsize=12)
@@ -2840,8 +2927,17 @@ class AlgorithmValidationPlatform(QMainWindow):
             ax_cpu.set_ylim(0, 100)
             
             # 3. 内存使用图（左下）- 使用实际MB数
-            ax_mem.plot(timestamps, history['memory_used_mb'], label='已使用', 
+            ax_mem.plot(timestamps, history['memory_used_mb'], label='Linux已使用',
                        marker='v', linewidth=2, linestyle='-', color='#9467bd')
+            # Falcon2 额外绘制 MMZ 媒体内存使用曲线
+            if history.get('mmz_used_mb') and any(v > 0 for v in history['mmz_used_mb']):
+                ax_mem.plot(timestamps, history['mmz_used_mb'], label='MMZ已使用',
+                           marker='^', linewidth=2, linestyle='--', color='#e377c2')
+                # 总使用量 = 系统内存(free) + MMZ 媒体内存
+                total_used = [f + m for f, m in
+                              zip(history['memory_used_mb'], history['mmz_used_mb'])]
+                ax_mem.plot(timestamps, total_used, label='总使用',
+                           marker='o', linewidth=2.5, linestyle='-', color='#17a2b8')
             ax_mem.set_xlabel('采样点', fontsize=12)
             ax_mem.set_ylabel('内存 (MB)', fontsize=12)
             ax_mem.set_title('内存使用', fontsize=14, fontweight='bold')
@@ -2902,7 +2998,9 @@ class AlgorithmValidationPlatform(QMainWindow):
             
     def analyze_log(self):
         """分析日志文件"""
-        log_file = self.log_file_edit.text()
+        log_file = self._strip_ansi_sequences(self.log_file_edit.text()).strip()
+        if log_file != self.log_file_edit.text():
+            self.log_file_edit.setText(log_file)
         if not log_file:
             QMessageBox.warning(self, "错误", "请选择有效的日志文件")
             return
@@ -2925,6 +3023,15 @@ class AlgorithmValidationPlatform(QMainWindow):
             
             # 使用LogAnalyzer分析
             results = self.log_analyzer.analyze(log_file)
+            if not results:
+                QMessageBox.warning(
+                    self,
+                    "未找到数据",
+                    "日志中没有匹配到模型推理耗时和总耗时记录。\n"
+                    "请确认日志包含 'infer spend time' 和 'Detection time'。",
+                )
+                self.statusBar().showMessage("日志分析完成，但未匹配到耗时数据", 5000)
+                return
             
             # 显示汇总结果（类似已部署模型的表格效果）
             self.result_table.setRowCount(len(results))
@@ -2939,10 +3046,14 @@ class AlgorithmValidationPlatform(QMainWindow):
                 self.result_table.setItem(i, 3, QTableWidgetItem(f"{stats['total_max']:.3f}"))
                 # 第4列：帧数
                 self.result_table.setItem(i, 4, QTableWidgetItem(str(stats['frame_count'])))
-                # 第5列：推理标准差(ms)
-                self.result_table.setItem(i, 5, QTableWidgetItem(f"{stats['infer_std']:.3f}"))
-                # 第6列：总耗时标准差(ms)
-                self.result_table.setItem(i, 6, QTableWidgetItem(f"{stats['total_std']:.3f}"))
+                # 第5列：按 infer 完成记录的时间跨度计算实际聚合吞吐
+                measured_fps = stats.get('measured_fps')
+                fps_text = f"{measured_fps:.2f}" if measured_fps is not None else "N/A"
+                self.result_table.setItem(i, 5, QTableWidgetItem(fps_text))
+                # 第6列：推理标准差(ms)
+                self.result_table.setItem(i, 6, QTableWidgetItem(f"{stats['infer_std']:.3f}"))
+                # 第7列：总耗时标准差(ms)
+                self.result_table.setItem(i, 7, QTableWidgetItem(f"{stats['total_std']:.3f}"))
             
             # 绘制曲线
             self.plot_log_results(log_file)
@@ -3003,7 +3114,14 @@ class AlgorithmValidationPlatform(QMainWindow):
         progress_layout.addWidget(cancel_btn)
 
         self.log_download_thread = QThread()
-        self.log_download_worker = LogDownloadWorker(self.current_device_ip, remote_log_file, local_file)
+        self.log_download_worker = LogDownloadWorker(
+            self.current_device_ip,
+            remote_log_file,
+            local_file,
+            self.device_manager.ssh_username,
+            self.device_manager.ssh_password,
+            self.device_manager.ssh_port,
+        )
         self.log_download_worker.moveToThread(self.log_download_thread)
 
         def update_progress(percent, transferred_mb, total_mb, speed_mbps):
@@ -3106,20 +3224,24 @@ class AlgorithmValidationPlatform(QMainWindow):
             QMessageBox.warning(self, "警告", "请先分析日志文件")
             return
         
-        # 选择保存目录
-        default_plot_dir = os.path.join(self.log_analysis_output_dir, "plots")
-        os.makedirs(default_plot_dir, exist_ok=True)
-        save_dir = QFileDialog.getExistingDirectory(
-            self, 
-            "选择保存图片的目录",
-            default_plot_dir,
-        )
+        try:
+            # 选择保存目录
+            default_plot_dir = os.path.join(self.log_analysis_output_dir, "plots")
+            os.makedirs(default_plot_dir, exist_ok=True)
+            save_dir = QFileDialog.getExistingDirectory(
+                self,
+                "选择保存图片的目录",
+                default_plot_dir,
+            )
+        except Exception as e:
+            log_manager.error(f"[LOG] 打开耗时图片导出目录失败: {e}", exc_info=True)
+            QMessageBox.critical(self, "错误", f"无法打开导出目录：\n{str(e)}")
+            return
         
         if not save_dir:
             return
         
         try:
-            import os
             from matplotlib.figure import Figure
             from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
             
@@ -3153,12 +3275,17 @@ class AlgorithmValidationPlatform(QMainWindow):
                 infer_avg = np.mean(model_data['infer'][:length])
                 total_avg = np.mean(model_data['total'][:length])
                 stats_text = f'Avg Infer: {infer_avg:.2f} ms\nAvg Total: {total_avg:.2f} ms\nFrames: {length}'
+                measured_fps = self.log_analyzer._calculate_measured_fps(model_data)
+                if measured_fps != "":
+                    stats_text += f'\nMeasured Infer FPS: {measured_fps:.2f}'
                 ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
                        fontsize=9)
                 
                 # 保存图片
-                safe_model_name = model_name.replace('.rknn', '').replace('/', '_').replace('\\', '_')
+                safe_model_name = os.path.splitext(str(model_name))[0]
+                safe_model_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', safe_model_name)
+                safe_model_name = safe_model_name.strip(" .") or "model"
                 file_path = os.path.join(save_dir, f"{safe_model_name}.png")
                 fig.savefig(file_path, dpi=150, bbox_inches='tight')
                 exported_files.append(file_path)
@@ -3178,6 +3305,7 @@ class AlgorithmValidationPlatform(QMainWindow):
                 QMessageBox.warning(self, "警告", "没有可导出的数据")
                 
         except Exception as e:
+            log_manager.error(f"[LOG] 导出耗时曲线图失败: {e}", exc_info=True)
             QMessageBox.critical(self, "错误", f"导出失败：\n{str(e)}")
             
     def browse_video_file(self):
@@ -3213,6 +3341,7 @@ class AlgorithmValidationPlatform(QMainWindow):
             mode_id=self._get_selected_track_mode_id(),
             video_src_type=self._get_tracking_video_src_type(),
             mode_updates=config_updates,
+            reset_tracking_on_success=True,
         )
 
     def _run_video_source_apply(
@@ -3222,6 +3351,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         mode_id=None,
         video_src_type=None,
         mode_updates=None,
+        reset_tracking_on_success=False,
     ):
         if not self.current_device_ip:
             QMessageBox.warning(self, "错误", "请先通过'一键配置设备'连接设备")
@@ -3272,6 +3402,13 @@ class AlgorithmValidationPlatform(QMainWindow):
         def finished(success, msg):
             progress_dialog.accept()
             if success:
+                if reset_tracking_on_success:
+                    self.is_tracking = False
+                    self.track_btn.setText("启动追踪")
+                    self.track_btn.setStyleSheet(
+                        "background-color: #4CAF50; color: white; padding: 10px;"
+                    )
+                    self._stop_tracking_runtime_clock()
                 self.load_track_modes()
                 self.statusBar().showMessage(msg, 5000)
                 QMessageBox.information(self, "成功", msg)
@@ -3654,16 +3791,17 @@ class AlgorithmValidationPlatform(QMainWindow):
         if not models:
             return "该模式未配置模型"
         items = []
-        items.append(
-            f"motFrameRate={mode.get('motFrameRate', 'N/A')}, "
-            f"pitchInitialAngle={mode.get('pitchInitialAngle', 'N/A')}"
-        )
+        items.append(f"pitchInitialAngle={mode.get('pitchInitialAngle', 'N/A')}")
         for index, model in enumerate(models):
             name = model.get("modelPath") or model.get("modelName") or "未知模型"
             source = model.get("videoSrcType", "未知视频源")
             size = model.get("modelSize") or {}
             size_text = f"{size.get('width', '?')}x{size.get('height', '?')}" if isinstance(size, dict) else "未知尺寸"
-            items.append(f"模型{index}: {name} / {source} / {size_text}")
+            frame_rate = model.get("motFrameRate", "N/A")
+            items.append(
+                f"模型{index}: {name} / {source} / {size_text} / "
+                f"motFrameRate={frame_rate}"
+            )
         return "；".join(items)
 
     def on_track_mode_changed(self, *args):
@@ -3675,8 +3813,6 @@ class AlgorithmValidationPlatform(QMainWindow):
         if not mode:
             return
 
-        if hasattr(self, "mot_frame_rate_spin"):
-            self.mot_frame_rate_spin.setValue(int(mode.get("motFrameRate", 20) or 20))
         if hasattr(self, "pitch_initial_angle_spin"):
             self.pitch_initial_angle_spin.setValue(float(mode.get("pitchInitialAngle", 0) or 0))
 
@@ -3688,7 +3824,11 @@ class AlgorithmValidationPlatform(QMainWindow):
             for index, model in enumerate(models):
                 path = model.get("modelPath") or "未配置模型"
                 model_type = model.get("modelType") or "未知类型"
-                self.tracking_model_entry_combo.addItem(f"[{index}] {path} / {model_type}", index)
+                frame_rate = model.get("motFrameRate", "N/A")
+                self.tracking_model_entry_combo.addItem(
+                    f"[{index}] {path} / {model_type} / {frame_rate} fps",
+                    index,
+                )
                 if previous_index is not None and int(previous_index) == index:
                     self.tracking_model_entry_combo.setCurrentIndex(self.tracking_model_entry_combo.count() - 1)
             if not models:
@@ -3712,6 +3852,8 @@ class AlgorithmValidationPlatform(QMainWindow):
             return
 
         model = models[model_index]
+        if hasattr(self, "mot_frame_rate_spin"):
+            self.mot_frame_rate_spin.setValue(int(model.get("motFrameRate", 20) or 20))
         if hasattr(self, "tracking_model_path_combo"):
             self._populate_editable_combo(
                 self.tracking_model_path_combo,
@@ -3801,7 +3943,10 @@ class AlgorithmValidationPlatform(QMainWindow):
             return value if value > 0 else None
         mode = self._get_mode_by_id(self._get_selected_track_mode_id())
         try:
-            value = int(mode.get("motFrameRate", 0)) if mode else 0
+            models = mode.get("models", []) if mode else []
+            model_index = self._get_selected_model_index()
+            model = models[model_index] if 0 <= model_index < len(models) else {}
+            value = int(model.get("motFrameRate", 0))
             return value if value > 0 else None
         except (TypeError, ValueError):
             return None
@@ -3933,13 +4078,13 @@ class AlgorithmValidationPlatform(QMainWindow):
 
         return {
             "mode_fields": {
-                "motFrameRate": int(self.mot_frame_rate_spin.value()) if hasattr(self, "mot_frame_rate_spin") else mode.get("motFrameRate", 20),
                 "pitchInitialAngle": self._normalize_number(
                     self.pitch_initial_angle_spin.value() if hasattr(self, "pitch_initial_angle_spin") else mode.get("pitchInitialAngle", 0)
                 ),
             },
             "model_index": model_index,
             "model_fields": {
+                "motFrameRate": int(self.mot_frame_rate_spin.value()) if hasattr(self, "mot_frame_rate_spin") else models[model_index].get("motFrameRate", 20),
                 "modelPath": model_path,
                 "modelSize": {
                     "width": int(self.model_width_spin.value()) if hasattr(self, "model_width_spin") else 1,
@@ -4171,7 +4316,10 @@ class AlgorithmValidationPlatform(QMainWindow):
                     for i, ts in enumerate(history['timestamps']):
                         f.write(f"[{ts}] NPU: {history['npu_load'][i]:.1f}% | ")
                         f.write(f"CPU: {history['cpu_usage'][i]:.1f}% | ")
-                        f.write(f"MEM: {history['memory_usage'][i]:.1f}%\n")
+                        f.write(f"MEM: {history['memory_usage'][i]:.1f}%")
+                        if history['mmz_usage'][i] > 0:
+                            f.write(f" | MMZ: {history['mmz_usage'][i]:.1f}%")
+                        f.write("\n")
                 f.write("\n")
                 
                 # 日志分析数据
@@ -4218,6 +4366,10 @@ class AlgorithmValidationPlatform(QMainWindow):
             # 加载配置
             with open(self.device_config_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
+
+            self.device_manager.ssh_username = config.get('ssh_username') or 'root'
+            self.device_manager.ssh_password = config.get('ssh_password') or ''
+            self.device_manager.ssh_port = int(config.get('ssh_port', 22) or 22)
             
             device_ip = config.get('device_ip')
             
@@ -4383,15 +4535,29 @@ class AlgorithmValidationPlatform(QMainWindow):
         # 自动加载追踪模式
         self.load_track_modes()
         
-    def save_device_config(self, device_ip, rtsp_0, rtsp_1, wifi_ssid='', wifi_password=''):
+    def save_device_config(
+        self,
+        device_ip,
+        rtsp_0,
+        rtsp_1,
+        wifi_ssid='',
+        wifi_password='',
+        ssh_username=None,
+        ssh_password=None,
+        ssh_port=None,
+    ):
         """保存设备配置到本地文件"""
         try:
+            previous = self._get_saved_device_config()
             config = {
                 'device_ip': device_ip,
                 'wifi_ssid': wifi_ssid,
                 'wifi_password': wifi_password,
                 'rtsp_0': rtsp_0,
                 'rtsp_1': rtsp_1,
+                'ssh_username': ssh_username if ssh_username is not None else previous.get('ssh_username', 'root'),
+                'ssh_password': ssh_password if ssh_password is not None else previous.get('ssh_password', ''),
+                'ssh_port': ssh_port if ssh_port is not None else previous.get('ssh_port', 22),
                 'last_connected': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
             

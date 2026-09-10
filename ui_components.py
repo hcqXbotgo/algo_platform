@@ -87,15 +87,10 @@ class ModelConfigTab:
         task_layout.addRow("模式信息:", parent.track_mode_detail_label)
 
         mode_param_layout = QHBoxLayout()
-        parent.mot_frame_rate_spin = QSpinBox()
-        parent.mot_frame_rate_spin.setRange(1, 120)
-        parent.mot_frame_rate_spin.setSuffix(" fps")
         parent.pitch_initial_angle_spin = QDoubleSpinBox()
         parent.pitch_initial_angle_spin.setRange(-90.0, 90.0)
         parent.pitch_initial_angle_spin.setDecimals(2)
         parent.pitch_initial_angle_spin.setSingleStep(0.5)
-        mode_param_layout.addWidget(QLabel("motFrameRate:"))
-        mode_param_layout.addWidget(parent.mot_frame_rate_spin)
         mode_param_layout.addWidget(QLabel("pitchInitialAngle:"))
         mode_param_layout.addWidget(parent.pitch_initial_angle_spin)
         mode_param_layout.addStretch()
@@ -123,6 +118,11 @@ class ModelConfigTab:
         parent.tracking_model_path_combo = QComboBox()
         parent.tracking_model_path_combo.setEditable(True)
         task_layout.addRow("models/modelPath:", parent.tracking_model_path_combo)
+
+        parent.mot_frame_rate_spin = QSpinBox()
+        parent.mot_frame_rate_spin.setRange(1, 120)
+        parent.mot_frame_rate_spin.setSuffix(" fps")
+        task_layout.addRow("models/motFrameRate:", parent.mot_frame_rate_spin)
 
         model_size_layout = QHBoxLayout()
         parent.model_width_spin = QSpinBox()
@@ -442,13 +442,14 @@ class LogAnalysisTab:
         result_layout = QVBoxLayout()
         
         parent.result_table = QTableWidget()
-        parent.result_table.setColumnCount(7)
+        parent.result_table.setColumnCount(8)
         parent.result_table.setHorizontalHeaderLabels([
             "模型名称", 
             "推理平均(ms)", 
             "总耗时平均(ms)", 
             "最大耗时(ms)",
             "帧数",
+            "实测推理吞吐FPS",
             "推理标准差(ms)",
             "总耗时标准差(ms)"
         ])

@@ -7,6 +7,7 @@
 import re
 import csv
 import numpy as np
+from collections import deque
 from collections import defaultdict
 
 
@@ -20,42 +21,94 @@ class LogAnalyzer:
         """解析日志文件"""
         self.data = {}
         
-        infer_pattern = re.compile(r"infer spend time:(\d+\.\d+)\s*ms")
-        post_process_pattern = re.compile(r"yolov5 post_process took (\d+\.\d+)\s*ms")
-        detect_pattern = re.compile(r"Detection time for model \d+:\s*(\d+\.\d+)ms")
-        model_pattern = re.compile(r"Loading model from:\s*([\w\d\-_\.]+\.rknn)")
+        number_pattern = r"\d+(?:\.\d+)?"
+        infer_pattern = re.compile(
+            rf"infer spend time:\s*(?P<time>{number_pattern})\s*ms",
+            re.IGNORECASE,
+        )
+        post_process_pattern = re.compile(
+            rf"yolov5 post_process took ({number_pattern})\s*ms",
+            re.IGNORECASE,
+        )
+        detect_pattern = re.compile(
+            rf"Detection time for model (?P<model_id>\d+):\s*"
+            rf"(?P<time>{number_pattern})\s*ms",
+            re.IGNORECASE,
+        )
+        model_pattern = re.compile(
+            r"(?:Loading model from:|init ok:)\s*(\S+)",
+            re.IGNORECASE,
+        )
+        timestamp_pattern = re.compile(
+            r"(?P<hour>\d{2}):(?P<minute>\d{2}):"
+            r"(?P<second>\d{2})(?:\.(?P<fraction>\d+))?"
+        )
         
-        current_infer = None
-        current_model = None
+        pending_infers = deque()
+        known_models = []
+        last_clock_seconds = None
+        day_offset = 0.0
         
         def init_model(name):
             if name not in self.data:
-                self.data[name] = {"infer": [], "total": []}
+                self.data[name] = {"infer": [], "total": [], "infer_timestamps": []}
+
+        def remember_model(path):
+            name = path.replace("\\", "/").rsplit("/", 1)[-1]
+            if name and name not in known_models:
+                known_models.append(name)
+
+        def parse_timestamp(match):
+            nonlocal last_clock_seconds, day_offset
+            fraction = match.group("fraction") or ""
+            fraction_seconds = float(f"0.{fraction}") if fraction else 0.0
+            clock_seconds = (
+                int(match.group("hour")) * 3600
+                + int(match.group("minute")) * 60
+                + int(match.group("second"))
+                + fraction_seconds
+            )
+            if last_clock_seconds is not None and clock_seconds < last_clock_seconds - 43200:
+                day_offset += 86400.0
+            last_clock_seconds = clock_seconds
+            return day_offset + clock_seconds
                 
         try:
             with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    
                     # 模型名 - 匹配初始化行
                     model_match = model_pattern.search(line)
                     if model_match:
-                        current_model = model_match.group(1)
-                        init_model(current_model)
-                        continue
+                        remember_model(model_match.group(1))
                         
-                    # infer - 必须在有 current_model 时才记录
+                    # infer 与后续 Detection 行配对，不依赖模型文件后缀。
                     infer_match = infer_pattern.search(line)
-                    if infer_match and current_model:
-                        current_infer = float(infer_match.group(1))
-                        continue
+                    if infer_match:
+                        timestamp_matches = list(timestamp_pattern.finditer(line, 0, infer_match.start()))
+                        infer_timestamp = (
+                            parse_timestamp(timestamp_matches[-1])
+                            if timestamp_matches else None
+                        )
+                        pending_infers.append(
+                            (float(infer_match.group("time")), infer_timestamp)
+                        )
                         
-                    # total（使用 Detection time）- 确保有 current_infer 和 current_model
-                    if current_infer is not None and current_model:
+                    # Detection 行携带模型序号，用它完成配对并进行分组。
+                    if pending_infers:
                         m = detect_pattern.search(line)
                         if m:
-                            self.data[current_model]["infer"].append(current_infer)
-                            self.data[current_model]["total"].append(float(m.group(1)))
-                            current_infer = None
+                            current_infer, current_infer_timestamp = pending_infers.popleft()
+                            model_id = int(m.group("model_id"))
+                            model_name = (
+                                known_models[model_id]
+                                if model_id < len(known_models)
+                                else f"model_{model_id}"
+                            )
+                            init_model(model_name)
+                            self.data[model_name]["infer"].append(current_infer)
+                            self.data[model_name]["total"].append(float(m.group("time")))
+                            if current_infer_timestamp is not None:
+                                self.data[model_name]["infer_timestamps"].append(current_infer_timestamp)
                             continue
                         
                         # 也尝试匹配 post_process 时间作为备选
@@ -80,6 +133,12 @@ class LogAnalyzer:
                 
             infer = np.array(d["infer"])
             total = np.array(d["total"])
+            timestamps = d.get("infer_timestamps", [])
+            measured_fps = None
+            if len(timestamps) >= 2:
+                elapsed = timestamps[-1] - timestamps[0]
+                if elapsed > 0:
+                    measured_fps = (len(timestamps) - 1) / elapsed
             
             results[model] = {
                 'infer_avg': float(np.mean(infer)),
@@ -87,7 +146,8 @@ class LogAnalyzer:
                 'total_max': float(np.max(total)),
                 'infer_std': float(np.std(infer)),
                 'total_std': float(np.std(total)),
-                'frame_count': len(infer)
+                'frame_count': len(infer),
+                'measured_fps': measured_fps,
             }
             
         return results
@@ -115,7 +175,10 @@ class LogAnalyzer:
         # 保存统计数据
         with open(summary_csv, "w", newline="", encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(["model", "infer_avg", "total_avg", "total_max", "infer_std", "total_std", "frame_count"])
+            writer.writerow([
+                "model", "infer_avg", "total_avg", "total_max", "infer_std",
+                "total_std", "frame_count", "measured_infer_fps"
+            ])
             
             for model, d in self.data.items():
                 if not d["infer"]:
@@ -131,12 +194,21 @@ class LogAnalyzer:
                     round(float(np.max(total)), 3),
                     round(float(np.std(infer)), 3),
                     round(float(np.std(total)), 3),
-                    len(infer)
+                    len(infer),
+                    self._calculate_measured_fps(d)
                 ])
                 
     def get_plot_data(self):
         """获取用于绘图的数据"""
         return self.data.copy()
+
+    @staticmethod
+    def _calculate_measured_fps(model_data):
+        timestamps = model_data.get("infer_timestamps", [])
+        if len(timestamps) < 2:
+            return ""
+        elapsed = timestamps[-1] - timestamps[0]
+        return round((len(timestamps) - 1) / elapsed, 3) if elapsed > 0 else ""
         
     def reset(self):
         """重置数据"""

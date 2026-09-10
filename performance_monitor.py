@@ -13,6 +13,7 @@ import subprocess
 from datetime import datetime
 
 from device_manager import DeviceManager, connect_ssh_with_retry
+from device_resources import DEVICE_DETECTION_COMMAND, DEVICE_RESOURCE_PROFILES
 
 
 class PerformanceMonitor:
@@ -23,6 +24,9 @@ class PerformanceMonitor:
     def __init__(self):
         self.monitoring = False
         self.ssh_client = None
+        self.ssh_username = 'root'
+        self.ssh_password = ''
+        self.ssh_port = 22
         self.adb_device_id = None
         self.connection_mode = None
         self.device_ip = None
@@ -30,6 +34,7 @@ class PerformanceMonitor:
         self.memory_source = None
         self.npu_source = None
         self.ddr_source = None
+        self.device_profile = None
         self.history_data = {
             'timestamps': [],
             'npu_core0': [],  # NPU Core0占用率
@@ -39,6 +44,9 @@ class PerformanceMonitor:
             'memory_used_mb': [],  # 内存实际使用量(MB)
             'memory_total_mb': [], # 内存总量(MB)
             'memory_usage': [],    # 内存占用率(%)
+            'mmz_used_mb': [],     # Falcon2 MMZ媒体内存使用量(MB)
+            'mmz_total_mb': [],    # Falcon2 MMZ媒体内存总量(MB)
+            'mmz_usage': [],       # Falcon2 MMZ媒体内存占用率(%)
             'ddr_total': [],       # DDR总带宽
             'ddr_modules': []      # 各模块带宽: {'cpu': x, 'isp': y, 'npu': z, ...}
         }
@@ -52,6 +60,9 @@ class PerformanceMonitor:
             'memory_used_mb': [],
             'memory_total_mb': [],
             'memory_usage': [],
+            'mmz_used_mb': [],
+            'mmz_total_mb': [],
+            'mmz_usage': [],
             'ddr_total': [],
             'ddr_modules': []
         }
@@ -76,7 +87,8 @@ class PerformanceMonitor:
         self.ddr_output_tail = []
 
         # NPU监控相关
-        self.latest_npu_data = {'core0': 0.0, 'core1': 0.0, 'avg': 0.0}
+        self.latest_npu_data = {'core0': 0.0, 'core1': 0.0, 'avg': 0.0, 'core_count': 2}
+        self._npu_smoothed_load = None
 
     def set_tool_path(self, local_path):
         """设置本地工具文件路径"""
@@ -109,6 +121,8 @@ class PerformanceMonitor:
         return None
 
     def _get_usb_adb_device_id(self):
+        if self.connection_mode == "ssh":
+            return None, "SSH模式已选择，跳过ADB探测"
         try:
             result = subprocess.run(
                 ["adb", "devices"],
@@ -169,6 +183,8 @@ class PerformanceMonitor:
         self.memory_source = None
         self.npu_source = None
         self.ddr_source = None
+        self.device_profile = None
+        self._npu_smoothed_load = None
 
         # 建立连接：USB ADB 优先，ADB 不可用再回退 SSH。
         try:
@@ -185,14 +201,14 @@ class PerformanceMonitor:
                     progress_callback(20, "正在建立SSH连接...")
                 print(f"[性能监控] ADB不可用({adb_msg})，正在连接设备 {device_ip} 的SSH...")
 
-                self.ssh_client, ssh_success, ssh_msg = connect_ssh_with_retry(device_ip)
+                self.ssh_client, ssh_success, ssh_msg = connect_ssh_with_retry(
+                    device_ip,
+                    username=self.ssh_username,
+                    password=self.ssh_password,
+                    port=self.ssh_port,
+                )
                 if not ssh_success:
-                    print(f"[性能监控] SSH直连失败，尝试通过ADB启动SSH服务: {ssh_msg}")
-                    adb_success, adb_start_msg = DeviceManager().ensure_ssh_service_via_adb()
-                    if adb_success:
-                        self.ssh_client, ssh_success, ssh_msg = connect_ssh_with_retry(device_ip, retries=3)
-                    if not ssh_success:
-                        raise Exception(f"{ssh_msg}; ADB启动SSH服务: {adb_start_msg}")
+                    raise Exception(f"SSH连接失败（不依赖ADB）: {ssh_msg}")
 
                 if progress_callback:
                     progress_callback(40, "SSH连接成功")
@@ -210,6 +226,9 @@ class PerformanceMonitor:
             'memory_used_mb': [],  # 内存实际使用量(MB)
             'memory_total_mb': [], # 内存总量(MB)
             'memory_usage': [],    # 内存占用率(%)
+            'mmz_used_mb': [],     # Falcon2 MMZ媒体内存使用量(MB)
+            'mmz_total_mb': [],    # Falcon2 MMZ媒体内存总量(MB)
+            'mmz_usage': [],       # Falcon2 MMZ媒体内存占用率(%)
             'ddr_total': [],       # DDR总带宽
             'ddr_modules': []      # 各模块带宽: {'cpu': x, 'isp': y, 'npu': z, ...}
         }
@@ -224,6 +243,9 @@ class PerformanceMonitor:
             'memory_used_mb': [],
             'memory_total_mb': [],
             'memory_usage': [],
+            'mmz_used_mb': [],
+            'mmz_total_mb': [],
+            'mmz_usage': [],
             'ddr_total': [],
             'ddr_modules': []
         }
@@ -236,7 +258,13 @@ class PerformanceMonitor:
             if progress_callback:
                 progress_callback(50 + int(percent * 0.3), message)
 
-        if self._ensure_tool_available(ddr_progress):
+        ddr_tool_available = self._ensure_tool_available(ddr_progress)
+        if ddr_tool_available and self.ddr_source == "vssdk":
+            self.ddr_status = "等待采样"
+            print("[性能监控] Falcon2 DDR单次采样已启用")
+            if progress_callback:
+                progress_callback(90, "Falcon2 DDR单次采样已就绪")
+        elif ddr_tool_available:
             if progress_callback:
                 progress_callback(85, "启动DDR监控...")
             if self._start_ddr_monitoring():
@@ -252,16 +280,10 @@ class PerformanceMonitor:
                 if progress_callback:
                     progress_callback(90, f"DDR监控未启动: {msg}")
         else:
-            if self.ddr_source == "vssdk":
-                self.ddr_status = "已禁用"
-                print("[性能监控] Falcon2 DDR监控已禁用，跳过ddr_bandwidth.sh")
-                if progress_callback:
-                    progress_callback(90, "Falcon2 DDR监控已禁用")
-            else:
-                self.ddr_status = "工具不可用"
-                print("[性能监控] 警告: DDR工具不可用，将跳过DDR监控")
-                if progress_callback:
-                    progress_callback(90, "DDR工具不可用，跳过DDR监控")
+            self.ddr_status = "工具不可用"
+            print("[性能监控] 警告: DDR工具不可用，将跳过DDR监控")
+            if progress_callback:
+                progress_callback(90, "DDR工具不可用，跳过DDR监控")
 
         # 启动监控线程
         if progress_callback:
@@ -328,21 +350,31 @@ class PerformanceMonitor:
         self.ddr_status = "异常"
         self.ddr_last_error = message
 
+    def _get_ddr_spec(self):
+        if self.device_profile:
+            return DEVICE_RESOURCE_PROFILES[self.device_profile].get("ddr")
+        if self.ddr_source:
+            for profile in DEVICE_RESOURCE_PROFILES.values():
+                ddr = profile.get("ddr")
+                if ddr and ddr.get("source") == self.ddr_source:
+                    return ddr
+        return DEVICE_RESOURCE_PROFILES[self._detect_device_profile()].get("ddr")
+
     def _build_ddr_command(self):
-        if self.ddr_source == "vssdk":
-            return (
-                "cd /userdata && ./ddr_bandwidth.sh "
-                f"-p 100 -f {self.FALCON2_DDR_FREQ} "
-                "-w 32 -b 0x100000 -t 1 -d 0xf00000"
-            )
-        tool_dir = os.path.dirname(self.tool_path) or "/userdata"
-        tool_name = os.path.basename(self.tool_path)
-        return f"cd {tool_dir} && ./{tool_name} -c rk3576 -f {self.ddr_freq} -l 2 2>&1"
+        ddr = self._get_ddr_spec()
+        if not ddr:
+            return "true"
+        return ddr["command"].format(
+            freq=self.FALCON2_DDR_FREQ if ddr["source"] == "vssdk" else self.ddr_freq,
+            tool_dir=os.path.dirname(self.tool_path) or "/userdata",
+            tool_name=os.path.basename(self.tool_path),
+        )
 
     def _build_ddr_stop_command(self):
-        if self.ddr_source == "vssdk":
-            return "pkill -f '[d]dr_bandwidth' >/dev/null 2>&1 || true"
-        return "pkill -f '[r]k-msch-probe-for-user-64bit-1' >/dev/null 2>&1 || true"
+        ddr = self._get_ddr_spec()
+        if ddr:
+            return ddr["stop_command"]
+        return "true"
 
     def _build_adb_ddr_args(self, command):
         args = ["adb", "-s", self.adb_device_id, "shell"]
@@ -350,6 +382,58 @@ class PerformanceMonitor:
             args.append("-tt")
         args.append(command)
         return args
+
+    def _sample_falcon2_ddr(self):
+        """串行执行一次 Falcon2 DDR 采样，结束后释放 ADB shell。"""
+        command = self._build_ddr_command()
+        try:
+            if self.connection_mode == "adb":
+                creationflags = (
+                    subprocess.CREATE_NO_WINDOW
+                    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW")
+                    else 0
+                )
+                result = subprocess.run(
+                    self._build_adb_ddr_args(command),
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=8,
+                    creationflags=creationflags,
+                )
+                output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+                if result.returncode != 0:
+                    self._set_ddr_error(output.strip() or f"ADB返回码 {result.returncode}")
+                    return False
+            else:
+                output = self._execute_command(command)
+
+            sample_data = {}
+            for line in output.splitlines():
+                parsed = self._parse_falcon2_ddr_line(line)
+                if parsed:
+                    sample_data.update(parsed)
+
+            if "total" not in sample_data:
+                self._set_ddr_error("Falcon2 DDR单次采样未返回有效带宽数据")
+                return False
+
+            self.latest_ddr_data = sample_data
+            self.ddr_status = "运行中"
+            self.ddr_last_error = ""
+            print(
+                f"[DDR] Falcon2单次采样 - 总:{sample_data.get('total', 0):.2f} MB/s, "
+                f"写:{sample_data.get('total_wr', 0):.2f} MB/s, "
+                f"读:{sample_data.get('total_rd', 0):.2f} MB/s"
+            )
+            return True
+        except subprocess.TimeoutExpired:
+            self._set_ddr_error("Falcon2 DDR单次采样超时")
+        except Exception as e:
+            self._set_ddr_error(str(e))
+        return False
 
     def _start_ddr_monitoring(self):
         """启动DDR阻塞监控命令"""
@@ -478,6 +562,13 @@ class PerformanceMonitor:
         self._parse_ddr_line(line)
 
     def _parse_ddr_line(self, line):
+        ddr = self._get_ddr_spec()
+        parser = ddr.get("line_parser") if ddr else None
+        if parser:
+            parsed = parser(line)
+            if parsed:
+                self.latest_ddr_data.update(parsed)
+                return
         """解析DDR输出行"""
         try:
             falcon2_data = self._parse_falcon2_ddr_line(line)
@@ -576,6 +667,11 @@ class PerformanceMonitor:
                 npu_load = self._get_npu_load()
                 cpu_usage = self._get_cpu_usage()
                 memory_usage, memory_used_mb, memory_total_mb = self._get_memory_usage()
+                # Falcon2 同时统计 MMZ 媒体内存；旧设备为零值
+                mmz_usage, mmz_used_mb, mmz_total_mb = self._get_mmz_usage()
+
+                if self.ddr_source == "vssdk" and self.ddr_status != "工具不可用":
+                    self._sample_falcon2_ddr()
 
                 # 从DDR实时数据中获取
                 ddr_total = self.latest_ddr_data.get('total', 0.0)
@@ -584,12 +680,21 @@ class PerformanceMonitor:
                 timestamp = datetime.now().strftime("%H:%M:%S")
 
                 # 详细日志
+                mem_log = (f"MEM(free): {memory_used_mb:.0f}/{memory_total_mb:.0f} MB "
+                           f"({memory_usage:.1f}%)")
+                if self.memory_source == "mmz":
+                    mem_log += (f" | MEM(mmz): {mmz_used_mb:.0f}/{mmz_total_mb:.0f} MB "
+                                f"({mmz_usage:.1f}%)")
+                if self.latest_npu_data.get("core_count", 2) <= 1:
+                    npu_log = f"NPU:{npu_load:.1f}%"
+                else:
+                    npu_log = (f"NPU(Core0:{self.latest_npu_data['core0']:.1f}%, "
+                               f"Core1:{self.latest_npu_data['core1']:.1f}%, "
+                               f"综合:{npu_load:.1f}%)")
                 print(f"[性能监控] {timestamp} | "
-                      f"NPU(Core0:{self.latest_npu_data['core0']:.1f}%, "
-                      f"Core1:{self.latest_npu_data['core1']:.1f}%, "
-                      f"综合:{npu_load:.1f}%) | "
+                      f"{npu_log} | "
                       f"CPU: {cpu_usage:.1f}% | "
-                      f"MEM: {memory_used_mb:.0f}/{memory_total_mb:.0f} MB ({memory_usage:.1f}%) | "
+                      f"{mem_log} | "
                       f"DDR总: {ddr_total:.2f} MB/s")
 
                 # 更新历史数据
@@ -601,6 +706,9 @@ class PerformanceMonitor:
                 self.history_data['memory_used_mb'].append(memory_used_mb)
                 self.history_data['memory_total_mb'].append(memory_total_mb)
                 self.history_data['memory_usage'].append(memory_usage)
+                self.history_data['mmz_used_mb'].append(mmz_used_mb)
+                self.history_data['mmz_total_mb'].append(mmz_total_mb)
+                self.history_data['mmz_usage'].append(mmz_usage)
                 self.history_data['ddr_total'].append(ddr_total)
                 self.history_data['ddr_modules'].append(ddr_modules)
 
@@ -619,6 +727,9 @@ class PerformanceMonitor:
                 self.full_history_data['memory_used_mb'].append(memory_used_mb)
                 self.full_history_data['memory_total_mb'].append(memory_total_mb)
                 self.full_history_data['memory_usage'].append(memory_usage)
+                self.full_history_data['mmz_used_mb'].append(mmz_used_mb)
+                self.full_history_data['mmz_total_mb'].append(mmz_total_mb)
+                self.full_history_data['mmz_usage'].append(mmz_usage)
                 self.full_history_data['ddr_total'].append(ddr_total)
                 self.full_history_data['ddr_modules'].append(ddr_modules)
 
@@ -628,10 +739,15 @@ class PerformanceMonitor:
                     'npu_core0': self.latest_npu_data['core0'],
                     'npu_core1': self.latest_npu_data['core1'],
                     'npu_load': npu_load,
+                    'npu_core_count': self.latest_npu_data.get('core_count', 2),
                     'cpu_usage': cpu_usage,
                     'memory_used_mb': memory_used_mb,
                     'memory_total_mb': memory_total_mb,
                     'memory_usage': memory_usage,
+                    'mmz_used_mb': mmz_used_mb,
+                    'mmz_total_mb': mmz_total_mb,
+                    'mmz_usage': mmz_usage,
+                    'memory_source': self.memory_source,
                     'ddr_total': ddr_total,
                     'ddr_modules': ddr_modules,
                     'ddr_source': self.ddr_source,
@@ -674,6 +790,31 @@ class PerformanceMonitor:
         except Exception as e:
             print(f"命令执行异常 [{command}]: {e}")
             return ""
+
+    def _detect_device_profile(self):
+        if self.device_profile:
+            return self.device_profile
+        detected = self._execute_command(DEVICE_DETECTION_COMMAND).strip().lower()
+        self.device_profile = detected if detected in DEVICE_RESOURCE_PROFILES else "falcon"
+        print(f"[性能监控] 设备资源配置: {self.device_profile}")
+        return self.device_profile
+
+    def _get_resource_spec(self, resource_name):
+        profile_name = self._detect_device_profile()
+        return DEVICE_RESOURCE_PROFILES[profile_name].get(resource_name)
+
+    def _collect_resource(self, resource_name):
+        spec = self._get_resource_spec(resource_name)
+        if not spec:
+            return None
+        sample_count = int(spec.get("samples", 1))
+        outputs = []
+        for index in range(sample_count):
+            outputs.append(self._execute_command(spec["command"]))
+            if index + 1 < sample_count:
+                time.sleep(float(spec.get("sample_delay", 0)))
+        parser_input = outputs if sample_count > 1 else outputs[0]
+        return spec["parser"](parser_input)
 
     def _check_tool_exists(self):
         """检查设备上是否存在DDR带宽测试工具"""
@@ -789,8 +930,8 @@ class PerformanceMonitor:
         if self.ddr_source is None:
             self._detect_ddr_source()
 
-        # Falcon2 暂不执行 ddr_bandwidth.sh，避免运行脚本后 ADB 断开。
-        if self.ddr_source == "vssdk":
+        if self.ddr_source == "unsupported":
+            self.ddr_status = "不支持"
             return False
 
         if self._check_tool_exists():
@@ -813,21 +954,15 @@ class PerformanceMonitor:
         return True
 
     def _detect_ddr_source(self):
-        """检测 DDR 统计接口；Falcon2 使用 ddr_bandwidth.sh。"""
-        output = self._execute_command(
-            "if [ -e /proc/vssdk/npu ] || [ -e /proc/vssdk/mmz ] || "
-            "[ -e /userdata/ddr_bandwidth.sh ]; then echo vssdk; else echo rknpu; fi"
-        )
-        self.ddr_source = "vssdk" if output.strip() == "vssdk" else "rknpu"
-        print(f"[DDR] 使用数据源: {self.ddr_source}")
+        """Select the DDR collector configured for the detected platform."""
+        ddr = DEVICE_RESOURCE_PROFILES[self._detect_device_profile()].get("ddr")
+        self.ddr_source = ddr.get("source") if ddr else "unsupported"
+        print(f"[DDR] source: {self.ddr_source}")
 
     def _detect_npu_source(self):
-        """检测设备 NPU 统计接口；Falcon2 使用 VSSDK，旧设备使用 RKNPU。"""
-        output = self._execute_command(
-            "if [ -r /proc/vssdk/npu ]; then echo vssdk; else echo rknpu; fi"
-        )
-        self.npu_source = "vssdk" if output.strip() == "vssdk" else "rknpu"
-        print(f"[NPU] 使用数据源: {self.npu_source}")
+        """Select the NPU collector configured for the detected platform."""
+        self.npu_source = self._detect_device_profile()
+        print(f"[NPU] source: {self.npu_source}")
 
     @staticmethod
     def _parse_npu_load(output):
@@ -879,38 +1014,58 @@ class PerformanceMonitor:
         if self.npu_source is None:
             self._detect_npu_source()
 
-        command = (
-            "cat /proc/vssdk/npu"
-            if self.npu_source == "vssdk"
-            else "cat /sys/kernel/debug/rknpu/load"
-        )
-        output = self._execute_command(command)
+        npu_resource = DEVICE_RESOURCE_PROFILES[self.npu_source]["npu"]
+        output = self._execute_command(npu_resource["command"])
         if self.npu_source == "vssdk":
             print(f"[NPU] 已读取 VSSDK 统计信息，共 {len(output)} 字符")
         else:
             print(f"[NPU] 命令输出: {output}")
 
         try:
-            result = self._parse_npu_load(output)
-            if result is None and self.npu_source == "vssdk":
-                result = self._parse_npu_load(
-                    self._execute_command("cat /sys/kernel/debug/rknpu/load")
-                )
+            result = npu_resource["parser"](output)
             if result is not None:
+                alpha = npu_resource.get("smoothing_alpha")
+                if alpha and self._npu_smoothed_load is not None:
+                    result = dict(result)
+                    result["avg"] = alpha * result["avg"] + (1.0 - alpha) * self._npu_smoothed_load
+                    result["core0"] = alpha * result["core0"] + (1.0 - alpha) * self.latest_npu_data.get("core0", 0.0)
+                if alpha:
+                    self._npu_smoothed_load = result["avg"]
                 self.latest_npu_data = result
-                print(
-                    f"[NPU] Core0: {result['core0']:.1f}%, "
-                    f"Core1: {result['core1']:.1f}%, 综合: {result['avg']:.1f}%"
-                )
+                if result.get("core_count", 2) <= 1:
+                    core_text = f"NPU: {result['avg']:.1f}%"
+                else:
+                    core_text = f"Core0: {result['core0']:.1f}%"
+                    core_text += f", Core1: {result['core1']:.1f}%"
+                    core_text += f", 综合: {result['avg']:.1f}%"
+                print(f"[NPU] {core_text}")
                 return result["avg"]
+            alpha = npu_resource.get("smoothing_alpha")
+            if alpha and self._npu_smoothed_load is not None:
+                decayed = (1.0 - alpha) * self._npu_smoothed_load
+                self._npu_smoothed_load = decayed
+                self.latest_npu_data = {
+                    "core0": decayed,
+                    "core1": 0.0,
+                    "avg": decayed,
+                    "core_count": npu_resource.get("core_count", 1),
+                }
+                return decayed
         except (TypeError, ValueError) as e:
             print(f"[NPU] 解析失败: {e}, 原始输出: {output}")
 
-        self.latest_npu_data = {"core0": 0.0, "core1": 0.0, "avg": 0.0}
+        core_count = npu_resource.get("core_count", 2)
+        self.latest_npu_data = {"core0": 0.0, "core1": 0.0, "avg": 0.0, "core_count": core_count}
         return 0.0
 
     def _get_cpu_usage(self):
-        """获取CPU占用率"""
+        """Get CPU utilization using the platform resource registry."""
+        try:
+            cpu_usage = self._collect_resource("cpu")
+            if cpu_usage is not None:
+                return cpu_usage
+        except (TypeError, ValueError) as e:
+            print(f"[CPU] registered parser failed: {e}")
         # 使用更可靠的命令 - 直接从 /proc/stat 计算
         output1 = self._execute_command("cat /proc/stat | grep '^cpu '")
         time.sleep(0.5)
@@ -953,16 +1108,17 @@ class PerformanceMonitor:
         return 0.0
 
     def _detect_memory_source(self):
-        """检测设备内存统计接口；Falcon2 使用 MMZ，旧设备使用 free。"""
-        output = self._execute_command(
-            "if [ -r /proc/vssdk/mmz ]; then echo mmz; else echo free; fi"
-        )
-        self.memory_source = "mmz" if output.strip() == "mmz" else "free"
-        print(f"[内存] 使用数据源: {self.memory_source}")
+        """Detect whether the platform provides an additional memory pool."""
+        profile = DEVICE_RESOURCE_PROFILES[self._detect_device_profile()]
+        self.memory_source = "mmz" if profile.get("extra_memory") else "free"
+        print(f"[MEM] source: {self.memory_source}")
 
     @staticmethod
     def _parse_memory_usage(output):
-        """解析 Falcon2 MMZ 或旧设备 free 输出。"""
+        """解析内存统计输出，兼容 Falcon2 MMZ 与旧设备 free 两种格式。
+
+        传入 MMZ 输出时返回 MMZ 统计，传入 free 输出时返回 Linux 系统内存统计。
+        """
         if not output:
             return None
 
@@ -989,25 +1145,58 @@ class PerformanceMonitor:
         return None
 
     def _get_memory_usage(self):
-        """获取内存占用率和实际使用量。"""
+        """Get Linux system memory utilization for every platform."""
+        try:
+            result = self._collect_resource("memory")
+            if result is not None:
+                return result
+        except (TypeError, ValueError) as e:
+            print(f"[MEM] registered parser failed: {e}")
         if self.memory_source is None:
             self._detect_memory_source()
 
-        command = "cat /proc/vssdk/mmz" if self.memory_source == "mmz" else "free -m"
-        output = self._execute_command(command)
-        print(f"[内存] 命令输出: {output}")
+        output = self._execute_command("free -m")
+        print(f"[内存-free] 命令输出: {output}")
 
         try:
             result = self._parse_memory_usage(output)
-            if result is None and self.memory_source == "mmz":
-                # MMZ 接口偶发不可读时，尽量保留 Linux 内存统计数据。
-                result = self._parse_memory_usage(self._execute_command("free -m"))
             if result is not None:
                 usage_percent, used_mb, total_mb = result
-                print(f"[内存] 计算结果: {used_mb:.2f}/{total_mb:.2f} MB = {usage_percent:.1f}%")
+                print(f"[内存-free] 计算结果: {used_mb:.2f}/{total_mb:.2f} MB = {usage_percent:.1f}%")
                 return result
         except (TypeError, ValueError) as e:
-            print(f"[内存] 解析失败: {e}, 原始输出: {output}")
+            print(f"[内存-free] 解析失败: {e}, 原始输出: {output}")
+
+        return 0.0, 0.0, 0.0
+
+    def _get_mmz_usage(self):
+        """获取 Falcon2 MMZ 媒体内存占用率；非 Falcon2 设备返回零值。
+
+        Falcon2 同时统计 MMZ 与 free，两者独立采集互不影响。
+        """
+        if self.memory_source is None:
+            self._detect_memory_source()
+
+        if self.memory_source != "mmz":
+            return 0.0, 0.0, 0.0
+
+        extra_memory = self._get_resource_spec("extra_memory")
+        if not extra_memory:
+            return 0.0, 0.0, 0.0
+
+        output = self._execute_command(extra_memory["command"])
+        print(f"[内存-mmz] 命令输出: {output}")
+
+        try:
+            result = extra_memory["parser"](output)
+            if result is not None:
+                usage_percent, used_mb, total_mb = result
+                print(f"[内存-mmz] 计算结果: {used_mb:.2f}/{total_mb:.2f} MB = {usage_percent:.1f}%")
+                return result
+            # MMZ 接口偶发不可读时返回零值，不影响系统内存统计
+            print("[内存-mmz] 未匹配到 mmz 统计行")
+        except (TypeError, ValueError) as e:
+            print(f"[内存-mmz] 解析失败: {e}, 原始输出: {output}")
 
         return 0.0, 0.0, 0.0
 
@@ -1034,7 +1223,8 @@ class PerformanceMonitor:
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(['时间戳', 'NPU占用(%)', 'CPU占用(%)', '内存占用(%)', 'DDR带宽(MB/s)'])
+                writer.writerow(['时间戳', 'NPU占用(%)', 'CPU占用(%)',
+                                 '内存占用(%)', 'MMZ占用(%)', 'DDR带宽(MB/s)'])
 
                 for i in range(len(self.full_history_data['timestamps'])):
                     writer.writerow([
@@ -1042,6 +1232,7 @@ class PerformanceMonitor:
                         self.full_history_data['npu_load'][i],
                         self.full_history_data['cpu_usage'][i],
                         self.full_history_data['memory_usage'][i],
+                        self.full_history_data['mmz_usage'][i],
                         self.full_history_data['ddr_total'][i]
                     ])
 
