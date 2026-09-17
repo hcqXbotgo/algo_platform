@@ -1057,6 +1057,10 @@ class AutoConnectWorker(QObject):
         super().__init__()
         self.device_manager = device_manager
         self.config = config or {}
+        # Worker 可能在主窗口初始化完成前启动，使用配置自身覆盖管理器默认凭据。
+        self.device_manager.ssh_username = self.config.get('ssh_username') or 'root'
+        self.device_manager.ssh_password = self.config.get('ssh_password') or ''
+        self.device_manager.ssh_port = int(self.config.get('ssh_port', 22) or 22)
 
     def _run_wifi_setup(self, fallback_ip, rtsp_0, rtsp_1):
         from smart_device_manager import SmartDeviceManager

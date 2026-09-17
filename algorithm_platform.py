@@ -43,6 +43,8 @@ from mqtt_controller import MQTTController
 from wifi_manager import WiFiManager
 from device_setup_dialog import DeviceSetupDialog
 from rtmp_manager import RTMPManager
+from serial_console import SerialConsoleDialog
+from serial_manager import SerialManager
 from wifi_perf_test import WiFiPerfTester
 from ui_components import (
     LogAnalysisTab,
@@ -87,7 +89,8 @@ class AlgorithmValidationPlatform(QMainWindow):
         
         # 初始化组件
         self.device_manager = DeviceManager()
-        self.performance_monitor = PerformanceMonitor()
+        self.serial_manager = SerialManager()
+        self.performance_monitor = PerformanceMonitor(self.serial_manager)
         self.log_analyzer = LogAnalyzer()
         self.video_manager = VideoManager()
         self.mqtt_controller = MQTTController()
@@ -171,6 +174,11 @@ class AlgorithmValidationPlatform(QMainWindow):
         wireless_ssh_action.setToolTip("通过设备IP连接SSH，适用于无线网络")
         wireless_ssh_action.triggered.connect(self.connect_wireless_ssh)
         toolbar.addAction(wireless_ssh_action)
+
+        serial_console_action = QAction("串口终端", self)
+        serial_console_action.setToolTip("连接设备调试串口并执行命令")
+        serial_console_action.triggered.connect(self.open_serial_console)
+        toolbar.addAction(serial_console_action)
         
         toolbar.addSeparator()
         
@@ -257,6 +265,7 @@ class AlgorithmValidationPlatform(QMainWindow):
         self.performance_monitor.ssh_password = self.device_manager.ssh_password
         self.performance_monitor.ssh_port = self.device_manager.ssh_port
         self.performance_monitor.connection_mode = mode
+        self._update_performance_controls(None)
 
         mode_text = "USB ADB" if mode == "adb" else "WiFi SSH"
         self.status_label.setText(f"OK {mode_text}: {endpoint}")
@@ -608,6 +617,25 @@ class AlgorithmValidationPlatform(QMainWindow):
             port,
         )
         QMessageBox.information(self, "SSH连接成功", f"已通过无线SSH连接设备: {device_ip}")
+
+    def open_serial_console(self):
+        """打开可复用的设备调试串口连接。"""
+        saved = self._get_saved_device_config()
+        dialog = SerialConsoleDialog(
+            self.serial_manager,
+            preferred_port=saved.get("serial_port", ""),
+            preferred_baud=saved.get("serial_baud", 115200),
+            parent=self,
+        )
+        dialog.exec_()
+        if self.serial_manager.is_connected:
+            saved["serial_port"] = self.serial_manager.port
+            saved["serial_baud"] = self.serial_manager.baudrate
+            try:
+                with open(self.device_config_file, "w", encoding="utf-8") as config_file:
+                    json.dump(saved, config_file, indent=2, ensure_ascii=False)
+            except Exception as exc:
+                log_manager.warning(f"[SERIAL] 保存串口配置失败: {exc}")
 
     def _auto_connect_mqtt(self, device_ip):
         """自动连接MQTT（用户无感知）"""
@@ -2585,6 +2613,23 @@ class AlgorithmValidationPlatform(QMainWindow):
     def start_performance_monitor(self):
         """开始性能监控（保留兼容性）"""
         self.start_performance_monitor_action()
+
+    def _update_performance_controls(self, device_profile=None):
+        """Apply platform-specific availability and wording to monitor controls."""
+        if not hasattr(self, "ddr_freq_spin"):
+            return
+        profile = str(device_profile or "").strip().lower()
+        is_ambarella = profile == "ambarella"
+        self.ddr_freq_spin.setEnabled(not is_ambarella)
+        self.ddr_freq_spin.setVisible(not is_ambarella)
+        if is_ambarella:
+            self.ddr_freq_label.setText("DDR频率: 由设备回显推算")
+            self.ddr_freq_spin.setToolTip(
+                "安霸 dram_traffic 不接收DDR频率；监控结果会根据可用带宽推算频率"
+            )
+        else:
+            self.ddr_freq_label.setText("DDR频率(MHz):")
+            self.ddr_freq_spin.setToolTip("板端DDR统计工具使用的频率参数")
     
     def start_performance_monitor_action(self):
         """开始性能监控的实际操作"""
@@ -2601,6 +2646,11 @@ class AlgorithmValidationPlatform(QMainWindow):
             ip = self.current_device_ip
             ddr_freq = self.ddr_freq_spin.value()
             interval = self.monitor_interval_spin.value()
+            saved_config = self._get_saved_device_config()
+            self.performance_monitor.configure_serial(
+                saved_config.get("serial_port", ""),
+                saved_config.get("serial_baud", 115200),
+            )
             
             # 显示进度对话框
             progress_dialog = QDialog(self)
@@ -2635,14 +2685,21 @@ class AlgorithmValidationPlatform(QMainWindow):
                 progress_dialog.accept()
 
                 if success:
+                    profile = self.performance_monitor.device_profile
+                    self._update_performance_controls(profile)
                     self.is_monitoring = True
                     self.monitor_btn.setText("停止监控")
                     self.monitor_btn.setStyleSheet("background-color: #f44336; color: white;")
                     self.update_timer.start(interval * 1000)
-                    log_manager.info(
-                        f"[PERF] 性能监控已启动: ip={ip}, interval={interval}s, ddr_freq={ddr_freq}MHz"
+                    frequency_log = (
+                        "ddr_freq=device_reported"
+                        if profile == "ambarella"
+                        else f"ddr_freq={ddr_freq}MHz"
                     )
-                    self.statusBar().showMessage(f"性能监控运行中 - 采样间隔: {interval}秒", 5000)
+                    log_manager.info(
+                        f"[PERF] 性能监控已启动: ip={ip}, interval={interval}s, {frequency_log}"
+                    )
+                    self.statusBar().showMessage(f"性能监控运行中 - 轮询间隔: {interval}秒", 5000)
                 else:
                     QMessageBox.critical(self, "启动失败", f"性能监控启动失败：\n{msg}")
                     self.statusBar().showMessage("性能监控启动失败", 3000)
@@ -2696,6 +2753,9 @@ class AlgorithmValidationPlatform(QMainWindow):
     def update_performance_data(self):
         """更新性能数据"""
         data = self.performance_monitor.get_latest_data()
+        self._update_performance_controls(
+            data.get('device_profile') or self.performance_monitor.device_profile
+        )
         ddr_modules = data.get('ddr_modules', {})
         ddr_status = data.get('ddr_status', '未启动')
         ddr_error = data.get('ddr_error')
@@ -2715,6 +2775,12 @@ class AlgorithmValidationPlatform(QMainWindow):
                 ("MMZ使用", f"{data.get('mmz_used_mb', 0):.0f} / {data.get('mmz_total_mb', 0):.0f} MB"),
                 ("MMZ占用率", f"{data.get('mmz_usage', 0):.1f}%"),
             ])
+        if data.get('device_profile') == 'ambarella' or data.get('mal_used_mb', 0) > 0:
+            mal_total = data.get('mal_total_mb', 0)
+            memory_rows.append(("MAL已分配", f"{data.get('mal_used_mb', 0):.0f} MB"))
+            memory_rows.append(
+                ("MAL占用率", f"{data.get('mal_usage', 0):.1f}%" if mal_total > 0 else "N/A（总容量未提供）")
+            )
         metrics = [
             ("NPU Core0占用率", f"{data.get('npu_core0', 0):.1f}%"),
             ("NPU Core1占用率", f"{data.get('npu_core1', 0):.1f}%"),
@@ -2733,6 +2799,24 @@ class AlgorithmValidationPlatform(QMainWindow):
                 ("DDR总占用率", f"{ddr_modules.get('total_occupancy', 0):.3f}%"),
                 ("DDR写占用率", f"{ddr_modules.get('total_wr_occupancy', 0):.3f}%"),
                 ("DDR读占用率", f"{ddr_modules.get('total_rd_occupancy', 0):.3f}%"),
+            ])
+        elif data.get('ddr_source') == 'ambarella_serial':
+            metrics.extend([
+                ("DDR-CPU", f"{ddr_modules.get('cpu', 0):.2f} MB/s"),
+                ("DDR-DSP", f"{ddr_modules.get('dsp', 0):.2f} MB/s"),
+                ("DDR-PERI", f"{ddr_modules.get('peri', 0):.2f} MB/s"),
+                ("DDR-NVP (NPU)", f"{ddr_modules.get('nvp', 0):.2f} MB/s"),
+                ("DDR-NVPORC", f"{ddr_modules.get('nvporc', 0):.2f} MB/s"),
+                ("DDR-其他/未归类", f"{ddr_modules.get('unattributed', 0):.2f} MB/s"),
+                ("DDR-CPU占用率", f"{ddr_modules.get('cpu_occupancy', 0):.3f}%"),
+                ("DDR-DSP占用率", f"{ddr_modules.get('dsp_occupancy', 0):.3f}%"),
+                ("DDR-PERI占用率", f"{ddr_modules.get('peri_occupancy', 0):.3f}%"),
+                ("DDR-NVP占用率", f"{ddr_modules.get('nvp_occupancy', 0):.3f}%"),
+                ("DDR-NVPORC占用率", f"{ddr_modules.get('nvporc_occupancy', 0):.3f}%"),
+                ("DDR总占用率", f"{ddr_modules.get('total_occupancy', 0):.3f}%"),
+                ("DDR等效速率", f"{ddr_modules.get('ddr_data_rate_mts', 0):.0f} MT/s"),
+                ("DDR时钟(推算)", f"{ddr_modules.get('ddr_clock_mhz', 0):.0f} MHz"),
+                ("DDR总线宽度", f"{ddr_modules.get('bus_width_bits', 0):.0f} bit"),
             ])
         else:
             metrics.extend([
@@ -2816,6 +2900,9 @@ class AlgorithmValidationPlatform(QMainWindow):
                               zip(history['memory_used_mb'], history['mmz_used_mb'])]
                 ax_mem.plot(timestamps, total_used, label='总使用',
                            marker='o', linewidth=2.5, linestyle='-', color='#17a2b8')
+            if history.get('mal_used_mb') and any(v > 0 for v in history['mal_used_mb']):
+                ax_mem.plot(timestamps, history['mal_used_mb'], label='MAL已分配',
+                           marker='s', linewidth=2, linestyle='-.', color='#9467bd')
             ax_mem.set_xlabel('采样点')
             ax_mem.set_ylabel('内存 (MB)')
             ax_mem.set_title('内存使用')
@@ -2835,6 +2922,11 @@ class AlgorithmValidationPlatform(QMainWindow):
                         'total_rd': ('读带宽', '#bcbd22', '--'),
                         'isp': ('ISP', '#1f77b4', '-'),
                         'npu': ('NPU', '#ff7f0e', '-'),
+                        'nvporc': ('NVPORC', '#ff7f0e', '-'),
+                        'nvp': ('NVP (NPU)', '#2ca02c', '-'),
+                        'peri': ('PERI', '#9467bd', '-'),
+                        'unattributed': ('其他/未归类', '#8c564b', '--'),
+                        'dsp': ('DSP', '#7f7f7f', '-'),
                         'vicap': ('VICAP', '#2ca02c', '-'),
                         'cpu': ('CPU', '#d62728', '-'),
                         'gpu': ('GPU', '#9467bd', '-'),
@@ -2938,6 +3030,9 @@ class AlgorithmValidationPlatform(QMainWindow):
                               zip(history['memory_used_mb'], history['mmz_used_mb'])]
                 ax_mem.plot(timestamps, total_used, label='总使用',
                            marker='o', linewidth=2.5, linestyle='-', color='#17a2b8')
+            if history.get('mal_used_mb') and any(v > 0 for v in history['mal_used_mb']):
+                ax_mem.plot(timestamps, history['mal_used_mb'], label='MAL已分配',
+                           marker='s', linewidth=2, linestyle='-.', color='#9467bd')
             ax_mem.set_xlabel('采样点', fontsize=12)
             ax_mem.set_ylabel('内存 (MB)', fontsize=12)
             ax_mem.set_title('内存使用', fontsize=14, fontweight='bold')
@@ -2955,6 +3050,11 @@ class AlgorithmValidationPlatform(QMainWindow):
                         'total_rd': ('读带宽', '#bcbd22', '--'),
                         'isp': ('ISP', '#1f77b4', '-'),
                         'npu': ('NPU', '#ff7f0e', '-'),
+                        'nvporc': ('NVPORC', '#ff7f0e', '-'),
+                        'nvp': ('NVP (NPU)', '#2ca02c', '-'),
+                        'peri': ('PERI', '#9467bd', '-'),
+                        'unattributed': ('其他/未归类', '#8c564b', '--'),
+                        'dsp': ('DSP', '#7f7f7f', '-'),
                         'vicap': ('VICAP', '#2ca02c', '-'),
                         'cpu': ('CPU', '#d62728', '-'),
                         'gpu': ('GPU', '#9467bd', '-'),
@@ -4319,6 +4419,12 @@ class AlgorithmValidationPlatform(QMainWindow):
                         f.write(f"MEM: {history['memory_usage'][i]:.1f}%")
                         if history['mmz_usage'][i] > 0:
                             f.write(f" | MMZ: {history['mmz_usage'][i]:.1f}%")
+                        if history.get('mal_total_mb') and history['mal_total_mb'][i] > 0:
+                            f.write(
+                                f" | MAL: {history['mal_used_mb'][i]:.0f}/"
+                                f"{history['mal_total_mb'][i]:.0f} MB "
+                                f"({history['mal_usage'][i]:.1f}%)"
+                            )
                         f.write("\n")
                 f.write("\n")
                 
@@ -4482,6 +4588,13 @@ class AlgorithmValidationPlatform(QMainWindow):
     def _on_auto_connect_success(self, device_ip, rtsp_0, rtsp_1, success_msg):
         """自动连接成功处理"""
         log_manager.info(f"[AUTO] {success_msg}")
+
+        # 自动连接复用保存的 SSH 凭据，必须同步给性能监控模块；
+        # 手动 SSH 连接会在 _set_device_connection_state 中完成同样的同步。
+        self.performance_monitor.ssh_username = self.device_manager.ssh_username
+        self.performance_monitor.ssh_password = self.device_manager.ssh_password
+        self.performance_monitor.ssh_port = self.device_manager.ssh_port
+        self.performance_monitor.connection_mode = "ssh"
         
         # 更新状态
         self.current_device_ip = device_ip
@@ -4558,6 +4671,8 @@ class AlgorithmValidationPlatform(QMainWindow):
                 'ssh_username': ssh_username if ssh_username is not None else previous.get('ssh_username', 'root'),
                 'ssh_password': ssh_password if ssh_password is not None else previous.get('ssh_password', ''),
                 'ssh_port': ssh_port if ssh_port is not None else previous.get('ssh_port', 22),
+                'serial_port': previous.get('serial_port', ''),
+                'serial_baud': previous.get('serial_baud', 115200),
                 'last_connected': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
             
@@ -4612,6 +4727,11 @@ class AlgorithmValidationPlatform(QMainWindow):
                          "• RTMP直播推流\n"
                          "• 一键设备配置\n\n"
                          "© 2024 Algorithm Validation Team")
+
+    def closeEvent(self, event):
+        """Release the persistent RTOS serial connection on application exit."""
+        self.serial_manager.disconnect()
+        super().closeEvent(event)
 
 
 def main():

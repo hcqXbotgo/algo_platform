@@ -2,13 +2,12 @@
 
 PROGRAM=${0##*/}
 DEFAULT_SOC_DIR=/sys/devices/platform/soc
-VS_DIAG_MODULE=/lib/modules/vs_diag.ko
 
 CAPTURE_PERIOD=100
-DDR_FREQUENCY=3733
+DDR_FREQUENCY=3200
 DDR_BIT_WIDTH=32
-CAPTURE_SIZE=0x0800000
-CAPTURE_TIME=1
+CAPTURE_SIZE=0x100000
+CAPTURE_TIME=30
 CAPTURE_ADDRESS=0xf0000000
 DDRC_COUNT=1
 MEASUREMENT_COUNT=
@@ -23,17 +22,16 @@ Bandwidth is displayed in decimal MB/s.
 
 Options:
   -p PERIOD    Capture period in us            (default: 100)
-  -f FREQ      DDR controller frequency in MHz (default: 3733)
+  -f FREQ      DDR controller frequency in MHz (default: 3200)
   -w WIDTH     Legacy driver bus width: 16/32  (default: 32)
-  -b SIZE      Capture buffer size in bytes    (default: 0x0800000)
-  -t SECONDS   Duration of each sample         (default: 1)
+  -b SIZE      Capture buffer size in bytes    (default: 0x100000)
+  -t SECONDS   Duration of each sample         (default: 30)
   -d ADDRESS   Free DDR buffer address         (default: 0xf0000000)
   -c COUNT     Number of DDR controllers       (default: 1)
   -n COUNT     Stop after COUNT samples        (default: continuous)
   -h           Show this help
 
 Example:
-  $PROGRAM -p 100 -f 3733 -w 32 -b 0x0800000 -t 8 -d 0xf0000000
   $PROGRAM -p 100 -f 3733 -w 32 -b 0x100000 -t 1 -d 0xf0000000 -c 2 -n 1
 
 Press Ctrl+C to stop continuous monitoring.
@@ -45,25 +43,6 @@ die()
     echo "$PROGRAM: $*" >&2
     echo "Try '$PROGRAM -h' for usage." >&2
     exit 1
-}
-
-ensure_vs_diag_loaded()
-{
-    command -v lsmod > /dev/null 2>&1 || die "lsmod is required"
-    if ! module_list=$(lsmod); then
-        die "failed to query loaded modules"
-    fi
-    if printf '%s\n' "$module_list" |
-        awk '$1 == "vs_diag" { found = 1 } END { exit !found }'; then
-        echo "vs_diag module is already loaded."
-        return
-    fi
-
-    command -v insmod > /dev/null 2>&1 || die "insmod is required"
-    if ! insmod "$VS_DIAG_MODULE"; then
-        die "failed to load vs_diag module"
-    fi
-    echo "vs_diag module loaded successfully."
 }
 
 is_positive_decimal()
@@ -122,8 +101,8 @@ is_positive_decimal "$CAPTURE_PERIOD" ||
 is_positive_decimal "$DDR_FREQUENCY" ||
     die "DDR frequency must be a positive decimal integer"
 case $DDR_BIT_WIDTH in
-    16|32|64) ;;
-    *) die "DDR bus width must be 16 32 or 64" ;;
+    16|32) ;;
+    *) die "DDR bus width must be 16 or 32" ;;
 esac
 is_uint "$CAPTURE_SIZE" ||
     die "capture buffer size must be decimal or hexadecimal"
@@ -137,9 +116,6 @@ if [ -n "$MEASUREMENT_COUNT" ]; then
 fi
 is_uint "$CAPTURE_ADDRESS" ||
     die "capture buffer address must be decimal or hexadecimal"
-
-command -v awk > /dev/null 2>&1 || die "awk is required for MB/s conversion"
-ensure_vs_diag_loaded
 
 if [ -z "${PERFSTAT_DIR:-}" ]; then
     PERFSTAT_SOC_DIR=${PERFSTAT_SOC_DIR:-$DEFAULT_SOC_DIR}
@@ -162,7 +138,7 @@ esac
 if [ ! -d "$PERFSTAT_DIR" ]; then
     die "perfstat directory not found: $PERFSTAT_DIR"
 fi
-for node in period ddrfrq otdcmd bd0cmd bd1cmd size addr start stop; do
+for node in period ddrfrq size addr start stop; do
     node_path=$PERFSTAT_DIR/perfstat_$node
     [ -e "$node_path" ] || die "perfstat node not found: $node_path"
     [ -w "$node_path" ] || die "perfstat node is not writable: $node_path"
@@ -174,6 +150,7 @@ fi
 RESULT_NODE=$PERFSTAT_DIR/perfstat_show
 [ -e "$RESULT_NODE" ] || die "perfstat node not found: $RESULT_NODE"
 [ -r "$RESULT_NODE" ] || die "perfstat node is not readable: $RESULT_NODE"
+command -v awk > /dev/null 2>&1 || die "awk is required for MB/s conversion"
 
 write_node()
 {
@@ -241,11 +218,8 @@ trap 'handle_signal 129 HUP' HUP
 trap 'handle_signal 130 INT' INT
 trap 'handle_signal 143 TERM' TERM
 
-write_node "$DDR_FREQUENCY" "$PERFSTAT_DIR/perfstat_ddrfrq"
-write_node 1 "$PERFSTAT_DIR/perfstat_otdcmd"
-write_node 1 "$PERFSTAT_DIR/perfstat_bd0cmd"
-write_node 0 "$PERFSTAT_DIR/perfstat_bd1cmd"
 write_node "$CAPTURE_PERIOD" "$PERFSTAT_DIR/perfstat_period"
+write_node "$DDR_FREQUENCY" "$PERFSTAT_DIR/perfstat_ddrfrq"
 if [ -e "$BIT_WIDTH_NODE" ]; then
     write_node "$DDR_BIT_WIDTH" "$BIT_WIDTH_NODE"
 fi

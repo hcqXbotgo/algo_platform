@@ -21,7 +21,7 @@ class PerformanceMonitor:
 
     FALCON2_DDR_FREQ = 3733
 
-    def __init__(self):
+    def __init__(self, serial_manager=None):
         self.monitoring = False
         self.ssh_client = None
         self.ssh_username = 'root'
@@ -35,6 +35,10 @@ class PerformanceMonitor:
         self.npu_source = None
         self.ddr_source = None
         self.device_profile = None
+        self.extra_memory_source = None
+        self.serial_manager = serial_manager
+        self.serial_port = None
+        self.serial_baudrate = 115200
         self.history_data = {
             'timestamps': [],
             'npu_core0': [],  # NPU Core0占用率
@@ -47,6 +51,9 @@ class PerformanceMonitor:
             'mmz_used_mb': [],     # Falcon2 MMZ媒体内存使用量(MB)
             'mmz_total_mb': [],    # Falcon2 MMZ媒体内存总量(MB)
             'mmz_usage': [],       # Falcon2 MMZ媒体内存占用率(%)
+            'mal_used_mb': [],     # Ambarella MAL已分配内存(MB)
+            'mal_total_mb': [],    # Ambarella MAL总内存（若设备提供）
+            'mal_usage': [],       # Ambarella MAL占用率（若设备提供）
             'ddr_total': [],       # DDR总带宽
             'ddr_modules': []      # 各模块带宽: {'cpu': x, 'isp': y, 'npu': z, ...}
         }
@@ -63,20 +70,15 @@ class PerformanceMonitor:
             'mmz_used_mb': [],
             'mmz_total_mb': [],
             'mmz_usage': [],
+            'mal_used_mb': [],
+            'mal_total_mb': [],
+            'mal_usage': [],
             'ddr_total': [],
             'ddr_modules': []
         }
         self.latest_data = {}
         self.monitor_thread = None
-        self.tool_path = "/userdata/rk-msch-probe-for-user-64bit-1"
-        self.falcon2_ddr_tool_path = "/userdata/ddr_bandwidth.sh"
-        self.local_tool_path = None  # 本地工具文件路径，需要外部设置
-        bundled_tool = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "rk-msch-probe-for-user-64bit-1",
-        )
-        if os.path.exists(bundled_tool):
-            self.local_tool_path = bundled_tool
+        self.local_tool_path = None  # 可选的自定义 DDR 工具路径
 
         # DDR监控相关
         self.ddr_process = None  # 阻塞命令的SSH通道
@@ -90,6 +92,14 @@ class PerformanceMonitor:
         self.latest_npu_data = {'core0': 0.0, 'core1': 0.0, 'avg': 0.0, 'core_count': 2}
         self._npu_smoothed_load = None
 
+    def configure_serial(self, port, baudrate=115200):
+        """Configure the serial endpoint used by serial-backed collectors."""
+        self.serial_port = str(port or "").strip() or None
+        try:
+            self.serial_baudrate = int(baudrate or 115200)
+        except (TypeError, ValueError):
+            self.serial_baudrate = 115200
+
     def set_tool_path(self, local_path):
         """设置本地工具文件路径"""
         if os.path.exists(local_path):
@@ -100,9 +110,12 @@ class PerformanceMonitor:
 
     def _get_fallback_tool_path(self):
         """获取随上位机一起打包的 DDR 工具路径。"""
+        ddr = self._get_ddr_spec()
+        if not ddr or not ddr.get("local_path"):
+            return None
         bundled_tool = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "rk-msch-probe-for-user-64bit-1",
+            *ddr["local_path"].split("/"),
         )
         if os.path.exists(bundled_tool):
             return bundled_tool
@@ -115,10 +128,14 @@ class PerformanceMonitor:
 
         fallback_tool = self._get_fallback_tool_path()
         if fallback_tool:
-            self.local_tool_path = fallback_tool
             return fallback_tool
 
         return None
+
+    def _get_remote_tool_path(self):
+        """获取当前设备配置对应的板端 DDR 工具路径。"""
+        ddr = self._get_ddr_spec()
+        return ddr.get("remote_path") if ddr else None
 
     def _get_usb_adb_device_id(self):
         if self.connection_mode == "ssh":
@@ -184,6 +201,7 @@ class PerformanceMonitor:
         self.npu_source = None
         self.ddr_source = None
         self.device_profile = None
+        self.extra_memory_source = None
         self._npu_smoothed_load = None
 
         # 建立连接：USB ADB 优先，ADB 不可用再回退 SSH。
@@ -229,6 +247,9 @@ class PerformanceMonitor:
             'mmz_used_mb': [],     # Falcon2 MMZ媒体内存使用量(MB)
             'mmz_total_mb': [],    # Falcon2 MMZ媒体内存总量(MB)
             'mmz_usage': [],       # Falcon2 MMZ媒体内存占用率(%)
+            'mal_used_mb': [],
+            'mal_total_mb': [],
+            'mal_usage': [],
             'ddr_total': [],       # DDR总带宽
             'ddr_modules': []      # 各模块带宽: {'cpu': x, 'isp': y, 'npu': z, ...}
         }
@@ -246,24 +267,27 @@ class PerformanceMonitor:
             'mmz_used_mb': [],
             'mmz_total_mb': [],
             'mmz_usage': [],
+            'mal_used_mb': [],
+            'mal_total_mb': [],
+            'mal_usage': [],
             'ddr_total': [],
             'ddr_modules': []
         }
 
-        # 检查DDR工具并启动DDR监控。当前函数运行在后台 worker 中，可以同步等待结果。
+        # 检查DDR采集方式并启动DDR监控。当前函数运行在后台 worker 中，可以同步等待结果。
         if progress_callback:
-            progress_callback(50, "检查DDR测试工具...")
+            progress_callback(50, "检查DDR采集方式...")
 
         def ddr_progress(percent, message):
             if progress_callback:
                 progress_callback(50 + int(percent * 0.3), message)
 
         ddr_tool_available = self._ensure_tool_available(ddr_progress)
-        if ddr_tool_available and self.ddr_source == "vssdk":
+        if ddr_tool_available and self._uses_polled_ddr():
             self.ddr_status = "等待采样"
-            print("[性能监控] Falcon2 DDR单次采样已启用")
+            print(f"[性能监控] {self.device_profile} DDR单次采样已启用")
             if progress_callback:
-                progress_callback(90, "Falcon2 DDR单次采样已就绪")
+                progress_callback(90, "DDR单次采样已就绪")
         elif ddr_tool_available:
             if progress_callback:
                 progress_callback(85, "启动DDR监控...")
@@ -280,10 +304,17 @@ class PerformanceMonitor:
                 if progress_callback:
                     progress_callback(90, f"DDR监控未启动: {msg}")
         else:
-            self.ddr_status = "工具不可用"
-            print("[性能监控] 警告: DDR工具不可用，将跳过DDR监控")
-            if progress_callback:
-                progress_callback(90, "DDR工具不可用，跳过DDR监控")
+            ddr = self._get_ddr_spec()
+            if ddr and ddr.get("transport") == "serial":
+                self.ddr_status = "等待串口重连"
+                print(f"[性能监控] DDR串口暂不可用，将在监控循环中重试: {self.ddr_last_error}")
+                if progress_callback:
+                    progress_callback(90, "DDR串口暂不可用，启动后将自动重试")
+            else:
+                self.ddr_status = "工具不可用"
+                print("[性能监控] 警告: DDR工具不可用，将跳过DDR监控")
+                if progress_callback:
+                    progress_callback(90, "DDR工具不可用，跳过DDR监控")
 
         # 启动监控线程
         if progress_callback:
@@ -329,7 +360,9 @@ class PerformanceMonitor:
                 pass
             self.ddr_process = None
 
-        self._execute_command(self._build_ddr_stop_command())
+        stop_command = self._build_ddr_stop_command()
+        if stop_command:
+            self._execute_command(stop_command)
         self.ddr_status = "已停止"
 
         # 等待读取线程结束
@@ -350,6 +383,24 @@ class PerformanceMonitor:
         self.ddr_status = "异常"
         self.ddr_last_error = message
 
+    def _write_ddr_serial_diagnostic(self, reason, output):
+        """Persist full serial responses that need parser investigation."""
+        try:
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, "ddr_serial_diagnostics.log")
+            mode = "w" if os.path.exists(log_path) and os.path.getsize(log_path) > 5 * 1024 * 1024 else "a"
+            with open(log_path, mode, encoding="utf-8", errors="replace") as log_file:
+                log_file.write(
+                    f"\n===== {datetime.now().isoformat(timespec='seconds')} | {reason} =====\n"
+                )
+                log_file.write(str(output or "<empty>"))
+                log_file.write("\n===== END =====\n")
+            return log_path
+        except Exception as exc:
+            print(f"[DDR] 写入串口诊断日志失败: {exc}")
+            return None
+
     def _get_ddr_spec(self):
         if self.device_profile:
             return DEVICE_RESOURCE_PROFILES[self.device_profile].get("ddr")
@@ -364,17 +415,25 @@ class PerformanceMonitor:
         ddr = self._get_ddr_spec()
         if not ddr:
             return "true"
+        if ddr.get("transport") == "serial":
+            return ddr["command"]
+        remote_path = ddr["remote_path"]
+        tool_dir, _, tool_name = remote_path.rpartition("/")
         return ddr["command"].format(
             freq=self.FALCON2_DDR_FREQ if ddr["source"] == "vssdk" else self.ddr_freq,
-            tool_dir=os.path.dirname(self.tool_path) or "/userdata",
-            tool_name=os.path.basename(self.tool_path),
+            tool_dir=tool_dir or "/userdata",
+            tool_name=tool_name,
         )
 
     def _build_ddr_stop_command(self):
         ddr = self._get_ddr_spec()
         if ddr:
-            return ddr["stop_command"]
-        return "true"
+            return ddr.get("stop_command")
+        return None
+
+    def _uses_polled_ddr(self):
+        ddr = self._get_ddr_spec()
+        return bool(ddr and ddr.get("mode") == "poll")
 
     def _build_adb_ddr_args(self, command):
         args = ["adb", "-s", self.adb_device_id, "shell"]
@@ -383,11 +442,86 @@ class PerformanceMonitor:
         args.append(command)
         return args
 
-    def _sample_falcon2_ddr(self):
-        """串行执行一次 Falcon2 DDR 采样，结束后释放 ADB shell。"""
+    def _ensure_serial_available(self):
+        if self.serial_manager is None:
+            self._set_ddr_error("未初始化串口管理器")
+            return False
+        if self.serial_manager.is_connected:
+            return True
+        if not self.serial_port:
+            self._set_ddr_error("未配置DDR采集串口，请先在串口终端中选择端口")
+            return False
+        ddr = self._get_ddr_spec() or {}
+        connect_attempts = max(1, int(ddr.get("connect_attempts", 3)))
+        sync_attempts = max(1, int(ddr.get("sync_attempts", 3)))
+        last_error = "未知串口错误"
+
+        for connect_attempt in range(1, connect_attempts + 1):
+            success, message = self.serial_manager.connect(
+                self.serial_port,
+                self.serial_baudrate,
+            )
+            if not success:
+                last_error = message
+                print(
+                    f"[DDR] 串口连接尝试 {connect_attempt}/{connect_attempts} 失败: "
+                    f"{message}"
+                )
+                if connect_attempt < connect_attempts:
+                    time.sleep(0.5)
+                continue
+
+            time.sleep(float(ddr.get("open_delay", 0.5)))
+            for sync_attempt in range(1, sync_attempts + 1):
+                synchronized, sync_message = self.serial_manager.execute_command(
+                    "",
+                    timeout=float(ddr.get("sync_timeout", 2.0)),
+                    completion_pattern=ddr.get("completion_pattern"),
+                )
+                if synchronized:
+                    self.ddr_last_error = ""
+                    print(f"[DDR] 串口已连接并同步: {self.serial_port} @ {self.serial_baudrate}")
+                    return True
+                last_error = sync_message
+                print(
+                    f"[DDR] 控制台同步尝试 {sync_attempt}/{sync_attempts} 失败: "
+                    f"{sync_message}"
+                )
+                if sync_attempt < sync_attempts:
+                    time.sleep(0.2)
+            self.serial_manager.disconnect()
+            if connect_attempt < connect_attempts:
+                time.sleep(0.5)
+
+        self._set_ddr_error(f"串口自动连接失败: {last_error}")
+        return False
+
+    def _sample_polled_ddr(self):
+        """Run one complete DDR sample using the profile's configured transport."""
+        ddr = self._get_ddr_spec()
+        if not ddr:
+            self._set_ddr_error("当前设备未配置DDR采集方式")
+            return False
         command = self._build_ddr_command()
         try:
-            if self.connection_mode == "adb":
+            if ddr.get("transport") == "serial":
+                if not self._ensure_serial_available():
+                    return False
+                success, output = self.serial_manager.execute_command(
+                    command,
+                    timeout=float(ddr.get("timeout", 5.0)),
+                    idle_timeout=float(ddr.get("idle_timeout", 0.3)),
+                    minimum_wait=float(ddr.get("minimum_wait", 0.0)),
+                    completion_markers=ddr.get("completion_markers"),
+                    completion_pattern=ddr.get("completion_pattern"),
+                )
+                if not success:
+                    self._set_ddr_error(output)
+                    print(f"[DDR] 串口采样未完整结束: {output}")
+                    self._write_ddr_serial_diagnostic("串口命令未完整结束", output)
+                    self.serial_manager.disconnect()
+                    return False
+            elif self.connection_mode == "adb":
                 creationflags = (
                     subprocess.CREATE_NO_WINDOW
                     if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW")
@@ -410,27 +544,63 @@ class PerformanceMonitor:
             else:
                 output = self._execute_command(command)
 
-            sample_data = {}
-            for line in output.splitlines():
-                parsed = self._parse_falcon2_ddr_line(line)
-                if parsed:
-                    sample_data.update(parsed)
+            parser = ddr.get("parser")
+            if parser:
+                sample_data = parser(output) or {}
+            else:
+                sample_data = {}
+                line_parser = ddr.get("line_parser")
+                for line in output.splitlines():
+                    parsed = line_parser(line) if line_parser else None
+                    if parsed:
+                        sample_data.update(parsed)
 
-            if "total" not in sample_data:
-                self._set_ddr_error("Falcon2 DDR单次采样未返回有效带宽数据")
+            required_keys = tuple(ddr.get("required_keys", ("total",)))
+            missing_keys = [key for key in required_keys if key not in sample_data]
+            if missing_keys:
+                diagnostic_path = None
+                if ddr.get("transport") == "serial":
+                    diagnostic_path = self._write_ddr_serial_diagnostic(
+                        f"解析缺少字段: {missing_keys}",
+                        output,
+                    )
+                output_tail = " | ".join(
+                    line.strip() for line in output.splitlines() if line.strip()
+                )
+                if len(output_tail) > 800:
+                    output_tail = output_tail[-800:]
+                error_message = "DDR单次采样未返回有效带宽数据"
+                if diagnostic_path:
+                    error_message += f"（原始回显已保存: {diagnostic_path}）"
+                self._set_ddr_error(error_message)
+                print(
+                    f"[DDR] 单次采样缺少字段 {missing_keys}，"
+                    f"原始回显: {output_tail or '<empty>'}"
+                )
                 return False
 
             self.latest_ddr_data = sample_data
             self.ddr_status = "运行中"
             self.ddr_last_error = ""
+            module_text = ""
+            if ddr.get("source") == "ambarella_serial":
+                module_text = (
+                    f", CPU:{sample_data.get('cpu', 0):.2f} MB/s"
+                    f", DSP:{sample_data.get('dsp', 0):.2f} MB/s"
+                    f", PERI:{sample_data.get('peri', 0):.2f} MB/s"
+                    f", NVPORC:{sample_data.get('nvporc', 0):.2f} MB/s"
+                    f", NVP:{sample_data.get('nvp', 0):.2f} MB/s"
+                    f", 其他:{sample_data.get('unattributed', 0):.2f} MB/s"
+                )
+                if not sample_data.get("component_consistent", True):
+                    self._write_ddr_serial_diagnostic("总量包含未归类带宽", output)
             print(
-                f"[DDR] Falcon2单次采样 - 总:{sample_data.get('total', 0):.2f} MB/s, "
-                f"写:{sample_data.get('total_wr', 0):.2f} MB/s, "
-                f"读:{sample_data.get('total_rd', 0):.2f} MB/s"
+                f"[DDR] {self.device_profile}单次采样 - "
+                f"总:{sample_data.get('total', 0):.2f} MB/s{module_text}"
             )
             return True
         except subprocess.TimeoutExpired:
-            self._set_ddr_error("Falcon2 DDR单次采样超时")
+            self._set_ddr_error("DDR单次采样超时")
         except Exception as e:
             self._set_ddr_error(str(e))
         return False
@@ -669,9 +839,10 @@ class PerformanceMonitor:
                 memory_usage, memory_used_mb, memory_total_mb = self._get_memory_usage()
                 # Falcon2 同时统计 MMZ 媒体内存；旧设备为零值
                 mmz_usage, mmz_used_mb, mmz_total_mb = self._get_mmz_usage()
+                mal_usage, mal_used_mb, mal_total_mb = self._get_mal_usage()
 
-                if self.ddr_source == "vssdk" and self.ddr_status != "工具不可用":
-                    self._sample_falcon2_ddr()
+                if self._uses_polled_ddr() and self.ddr_status not in ("工具不可用", "不支持"):
+                    self._sample_polled_ddr()
 
                 # 从DDR实时数据中获取
                 ddr_total = self.latest_ddr_data.get('total', 0.0)
@@ -685,6 +856,13 @@ class PerformanceMonitor:
                 if self.memory_source == "mmz":
                     mem_log += (f" | MEM(mmz): {mmz_used_mb:.0f}/{mmz_total_mb:.0f} MB "
                                 f"({mmz_usage:.1f}%)")
+                if self.extra_memory_source == "mal":
+                    mal_text = f"MAL:{mal_used_mb:.0f} MB"
+                    if mal_total_mb > 0:
+                        mal_text += f" ({mal_usage:.1f}%)"
+                    else:
+                        mal_text += " (总量未知)"
+                    mem_log += f" | {mal_text}"
                 if self.latest_npu_data.get("core_count", 2) <= 1:
                     npu_log = f"NPU:{npu_load:.1f}%"
                 else:
@@ -709,6 +887,9 @@ class PerformanceMonitor:
                 self.history_data['mmz_used_mb'].append(mmz_used_mb)
                 self.history_data['mmz_total_mb'].append(mmz_total_mb)
                 self.history_data['mmz_usage'].append(mmz_usage)
+                self.history_data['mal_used_mb'].append(mal_used_mb)
+                self.history_data['mal_total_mb'].append(mal_total_mb)
+                self.history_data['mal_usage'].append(mal_usage)
                 self.history_data['ddr_total'].append(ddr_total)
                 self.history_data['ddr_modules'].append(ddr_modules)
 
@@ -730,6 +911,9 @@ class PerformanceMonitor:
                 self.full_history_data['mmz_used_mb'].append(mmz_used_mb)
                 self.full_history_data['mmz_total_mb'].append(mmz_total_mb)
                 self.full_history_data['mmz_usage'].append(mmz_usage)
+                self.full_history_data['mal_used_mb'].append(mal_used_mb)
+                self.full_history_data['mal_total_mb'].append(mal_total_mb)
+                self.full_history_data['mal_usage'].append(mal_usage)
                 self.full_history_data['ddr_total'].append(ddr_total)
                 self.full_history_data['ddr_modules'].append(ddr_modules)
 
@@ -747,10 +931,14 @@ class PerformanceMonitor:
                     'mmz_used_mb': mmz_used_mb,
                     'mmz_total_mb': mmz_total_mb,
                     'mmz_usage': mmz_usage,
+                    'mal_used_mb': mal_used_mb,
+                    'mal_total_mb': mal_total_mb,
+                    'mal_usage': mal_usage,
                     'memory_source': self.memory_source,
                     'ddr_total': ddr_total,
                     'ddr_modules': ddr_modules,
                     'ddr_source': self.ddr_source,
+                    'device_profile': self.device_profile,
                     'ddr_status': self.ddr_status,
                     'ddr_error': self.ddr_last_error
                 }
@@ -818,7 +1006,9 @@ class PerformanceMonitor:
 
     def _check_tool_exists(self):
         """检查设备上是否存在DDR带宽测试工具"""
-        tool_path = self.falcon2_ddr_tool_path if self.ddr_source == "vssdk" else self.tool_path
+        tool_path = self._get_remote_tool_path()
+        if not tool_path:
+            return False
         command = f"test -x {tool_path} && echo 'exists' || echo 'not_exists'"
         output = self._execute_command(command)
         return output == 'exists'
@@ -830,6 +1020,9 @@ class PerformanceMonitor:
             progress_callback: 进度回调函数，接收(百分比, 消息)参数
         """
         local_tool_path = self._resolve_local_tool_path()
+        remote_path = self._get_remote_tool_path()
+        if not remote_path:
+            return False, "当前设备未配置 DDR 工具"
         if not local_tool_path:
             return False, "未找到可用的本地 DDR 工具文件"
 
@@ -850,12 +1043,13 @@ class PerformanceMonitor:
                 progress_callback(20, f"正在上传工具 ({file_size_mb:.2f} MB)...")
 
             if self.connection_mode == "adb":
-                success, msg = self._run_adb_shell_command("mkdir -p /userdata", timeout=10)
+                remote_dir = remote_path.rpartition("/")[0] or "/userdata"
+                success, msg = self._run_adb_shell_command(f"mkdir -p {remote_dir}", timeout=10)
                 if not success:
-                    return False, f"创建/userdata失败: {msg}"
+                    return False, f"创建{remote_dir}失败: {msg}"
 
                 result = subprocess.run(
-                    ["adb", "-s", self.adb_device_id, "push", local_tool_path, self.tool_path],
+                    ["adb", "-s", self.adb_device_id, "push", local_tool_path, remote_path],
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
@@ -866,19 +1060,20 @@ class PerformanceMonitor:
                     return False, (result.stderr or result.stdout or "adb push失败").strip()
                 if progress_callback:
                     progress_callback(90, "设置文件权限...")
-                success, msg = self._run_adb_shell_command(f"chmod 755 {self.tool_path} && sync", timeout=10)
+                success, msg = self._run_adb_shell_command(f"chmod 755 {remote_path} && sync", timeout=10)
                 if not success:
                     return False, f"chmod失败: {msg}"
                 if progress_callback:
                     progress_callback(100, "验证文件...")
                 if self._check_tool_exists():
-                    return True, f"工具已通过ADB推送到 {self.tool_path}"
+                    return True, f"工具已通过ADB推送到 {remote_path}"
                 return False, "工具推送后验证失败"
 
             if not self.ssh_client:
                 return False, "SSH未连接，无法推送DDR工具"
 
-            self._execute_command("mkdir -p /userdata")
+            remote_dir = remote_path.rpartition("/")[0] or "/userdata"
+            self._execute_command(f"mkdir -p {remote_dir}")
             sftp = self.ssh_client.open_sftp()
 
             # 确保目标目录存在
@@ -886,15 +1081,13 @@ class PerformanceMonitor:
                 progress_callback(30, "检查目标目录...")
 
             try:
-                sftp.stat('/userdata')
+                sftp.stat(remote_dir)
             except FileNotFoundError:
-                print("[DDR工具] 错误: /userdata 目录不存在")
+                print(f"[DDR工具] 错误: {remote_dir} 目录不存在")
                 sftp.close()
-                return False, "/userdata 目录不存在"
+                return False, f"{remote_dir} 目录不存在"
 
             # 上传文件（带进度）
-            remote_path = self.tool_path
-
             def upload_progress(transferred, total):
                 if progress_callback:
                     percent = 30 + int((transferred / total) * 60)  # 30-90%
@@ -934,12 +1127,12 @@ class PerformanceMonitor:
             self.ddr_status = "不支持"
             return False
 
+        ddr = self._get_ddr_spec()
+        if ddr and ddr.get("transport") == "serial":
+            return self._ensure_serial_available()
+
         if self._check_tool_exists():
             return True
-
-        if self.ddr_source == "vssdk":
-            print(f"Falcon2 DDR工具不存在或不可执行: {self.falcon2_ddr_tool_path}")
-            return False
 
         local_tool_path = self._resolve_local_tool_path()
         if not local_tool_path:
@@ -1110,8 +1303,10 @@ class PerformanceMonitor:
     def _detect_memory_source(self):
         """Detect whether the platform provides an additional memory pool."""
         profile = DEVICE_RESOURCE_PROFILES[self._detect_device_profile()]
-        self.memory_source = "mmz" if profile.get("extra_memory") else "free"
-        print(f"[MEM] source: {self.memory_source}")
+        extra_memory = profile.get("extra_memory") or {}
+        self.extra_memory_source = extra_memory.get("source")
+        self.memory_source = "mmz" if self.extra_memory_source == "mmz" else "free"
+        print(f"[MEM] source: free, extra: {self.extra_memory_source or 'none'}")
 
     @staticmethod
     def _parse_memory_usage(output):
@@ -1200,6 +1395,32 @@ class PerformanceMonitor:
 
         return 0.0, 0.0, 0.0
 
+    def _get_mal_usage(self):
+        """Read Ambarella MAL allocation ranges independently from Linux free."""
+        if self.memory_source is None:
+            self._detect_memory_source()
+        if self.extra_memory_source != "mal":
+            return 0.0, 0.0, 0.0
+
+        extra_memory = self._get_resource_spec("extra_memory")
+        if not extra_memory:
+            return 0.0, 0.0, 0.0
+        output = self._execute_command(extra_memory["command"])
+        print(f"[内存-mal] 命令输出: {output}")
+        try:
+            result = extra_memory["parser"](output)
+            if result is not None:
+                usage_percent, used_mb, total_mb = result
+                if total_mb > 0:
+                    print(f"[内存-mal] 计算结果: {used_mb:.2f}/{total_mb:.2f} MB = {usage_percent:.1f}%")
+                else:
+                    print(f"[内存-mal] 已分配: {used_mb:.2f} MB（回显未提供总容量）")
+                return result
+            print("[内存-mal] 未匹配到 MAL 区间")
+        except (TypeError, ValueError) as e:
+            print(f"[内存-mal] 解析失败: {e}, 原始输出: {output}")
+        return 0.0, 0.0, 0.0
+
 
     def get_latest_data(self):
         """获取最新的监控数据"""
@@ -1224,7 +1445,8 @@ class PerformanceMonitor:
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(['时间戳', 'NPU占用(%)', 'CPU占用(%)',
-                                 '内存占用(%)', 'MMZ占用(%)', 'DDR带宽(MB/s)'])
+                                 '内存占用(%)', 'MMZ占用(%)', 'MAL已分配(MB)',
+                                 'MAL占用(%)', 'DDR带宽(MB/s)'])
 
                 for i in range(len(self.full_history_data['timestamps'])):
                     writer.writerow([
@@ -1233,6 +1455,8 @@ class PerformanceMonitor:
                         self.full_history_data['cpu_usage'][i],
                         self.full_history_data['memory_usage'][i],
                         self.full_history_data['mmz_usage'][i],
+                        self.full_history_data['mal_used_mb'][i],
+                        self.full_history_data['mal_usage'][i],
                         self.full_history_data['ddr_total'][i]
                     ])
 

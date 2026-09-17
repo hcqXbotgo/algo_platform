@@ -237,12 +237,15 @@ class PerformanceTab:
         parent.monitor_interval_spin = QSpinBox()
         parent.monitor_interval_spin.setRange(1, 10)
         parent.monitor_interval_spin.setValue(2)
-        control_layout.addRow("采样间隔(秒):", parent.monitor_interval_spin)
+        parent.monitor_interval_label = QLabel("轮询间隔(秒):")
+        parent.monitor_interval_spin.setToolTip("每轮性能数据采集完成后的等待时间")
+        control_layout.addRow(parent.monitor_interval_label, parent.monitor_interval_spin)
         
         parent.ddr_freq_spin = QSpinBox()
         parent.ddr_freq_spin.setRange(1000, 5000)
         parent.ddr_freq_spin.setValue(1848)
-        control_layout.addRow("DDR频率(MHz):", parent.ddr_freq_spin)
+        parent.ddr_freq_label = QLabel("DDR频率(MHz):")
+        control_layout.addRow(parent.ddr_freq_label, parent.ddr_freq_spin)
         
         # 创建单个按钮，根据状态切换文本
         parent.monitor_btn = QPushButton("开始监控")

@@ -44,31 +44,60 @@ def parse_npu_common(output):
 
 
 def parse_ambarella_npu(output):
-    """Parse VP utilization from ``flexidag_schdr -t 1000``."""
+    """Parse aggregate VP utilization from ``flexidag_schdr -t 1000``."""
     if not output:
         return None
 
     current_core = None
-    core_loads = {}
+    core_summaries = {}
+    core_task_loads = {}
     data_row = re.compile(
         r"^\s*\[\s*\d+\]\s+\S+\s+"
         r"(?P<vp_total>\d+(?:\.\d+)?)\s+"
         r"\(\s*(?P<percent>\d+(?:\.\d+)?)\s*\)\s+"
         r"(?P<total>\d+(?:\.\d+)?)\b"
     )
+    summary_row = re.compile(
+        r"^\s*(?P<vp_total>\d+(?:\.\d+)?)\s+"
+        r"\(\s*(?P<percent>\d+(?:\.\d+)?)\s*\)\s+"
+        r"(?P<total>\d+(?:\.\d+)?)\s+with\s+"
+        r"(?P<hw_units>\d+)\s+hw\s+unit(?:s)?\s*$",
+        re.IGNORECASE,
+    )
+
+    def utilization(match):
+        vp_total = float(match.group("vp_total"))
+        total = float(match.group("total"))
+        calculated = vp_total / total * 100.0 if total > 0 else 0.0
+        reported = float(match.group("percent"))
+        return reported if abs(reported - calculated) < 2.0 else calculated
+
     for line in output.splitlines():
         core_match = re.search(r"CVCORE[_ ]VP\s*(\d+)", line, re.IGNORECASE)
         if core_match:
             current_core = int(core_match.group(1))
             continue
-        match = data_row.match(line)
-        if current_core is None or not match:
+        if current_core is None:
             continue
-        vp_total = float(match.group("vp_total"))
-        total = float(match.group("total"))
-        calculated = vp_total / total * 100.0 if total > 0 else 0.0
-        reported = float(match.group("percent"))
-        core_loads[current_core] = reported if abs(reported - calculated) < 2.0 else calculated
+
+        summary_match = summary_row.match(line)
+        if summary_match:
+            core_summaries[current_core] = utilization(summary_match)
+            continue
+
+        match = data_row.match(line)
+        if not match:
+            continue
+        core_task_loads.setdefault(current_core, []).append(utilization(match))
+
+    core_ids = set(core_summaries) | set(core_task_loads)
+    core_loads = {
+        core_id: core_summaries.get(
+            core_id,
+            min(100.0, sum(core_task_loads.get(core_id, []))),
+        )
+        for core_id in core_ids
+    }
 
     if not core_loads:
         return None
@@ -103,6 +132,96 @@ def parse_memory(output):
     return None
 
 
+def parse_mal_memory(output):
+    """Parse Ambarella MAL memory status into (usage%, used MB, total MB).
+
+    MAL firmware versions use slightly different labels, so accept both
+    ``total/used/free`` fields and ``used/total`` pairs with common units.
+    """
+    if not output:
+        return None
+
+    # Current Ambarella firmware reports each MAL pool on an Id line and active
+    # allocations on indented ref_cnt lines. Sum them separately.
+    pool_pattern = re.compile(
+        r"\bId\s*\[\s*\d+\s*\]\s+Pa\s+0x([0-9a-f]+)\s*-\s*0x([0-9a-f]+)",
+        re.IGNORECASE,
+    )
+    allocation_pattern = re.compile(
+        r"^\s+Pa\s+0x([0-9a-f]+)\s*-\s*0x([0-9a-f]+)\s+ref_cnt\s*:\s*(\d+)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    pools = pool_pattern.findall(output)
+    if pools:
+        total_bytes = sum(max(0, int(end, 16) - int(start, 16)) for start, end in pools)
+        allocations = allocation_pattern.findall(output)
+        used_bytes = sum(
+            max(0, int(end, 16) - int(start, 16))
+            for start, end, ref_count in allocations
+            if int(ref_count) > 0
+        )
+        total_mb = total_bytes / (1024.0 * 1024.0)
+        used_mb = used_bytes / (1024.0 * 1024.0)
+        return (used_mb / total_mb * 100.0 if total_mb else 0.0, used_mb, total_mb)
+
+    unit_multiplier = {
+        "b": 1.0 / (1024.0 * 1024.0),
+        "kb": 1.0 / 1024.0,
+        "kib": 1.0 / 1024.0,
+        "mb": 1.0,
+        "mib": 1.0,
+        "gb": 1024.0,
+        "gib": 1024.0,
+    }
+
+    def value_for(label):
+        match = re.search(
+            rf"\b{label}\b\s*(?:memory|size|bytes)?\s*[:=]?\s*"
+            rf"([0-9]+(?:\.[0-9]+)?)\s*(bytes?|kib?|mib?|gib?)?",
+            output,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        unit = (match.group(2) or "mb").lower()
+        if unit == "byte":
+            unit = "b"
+        elif unit == "k":
+            unit = "kb"
+        elif unit == "m":
+            unit = "mb"
+        elif unit == "g":
+            unit = "gb"
+        return float(match.group(1)) * unit_multiplier.get(unit, 1.0)
+
+    total_mb = value_for("total")
+    used_mb = value_for("used")
+    free_mb = value_for("free")
+
+    if total_mb is None or used_mb is None:
+        pair = re.search(
+            r"(?:used|usage)\s*[/(:]\s*([0-9]+(?:\.[0-9]+)?)\s*"
+            r"(?:/|of)\s*([0-9]+(?:\.[0-9]+)?)\s*(bytes?|kib?|mib?|gib?)?",
+            output,
+            re.IGNORECASE,
+        )
+        if pair:
+            unit = (pair.group(3) or "mb").lower()
+            multiplier = unit_multiplier.get(unit, 1.0)
+            used_mb = float(pair.group(1)) * multiplier
+            total_mb = float(pair.group(2)) * multiplier
+
+    if total_mb is None and used_mb is not None and free_mb is not None:
+        total_mb = used_mb + free_mb
+    if used_mb is None and total_mb is not None and free_mb is not None:
+        used_mb = total_mb - free_mb
+    if total_mb is None or used_mb is None or total_mb <= 0:
+        return None
+
+    used_mb = max(0.0, used_mb)
+    return (used_mb / total_mb * 100.0, used_mb, total_mb)
+
+
 def parse_cpu_stat(samples):
     if not samples or len(samples) < 2 or not samples[0] or not samples[1]:
         return None
@@ -130,6 +249,115 @@ def parse_falcon2_ddr_line(line):
     return {metric: float(match.group(2)), f"{metric}_occupancy": float(match.group(3))}
 
 
+def parse_ambarella_ddr(output):
+    """Parse ``svc_sys dram_traffic`` output into MB/s and utilization."""
+    if not output:
+        return None
+
+    # Strip terminal decoration before parsing line-oriented RTOS output.
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output).replace("\x00", "")
+    module_names = {
+        "cpu": "cpu",
+        "dsp": "dsp",
+        "peri": "peri",
+        "nvporc": "nvporc",
+        "nvp": "nvp",
+    }
+    module_pattern = re.compile(
+        r"^\s*\[(CPU|DSP|PERI|NVPORC|NVP)\s*\]\s*"
+        r"\d+(?:\.\d+)?\s*MB\s*\((\d+)\)\s*,\s*"
+        r"([0-9]+(?:\.[0-9]+)?)\s*percentage",
+        re.IGNORECASE,
+    )
+    total_pattern = re.compile(
+        r"\[Utilization\]\s*([0-9]+(?:\.[0-9]+)?)\s*percentage\s*,\s*"
+        r"used/avail\((\d+)\s*/\s*(\d+)\)\s*bytes",
+        re.IGNORECASE,
+    )
+    interval_pattern = re.compile(
+        r"\[Measured\s+Interval\]\s*(\d+(?:\.\d+)?)\s*ms",
+        re.IGNORECASE,
+    )
+
+    samples = []
+    current = {"modules": {}}
+
+    def finish_sample(interval_ms):
+        modules = current.get("modules", {})
+        if not {"cpu", "dsp"}.issubset(modules) or "total_bytes" not in current:
+            return
+        interval_seconds = interval_ms / 1000.0
+        if interval_seconds <= 0:
+            return
+
+        result = {"measured_interval_ms": interval_ms}
+        for key in module_names.values():
+            module_bytes, occupancy = modules.get(key, (0, 0.0))
+            result[key] = module_bytes / (1024.0 * 1024.0) / interval_seconds
+            result[f"{key}_occupancy"] = occupancy
+
+        result["total_occupancy"] = current["total_occupancy"]
+        result["total"] = current["total_bytes"] / (1024.0 * 1024.0) / interval_seconds
+        available_bytes_per_second = current["available_bytes"] / interval_seconds
+        result["available"] = available_bytes_per_second / (1024.0 * 1024.0)
+        # The command is configured for a 64-bit DRAM bus. Available bandwidth
+        # therefore exposes the effective transfer rate without another RTOS call.
+        bus_width_bits = 64
+        result["bus_width_bits"] = bus_width_bits
+        result["ddr_data_rate_mts"] = (
+            available_bytes_per_second / (bus_width_bits / 8.0) / 1_000_000.0
+        )
+        result["ddr_clock_mhz"] = result["ddr_data_rate_mts"] / 2.0
+        result["component_total"] = sum(result[key] for key in module_names.values())
+        result["unattributed"] = result["total"] - result["component_total"]
+        tolerance = max(0.01, result["total"] * 0.001)
+        result["component_consistent"] = abs(result["unattributed"]) <= tolerance
+        result["unattributed_occupancy"] = (
+            result["unattributed"] / result["available"] * 100.0
+            if result["available"] > 0
+            else 0.0
+        )
+        samples.append(result)
+
+    for line in output.splitlines():
+        module_match = module_pattern.match(line)
+        if module_match:
+            key = module_names[module_match.group(1).strip().lower()]
+            # A new CPU line after a complete total starts another sample even
+            # on firmware that omits the heading or interval separator.
+            if key == "cpu" and "cpu" in current["modules"] and "total_bytes" in current:
+                finish_sample(1000.0)
+                current = {"modules": {}}
+            current["modules"][key] = (
+                int(module_match.group(2)),
+                float(module_match.group(3)),
+            )
+            continue
+
+        total_match = total_pattern.search(line)
+        if total_match:
+            current["total_occupancy"] = float(total_match.group(1))
+            current["total_bytes"] = int(total_match.group(2))
+            current["available_bytes"] = int(total_match.group(3))
+            continue
+
+        interval_match = interval_pattern.search(line)
+        if interval_match:
+            finish_sample(float(interval_match.group(1)))
+            current = {"modules": {}}
+
+    # Accept a complete final sample even when this firmware omits the interval
+    # line; the command itself requests a 1000 ms measurement window.
+    if current.get("modules") and "total_bytes" in current:
+        finish_sample(1000.0)
+
+    if not samples:
+        return None
+    result = samples[-1]
+    result["sample_count"] = len(samples)
+    return result
+
+
 COMMON_CPU = {
     "command": "cat /proc/stat | grep '^cpu '",
     "samples": 2,
@@ -150,8 +378,28 @@ DEVICE_RESOURCE_PROFILES = {
         },
         "cpu": COMMON_CPU,
         "memory": COMMON_MEMORY,
-        "extra_memory": None,
-        "ddr": None,
+        "extra_memory": {
+            "name": "mal",
+            "source": "mal",
+            "command": "cat /proc/ambarella/AmbaMalStatus",
+            "parser": parse_mal_memory,
+        },
+        "ddr": {
+            "source": "ambarella_serial",
+            "transport": "serial",
+            "mode": "poll",
+            "command": "svc_sys dram_traffic 1000 2 1 64",
+            "timeout": 6.0,
+            "idle_timeout": 0.6,
+            "minimum_wait": 2.5,
+            "connect_attempts": 2,
+            "open_delay": 0.5,
+            "sync_attempts": 3,
+            "sync_timeout": 1.5,
+            "completion_pattern": r"(?:^|[\r\n])[a-z]:[^\r\n>]*>\s*$",
+            "required_keys": ("cpu", "dsp", "peri", "nvporc", "nvp", "total"),
+            "parser": parse_ambarella_ddr,
+        },
     },
     "falcon2": {
         "probe": "[ -r /proc/vssdk/npu ] || [ -r /proc/vssdk/mmz ]",
@@ -161,7 +409,10 @@ DEVICE_RESOURCE_PROFILES = {
         "extra_memory": {"command": "cat /proc/vssdk/mmz", "parser": parse_memory},
         "ddr": {
             "source": "vssdk",
-            "command": "cd /userdata && ./ddr_bandwidth.sh -p 100 -f {freq} -w 32 -b 0x100000 -t 1 -d 0xf0000000 -c 2 -n 1",
+            "mode": "poll",
+            "local_path": "tools/ddr/ddr_bandwidth.sh",
+            "remote_path": "/userdata/ddr_bandwidth.sh",
+            "command": "cd {tool_dir} && ./{tool_name} -p 100 -f {freq} -w 32 -b 0x100000 -t 1 -d 0xf0000000 -c 2 -n 1",
             "stop_command": "pkill -f '[d]dr_bandwidth' >/dev/null 2>&1 || true",
             "line_parser": parse_falcon2_ddr_line,
         },
@@ -174,6 +425,8 @@ DEVICE_RESOURCE_PROFILES = {
         "extra_memory": None,
         "ddr": {
             "source": "rknpu",
+            "local_path": "tools/ddr/rk-msch-probe-for-user-64bit-1",
+            "remote_path": "/userdata/rk-msch-probe-for-user-64bit-1",
             "command": "cd {tool_dir} && ./{tool_name} -c rk3576 -f {freq} -l 2 2>&1",
             "stop_command": "pkill -f '[r]k-msch-probe-for-user-64bit-1' >/dev/null 2>&1 || true",
         },
