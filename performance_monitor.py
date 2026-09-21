@@ -344,6 +344,13 @@ class PerformanceMonitor:
         """停止监控"""
         self.monitoring = False
 
+        profile = DEVICE_RESOURCE_PROFILES.get(self.device_profile, {})
+        ddr_spec = profile.get("ddr") or {}
+        uses_serial_ddr = (
+            ddr_spec.get("transport") == "serial"
+            or self.ddr_source == "ambarella_serial"
+        )
+
         # 停止DDR监控进程
         if self.ddr_process:
             try:
@@ -373,6 +380,14 @@ class PerformanceMonitor:
         # 停止主监控线程
         if self.monitor_thread:
             self.monitor_thread.join(timeout=5)
+
+        # 串口采样可能仍在 execute_command 中，必须在线程停止后再关闭。
+        # 否则停止后遗留的 RTOS 会话会影响下一次监控启动。
+        if uses_serial_ddr and self.serial_manager is not None:
+            was_connected = self.serial_manager.is_connected
+            self.serial_manager.disconnect()
+            if was_connected:
+                print("[DDR] 已断开DDR采集串口")
 
         # 关闭SSH连接
         if self.ssh_client:
@@ -446,15 +461,43 @@ class PerformanceMonitor:
         if self.serial_manager is None:
             self._set_ddr_error("未初始化串口管理器")
             return False
-        if self.serial_manager.is_connected:
-            return True
-        if not self.serial_port:
-            self._set_ddr_error("未配置DDR采集串口，请先在串口终端中选择端口")
-            return False
         ddr = self._get_ddr_spec() or {}
         connect_attempts = max(1, int(ddr.get("connect_attempts", 3)))
         sync_attempts = max(1, int(ddr.get("sync_attempts", 3)))
         last_error = "未知串口错误"
+
+        def synchronize_console():
+            sync_error = "RTOS控制台未返回提示符"
+            for sync_attempt in range(1, sync_attempts + 1):
+                synchronized, sync_message = self.serial_manager.execute_command(
+                    "",
+                    timeout=float(ddr.get("sync_timeout", 2.0)),
+                    completion_pattern=ddr.get("completion_pattern"),
+                )
+                if synchronized:
+                    self.ddr_last_error = ""
+                    return True, ""
+                sync_error = sync_message
+                print(
+                    f"[DDR] 控制台同步尝试 {sync_attempt}/{sync_attempts} 失败: "
+                    f"{sync_message}"
+                )
+                if sync_attempt < sync_attempts:
+                    time.sleep(0.2)
+            return False, sync_error
+
+        # 端口打开不代表 RTOS 控制台仍处于可用状态。先同步；若会话已失效，
+        # 主动关闭后走下面的重连流程，避免必须在串口终端手工断开重连。
+        if self.serial_manager.is_connected:
+            synchronized, last_error = synchronize_console()
+            if synchronized:
+                return True
+            print(f"[DDR] 已有串口会话不可用，准备重新连接: {last_error}")
+            self.serial_manager.disconnect()
+
+        if not self.serial_port:
+            self._set_ddr_error("未配置DDR采集串口，请先在串口终端中选择端口")
+            return False
 
         for connect_attempt in range(1, connect_attempts + 1):
             success, message = self.serial_manager.connect(
@@ -472,23 +515,10 @@ class PerformanceMonitor:
                 continue
 
             time.sleep(float(ddr.get("open_delay", 0.5)))
-            for sync_attempt in range(1, sync_attempts + 1):
-                synchronized, sync_message = self.serial_manager.execute_command(
-                    "",
-                    timeout=float(ddr.get("sync_timeout", 2.0)),
-                    completion_pattern=ddr.get("completion_pattern"),
-                )
-                if synchronized:
-                    self.ddr_last_error = ""
-                    print(f"[DDR] 串口已连接并同步: {self.serial_port} @ {self.serial_baudrate}")
-                    return True
-                last_error = sync_message
-                print(
-                    f"[DDR] 控制台同步尝试 {sync_attempt}/{sync_attempts} 失败: "
-                    f"{sync_message}"
-                )
-                if sync_attempt < sync_attempts:
-                    time.sleep(0.2)
+            synchronized, last_error = synchronize_console()
+            if synchronized:
+                print(f"[DDR] 串口已连接并同步: {self.serial_port} @ {self.serial_baudrate}")
+                return True
             self.serial_manager.disconnect()
             if connect_attempt < connect_attempts:
                 time.sleep(0.5)

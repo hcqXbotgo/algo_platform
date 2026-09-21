@@ -4729,8 +4729,14 @@ class AlgorithmValidationPlatform(QMainWindow):
                          "© 2024 Algorithm Validation Team")
 
     def closeEvent(self, event):
-        """Release the persistent RTOS serial connection on application exit."""
-        self.serial_manager.disconnect()
+        """Stop collectors before releasing the persistent RTOS serial port."""
+        try:
+            self.update_timer.stop()
+            if self.performance_monitor.monitoring:
+                self.performance_monitor.stop_monitoring()
+        finally:
+            # 即使监控未启动或停止过程异常，也必须释放串口句柄。
+            self.serial_manager.disconnect()
         super().closeEvent(event)
 
 
