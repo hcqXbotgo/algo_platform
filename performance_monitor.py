@@ -79,10 +79,14 @@ class PerformanceMonitor:
         self.latest_data = {}
         self.monitor_thread = None
         self.local_tool_path = None  # 可选的自定义 DDR 工具路径
+        self._stop_event = threading.Event()
 
         # DDR监控相关
         self.ddr_process = None  # 阻塞命令的SSH通道
         self.ddr_reader_thread = None  # 读取输出的线程
+        self.ddr_sample_thread = None  # 单次DDR采样线程，避免阻塞主监控循环
+        self._ddr_next_retry_at = 0.0
+        self._ddr_failure_count = 0
         self.latest_ddr_data = {}  # 最新解析的DDR数据
         self.ddr_status = "未启动"
         self.ddr_last_error = ""
@@ -193,6 +197,10 @@ class PerformanceMonitor:
         self.device_ip = device_ip
         self.ddr_freq = ddr_freq
         self.monitoring = True
+        self._stop_event.clear()
+        self.ddr_sample_thread = None
+        self._ddr_next_retry_at = 0.0
+        self._ddr_failure_count = 0
         self.latest_ddr_data = {}
         self.ddr_status = "初始化中"
         self.ddr_last_error = ""
@@ -343,6 +351,7 @@ class PerformanceMonitor:
     def stop_monitoring(self):
         """停止监控"""
         self.monitoring = False
+        self._stop_event.set()
 
         profile = DEVICE_RESOURCE_PROFILES.get(self.device_profile, {})
         ddr_spec = profile.get("ddr") or {}
@@ -380,6 +389,15 @@ class PerformanceMonitor:
         # 停止主监控线程
         if self.monitor_thread:
             self.monitor_thread.join(timeout=5)
+
+        # 单次串口采样拥有独立线程；取消其当前命令后再释放串口。
+        if self.ddr_sample_thread:
+            sample_thread = self.ddr_sample_thread
+            sample_thread.join(timeout=2)
+            if sample_thread.is_alive():
+                print("[DDR] 串口采样线程仍在退出，保留线程引用避免重复启动")
+            else:
+                self.ddr_sample_thread = None
 
         # 串口采样可能仍在 execute_command 中，必须在线程停止后再关闭。
         # 否则停止后遗留的 RTOS 会话会影响下一次监控启动。
@@ -469,19 +487,18 @@ class PerformanceMonitor:
         def synchronize_console():
             sync_error = "RTOS控制台未返回提示符"
             for sync_attempt in range(1, sync_attempts + 1):
+                if self._stop_event.is_set():
+                    return False, "监控已停止"
                 synchronized, sync_message = self.serial_manager.execute_command(
                     "",
                     timeout=float(ddr.get("sync_timeout", 2.0)),
                     completion_pattern=ddr.get("completion_pattern"),
+                    cancel_event=self._stop_event,
                 )
                 if synchronized:
                     self.ddr_last_error = ""
                     return True, ""
                 sync_error = sync_message
-                print(
-                    f"[DDR] 控制台同步尝试 {sync_attempt}/{sync_attempts} 失败: "
-                    f"{sync_message}"
-                )
                 if sync_attempt < sync_attempts:
                     time.sleep(0.2)
             return False, sync_error
@@ -492,7 +509,11 @@ class PerformanceMonitor:
             synchronized, last_error = synchronize_console()
             if synchronized:
                 return True
-            print(f"[DDR] 已有串口会话不可用，准备重新连接: {last_error}")
+            if not self._stop_event.is_set():
+                print(
+                    f"[DDR] 已有串口会话不可用（{sync_attempts}次同步失败），"
+                    f"准备重新连接: {self._short_serial_error(last_error)}"
+                )
             self.serial_manager.disconnect()
 
         if not self.serial_port:
@@ -506,10 +527,11 @@ class PerformanceMonitor:
             )
             if not success:
                 last_error = message
-                print(
-                    f"[DDR] 串口连接尝试 {connect_attempt}/{connect_attempts} 失败: "
-                    f"{message}"
-                )
+                if not self._stop_event.is_set():
+                    print(
+                        f"[DDR] 串口连接尝试 {connect_attempt}/{connect_attempts} 失败: "
+                        f"{self._short_serial_error(message)}"
+                    )
                 if connect_attempt < connect_attempts:
                     time.sleep(0.5)
                 continue
@@ -519,12 +541,26 @@ class PerformanceMonitor:
             if synchronized:
                 print(f"[DDR] 串口已连接并同步: {self.serial_port} @ {self.serial_baudrate}")
                 return True
+            if not self._stop_event.is_set():
+                print(
+                    f"[DDR] 控制台同步失败（{sync_attempts}次），"
+                    f"{self._short_serial_error(last_error)}"
+                )
             self.serial_manager.disconnect()
             if connect_attempt < connect_attempts:
                 time.sleep(0.5)
 
         self._set_ddr_error(f"串口自动连接失败: {last_error}")
         return False
+
+    @staticmethod
+    def _short_serial_error(message, limit=180):
+        """Keep serial diagnostics from flooding the monitoring console."""
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(message or ""))
+        text = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+        if len(text) > limit:
+            return text[:limit] + "..."
+        return text or "未知串口错误"
 
     def _sample_polled_ddr(self):
         """Run one complete DDR sample using the profile's configured transport."""
@@ -544,10 +580,12 @@ class PerformanceMonitor:
                     minimum_wait=float(ddr.get("minimum_wait", 0.0)),
                     completion_markers=ddr.get("completion_markers"),
                     completion_pattern=ddr.get("completion_pattern"),
+                    cancel_event=self._stop_event,
                 )
                 if not success:
                     self._set_ddr_error(output)
-                    print(f"[DDR] 串口采样未完整结束: {output}")
+                    if not self._stop_event.is_set():
+                        print(f"[DDR] 串口采样未完整结束: {self._short_serial_error(output)}")
                     self._write_ddr_serial_diagnostic("串口命令未完整结束", output)
                     self.serial_manager.disconnect()
                     return False
@@ -603,10 +641,11 @@ class PerformanceMonitor:
                 if diagnostic_path:
                     error_message += f"（原始回显已保存: {diagnostic_path}）"
                 self._set_ddr_error(error_message)
-                print(
-                    f"[DDR] 单次采样缺少字段 {missing_keys}，"
-                    f"原始回显: {output_tail or '<empty>'}"
-                )
+                if not self._stop_event.is_set():
+                    print(
+                        f"[DDR] 单次采样缺少字段 {missing_keys}，"
+                        f"回显摘要: {self._short_serial_error(output_tail, 240)}"
+                    )
                 return False
 
             self.latest_ddr_data = sample_data
@@ -634,6 +673,40 @@ class PerformanceMonitor:
         except Exception as e:
             self._set_ddr_error(str(e))
         return False
+
+    def _start_polled_ddr_sample(self):
+        """Schedule one DDR sample without blocking the main metrics loop."""
+        if not self.monitoring or self._stop_event.is_set():
+            return
+        if self.ddr_sample_thread and self.ddr_sample_thread.is_alive():
+            return
+        if time.monotonic() < self._ddr_next_retry_at:
+            return
+
+        def worker():
+            success = False
+            try:
+                success = self._sample_polled_ddr()
+            except Exception as exc:
+                if not self._stop_event.is_set():
+                    self._set_ddr_error(str(exc))
+                    print(f"[DDR] 单次采样异常: {self._short_serial_error(exc)}")
+            finally:
+                if success:
+                    self._ddr_failure_count = 0
+                    self._ddr_next_retry_at = 0.0
+                elif not self._stop_event.is_set():
+                    self._ddr_failure_count = min(self._ddr_failure_count + 1, 4)
+                    retry_delay = min(30.0, max(2.0, 2 ** self._ddr_failure_count))
+                    self._ddr_next_retry_at = time.monotonic() + retry_delay
+                    print(f"[DDR] 本次采样失败，{retry_delay:.0f}秒后重试；主监控继续运行")
+
+        self.ddr_sample_thread = threading.Thread(
+            target=worker,
+            name="ddr-sample",
+            daemon=True,
+        )
+        self.ddr_sample_thread.start()
 
     def _start_ddr_monitoring(self):
         """启动DDR阻塞监控命令"""
@@ -872,7 +945,7 @@ class PerformanceMonitor:
                 mal_usage, mal_used_mb, mal_total_mb = self._get_mal_usage()
 
                 if self._uses_polled_ddr() and self.ddr_status not in ("工具不可用", "不支持"):
-                    self._sample_polled_ddr()
+                    self._start_polled_ddr_sample()
 
                 # 从DDR实时数据中获取
                 ddr_total = self.latest_ddr_data.get('total', 0.0)
@@ -1159,7 +1232,9 @@ class PerformanceMonitor:
 
         ddr = self._get_ddr_spec()
         if ddr and ddr.get("transport") == "serial":
-            return self._ensure_serial_available()
+            # 串口探测不能阻塞性能监控启动；首次同步和后续重试由独立采样线程完成。
+            self.ddr_status = "等待串口采样"
+            return True
 
         if self._check_tool_exists():
             return True
@@ -1242,7 +1317,11 @@ class PerformanceMonitor:
         if self.npu_source == "vssdk":
             print(f"[NPU] 已读取 VSSDK 统计信息，共 {len(output)} 字符")
         else:
-            print(f"[NPU] 命令输出: {output}")
+            # Ambarella 输出包含整段任务表，避免每个采样周期把完整回显刷入控制台。
+            if self.npu_source == "ambarella":
+                print(f"[NPU] 已读取 Ambarella 统计信息，共 {len(output)} 字符")
+            else:
+                print(f"[NPU] 命令输出: {output[:500]}")
 
         try:
             result = npu_resource["parser"](output)
@@ -1275,7 +1354,7 @@ class PerformanceMonitor:
                 }
                 return decayed
         except (TypeError, ValueError) as e:
-            print(f"[NPU] 解析失败: {e}, 原始输出: {output}")
+            print(f"[NPU] 解析失败: {e}, 回显长度: {len(output)}")
 
         core_count = npu_resource.get("core_count", 2)
         self.latest_npu_data = {"core0": 0.0, "core1": 0.0, "avg": 0.0, "core_count": core_count}
@@ -1410,7 +1489,7 @@ class PerformanceMonitor:
             return 0.0, 0.0, 0.0
 
         output = self._execute_command(extra_memory["command"])
-        print(f"[内存-mmz] 命令输出: {output}")
+        print(f"[内存-mmz] 已读取统计信息，共 {len(output)} 字符")
 
         try:
             result = extra_memory["parser"](output)
@@ -1421,7 +1500,7 @@ class PerformanceMonitor:
             # MMZ 接口偶发不可读时返回零值，不影响系统内存统计
             print("[内存-mmz] 未匹配到 mmz 统计行")
         except (TypeError, ValueError) as e:
-            print(f"[内存-mmz] 解析失败: {e}, 原始输出: {output}")
+            print(f"[内存-mmz] 解析失败: {e}, 回显长度: {len(output)}")
 
         return 0.0, 0.0, 0.0
 
@@ -1436,7 +1515,7 @@ class PerformanceMonitor:
         if not extra_memory:
             return 0.0, 0.0, 0.0
         output = self._execute_command(extra_memory["command"])
-        print(f"[内存-mal] 命令输出: {output}")
+        print(f"[内存-mal] 已读取统计信息，共 {len(output)} 字符")
         try:
             result = extra_memory["parser"](output)
             if result is not None:
@@ -1448,7 +1527,7 @@ class PerformanceMonitor:
                 return result
             print("[内存-mal] 未匹配到 MAL 区间")
         except (TypeError, ValueError) as e:
-            print(f"[内存-mal] 解析失败: {e}, 原始输出: {output}")
+            print(f"[内存-mal] 解析失败: {e}, 回显长度: {len(output)}")
         return 0.0, 0.0, 0.0
 
 

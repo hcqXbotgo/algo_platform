@@ -110,11 +110,14 @@ class SerialManager:
         minimum_wait=0.0,
         completion_markers=None,
         completion_pattern=None,
+        cancel_event=None,
     ):
         """Execute one command and optionally wait for a complete console prompt."""
         with self._lock:
             if not self.is_connected:
                 return False, "串口未连接"
+            if cancel_event is not None and cancel_event.is_set():
+                return False, "串口命令已取消"
             try:
                 self._serial.reset_input_buffer()
                 payload = str(command or "").rstrip("\r\n") + self.line_ending
@@ -141,6 +144,8 @@ class SerialManager:
                 last_data_at = None
                 completed = False
                 while time.monotonic() < deadline:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return False, "串口命令已取消"
                     waiting = self._serial.in_waiting
                     if waiting:
                         response.extend(self._serial.read(waiting))
